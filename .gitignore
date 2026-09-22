@@ -1,0 +1,14 @@
+# Rust
+/host/target/
+**/*.rs.bk
+
+# Build outputs
+/tools/*.out
+*.o
+*.bin
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

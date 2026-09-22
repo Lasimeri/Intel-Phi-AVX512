@@ -1,0 +1,28 @@
+# The host side of the AVX-512 co-processor: four crates. The card's
+# software stack (Intel-Phi-3120A) is a runtime requirement, not a build
+# one: nothing here links against it.
+[workspace]
+resolver = "2"
+members = [
+    "crates/knc-mvex",
+    "crates/avx512-xlate",
+    "crates/phi512",
+    "crates/phi-vpu",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Lasimeri/Intel-Phi-AVX512"
+rust-version = "1.85"
+
+[workspace.dependencies]
+libc = "0.2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info", "intel"] }
+object = { version = "0.36", default-features = false, features = ["std", "read", "elf"] }
+
+[profile.release]
+debug = 1
