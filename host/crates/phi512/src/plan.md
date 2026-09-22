@@ -24,6 +24,18 @@ body is not trusted either, except the nested loop's own induction
 register, which becomes a range from its value at the loop's head over
 its trip count, and is known again after the loop.
 
+When the phase is a loop body, a register the body reads before it
+writes (carried across iterations: a running pointer, a running count)
+is not the value one iteration sees. If the body steps it exactly once
+by a constant, it becomes a range from its value at the head over the
+trip count, the same way the induction register does; otherwise it is
+`Unknown`, and a memory operand built on it leaves the phase unresolved
+(demand mode). Until 2026-09-22 the tracker used the first iteration's
+value: a copy loop with two running pointers declared 64 bytes per
+array, the card mapped the rest of the chunk anyway, and every store
+past the first vector was silently dropped (`scripts/phi512-ground.sh`
+found it: 65408 of 65536 lanes wrong).
+
 Every memory operand's address is `base + index * scale + disp` in these
 values (RIP-relative from the instruction's own address); one that
 resolves becomes a `MemRange` with its size, whether it is written, the
@@ -62,6 +74,8 @@ store range overlapping a load range of another form.
 (the output dense and write-only) and split; the dot product is found
 and refused for its accumulator; a count-down inner loop
 (`mov $0x1d,%eax; ... sub $1,%rax; jae`) resolves to its 30 coefficient
-reads and leaves rax at -1. On the card (2026-09-22): all three kernels
+reads and leaves rax at -1; a copy loop with two running pointers
+(`add $0x40,%rsi; add $0x40,%rdi`) resolves each to its whole array,
+not one vector. On the card (2026-09-22): all three kernels
 of the test bit-identical at 65536, 1048576 and 16777216 elements,
 `docs/results/2026-09-22-seamless-card.md`.

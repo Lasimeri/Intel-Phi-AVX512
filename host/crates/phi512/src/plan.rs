@@ -452,6 +452,32 @@ impl Tracker {
     pub fn run(&mut self, insns: &Insns, from: u64, to: u64, outer: Option<(usize, u64, u64, u64)>) {
         if let Some((ind, lo, hi, step)) = outer {
             self.gpr[ind] = Val::Range { lo, hi, step };
+            // Every other register carried across the iterations (read before
+            // it is written in the body) takes a different value each time
+            // round, which one pass in address order would not see: one that
+            // is stepped once by a constant (a running pointer) is a range over
+            // the trip count; any other is unknown, and the phase runs in
+            // demand mode.
+            let n = hi.wrapping_sub(lo).checked_div(step).map_or(1, |q| q + 1);
+            for reg in carried_gprs(insns, from, to) {
+                if reg == ind {
+                    continue;
+                }
+                let body: Vec<&Instruction> = insns.range(from..to).map(|(_, i)| i).collect();
+                let stepped = induction_step(&mut self.fac, &body, reg);
+                self.gpr[reg] = match (self.gpr[reg], stepped) {
+                    (Val::Known(r0), Some((s, _))) => {
+                        let last = r0.wrapping_add((s as u64).wrapping_mul(n - 1));
+                        let (rlo, rhi) = if s > 0 { (r0, last) } else { (last, r0) };
+                        Val::Range {
+                            lo: rlo,
+                            hi: rhi,
+                            step: s.unsigned_abs(),
+                        }
+                    }
+                    _ => Val::Unknown,
+                };
+            }
         }
         // Loops nested in the phase, by their back edge; and intervals a
         // forward branch can skip, whose writes cannot be trusted after.
@@ -677,6 +703,50 @@ impl Tracker {
     }
 }
 
+/// The integer registers read before they are written in `[from, to)`,
+/// and written somewhere in it: carried across the iterations of a loop
+/// with that body.
+pub fn carried_gprs(insns: &Insns, from: u64, to: u64) -> Vec<usize> {
+    let mut fac = InstructionInfoFactory::new();
+    let uses: Vec<Vec<(usize, bool, bool)>> = insns
+        .range(from..to)
+        .map(|(_, insn)| {
+            fac.info(insn)
+                .used_registers()
+                .iter()
+                .filter_map(|r| {
+                    let reads = matches!(
+                        r.access(),
+                        OpAccess::Read | OpAccess::CondRead | OpAccess::ReadWrite | OpAccess::ReadCondWrite
+                    );
+                    let writes = matches!(
+                        r.access(),
+                        OpAccess::Write | OpAccess::ReadWrite | OpAccess::CondWrite | OpAccess::ReadCondWrite
+                    );
+                    gpr_index(r.register()).map(|i| (i, reads, writes))
+                })
+                .collect()
+        })
+        .collect();
+    let body_writes = |i: usize| uses.iter().flatten().any(|&(r, _, w)| r == i && w);
+    let mut written: Vec<usize> = Vec::new();
+    let mut carried: Vec<usize> = Vec::new();
+    for insn_uses in &uses {
+        for &(i, reads, writes) in insn_uses {
+            if i == 4 || i == 5 {
+                continue; // rsp and rbp: the frame, not loop state
+            }
+            if reads && !written.contains(&i) && body_writes(i) && !carried.contains(&i) {
+                carried.push(i);
+            }
+            if writes && !written.contains(&i) {
+                written.push(i);
+            }
+        }
+    }
+    carried
+}
+
 /// Can the loop's iterations run on several threads at once? No register
 /// (integer, vector or mask) read before written in the body except the
 /// induction; every store indexed by the induction; no store range
@@ -817,6 +887,34 @@ mod tests {
         t.run(&insns, lp.head, lp.exit, Some((0, 0, 1024 - 16, 16)));
         assert!(t.resolved);
         assert!(splittable(&insns, &lp, &t).is_err(), "zmm0 accumulates");
+    }
+
+    /// A hand-written kernel's loop: running pointers stepped each iteration.
+    /// vmovaps (%rsi),%zmm0; vmovaps %zmm0,(%rdi); add /tmp/claude-1000/-home-lasimeri/1f927f0a-8413-4fec-8043-e31c53b2bb17/scratchpad/edit7.plx40,%rsi; add /tmp/claude-1000/-home-lasimeri/1f927f0a-8413-4fec-8043-e31c53b2bb17/scratchpad/edit7.plx40,%rdi; sub /tmp/claude-1000/-home-lasimeri/1f927f0a-8413-4fec-8043-e31c53b2bb17/scratchpad/edit7.plx10,%rcx; jg L
+    #[test]
+    fn running_pointers_cover_every_iteration() {
+        let bytes = [
+            0x62, 0xf1, 0x7c, 0x48, 0x28, 0x06, 0x62, 0xf1, 0x7c, 0x48, 0x29, 0x07, 0x48, 0x83, 0xc6, 0x40, 0x48, 0x83, 0xc7, 0x40, 0x48,
+            0x83, 0xe9, 0x10, 0x7f, 0xe6, 0x90,
+        ];
+        let insns = decode(&bytes, 0x4000);
+        let lp = find_loop(&insns, 0x4000, &[]).expect("a loop");
+        assert_eq!(lp.ind, 1, "rcx");
+        assert_eq!(lp.step, -16);
+        assert_eq!(iterations(&lp, 65536, 16), Some(4096));
+        let mut gpr = [0u64; 16];
+        gpr[1] = 65536;
+        gpr[6] = 0x10000;
+        gpr[7] = 0x80000;
+        let mut t = Tracker::new(gpr, no_mem);
+        t.run(&insns, lp.head, lp.exit, Some((1, 16, 65536, 16)));
+        assert!(t.resolved, "{:?}", t.ranges);
+        assert_eq!(
+            t.merged(),
+            vec![(0x10000, 4096 * 64, false, true, true), (0x80000, 4096 * 64, true, false, true)],
+            "all 4096 iterations, not the first"
+        );
+        assert!(splittable(&insns, &lp, &t).is_err(), "the pointers are carried");
     }
 
     #[test]

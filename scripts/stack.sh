@@ -15,3 +15,11 @@ if [ -z "${PHI_STACK_ROOT:-}" ] || [ ! -f "$PHI_STACK_ROOT/scripts/phi-env.sh" ]
     exit 1
 fi
 export PHI_STACK_ROOT
+# phi-env.sh finds phictl through PHICTL, else next to the script that
+# sourced it, which here is this repository, not the stack's.
+if [ -z "${PHICTL:-}" ]; then
+    for cand in "$PHI_STACK_ROOT/host/target/release/phictl" "$PHI_STACK_ROOT/host/target/debug/phictl"; do
+        [ -x "$cand" ] && { PHICTL=$cand; break; }
+    done
+fi
+export PHICTL
