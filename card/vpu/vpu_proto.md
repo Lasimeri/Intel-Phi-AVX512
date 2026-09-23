@@ -4,10 +4,10 @@ One window of host memory, seen from both sides. The host maps
 `/dev/shm/phi-hostmem`. The card reaches the same bytes two ways, and
 which one to use for what is a measurement, not a preference:
 
-| path | measured 2026-09-22 | used for |
+| path | measured | used for |
 | --- | --- | --- |
-| `/dev/phihost`, mapped, uncached | 2.36 us doorbell round trip; 50 MB/s streaming | control words |
-| `/dev/phiblk1`, DMA block device | 1.2 GB/s at 16 MiB reads, 553 MB/s at 4 MiB, 184 MB/s at 1 MiB | bulk data |
+| `/dev/phihost`, mapped, uncached | 2.36 us doorbell round trip (2026-09-22); 11 MB/s reading and 73 MB/s writing a 16 KiB block by `memcpy` (2026-09-23) | control words |
+| `/dev/phiblk1`, DMA block device | 1.2 GB/s at 16 MiB reads, 553 MB/s at 4 MiB, 184 MB/s at 1 MiB (2026-09-22); 109 us reading and 95 us writing 16 KiB, nearly all of it fixed cost (2026-09-23) | bulk data, at every size |
 
 That the two paths address the same bytes at the same offsets was
 verified with a marker: written by the host at window offset 1 MiB, read
