@@ -237,9 +237,32 @@ static bool phi_supports_mul_mat(const struct ggml_tensor *op)
 static const char *phi_backend_get_name(ggml_backend_t backend) { (void)backend; return "Phi"; }
 static void phi_backend_free(ggml_backend_t backend) { free(backend); }
 
+/* PHI_GGML_GRAPH=N: print the first N sub-graphs the scheduler hands
+ * this backend, one line per node, with the activation tensor's address,
+ * so it can be seen which multiplies arrive together and which of them
+ * share an input. See ggml-phi.md. */
+static void dump_graph(const struct ggml_cgraph *cgraph)
+{
+    static int left = -1;
+    if (left < 0) {
+        const char *e = getenv("PHI_GGML_GRAPH");
+        left = e ? atoi(e) : 0;
+    }
+    if (left == 0) return;
+    left--;
+    fprintf(stderr, "ggml-phi: sub-graph of %d nodes\n", cgraph->n_nodes);
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const struct ggml_tensor *n = cgraph->nodes[i];
+        fprintf(stderr, "ggml-phi:   %-14s %-34s src0 %-30s src1 %p %s\n", ggml_op_desc(n), n->name,
+                n->src[0] ? n->src[0]->name : "-", n->src[1] ? (void *)n->src[1] : NULL,
+                n->src[1] ? n->src[1]->name : "-");
+    }
+}
+
 static enum ggml_status phi_graph_compute(ggml_backend_t backend, struct ggml_cgraph *cgraph)
 {
     (void)backend;
+    dump_graph(cgraph);
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor *node = cgraph->nodes[i];
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) continue;

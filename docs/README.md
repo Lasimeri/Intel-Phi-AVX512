@@ -6,6 +6,7 @@
 | --- | --- |
 | [avx512-on-knc.md](research/avx512-on-knc.md) | The precision audit: which AVX-512 operations the card computes bit-identically, which need expansion, which cannot be offered; gates everything |
 | [avx512-transparency.md](research/avx512-transparency.md) | The design of the transparent path: interception, regions, the register file, memory |
+| [selection-under-a-slow-link.md](research/selection-under-a-slow-link.md) | Why this machine has the opposite balance to a GPU, and what a documented 2008 collection system settled about that balance: keep the corpus where it is, make depth follow the arrival rate, promote in three decisions, reduce where the data is; which of those this repository has built and which it may not have
 
 ## Results
 
@@ -21,6 +22,7 @@
 | [2026-09-23-ceilings-and-residency.md](results/2026-09-23-ceilings-and-residency.md) | The card's two ceilings measured across the whole pool (76.9 GB/s of reads, 810 GFLOP/s of vector issue at one thread per core), the quantized kernels shown to be exactly issue bound, the activation rows found to be sharing one L1 set (twice the arithmetic at prompt sizes once the stride is padded), and residency shown to be what bounds generation: pp512 11.79 against the host's 9.24, tg16 1.51 against 1.07 |
 | [2026-09-23-mixture-of-experts.md](results/2026-09-23-mixture-of-experts.md) | ggml's MUL_MAT_ID on the cards, which is what an MoE model's expert weights go through, a backend that judges by measurement whether a card pays for its 0.45 ms of latency, and the baseline that had to be corrected: Qwen3.8-35B-A3B Q4_K_M gains 3 to 5 percent at generation and loses 11 at pp512, because the card still computes a mixture one column at a time where ggml groups them by expert |
 | [2026-09-23-float16-activations.md](results/2026-09-23-float16-activations.md) | The activations sent as float16, which the card up-converts for nothing because it is a field of the memory operand and not an instruction: 12 to 19 percent more arithmetic per second from eight activation rows up, the 27B at pp512 12.40 against 12.05 and tg32 1.61 against 1.45, and the measurement rule that was costing 5x (the calling program needs 12 threads too, not 16)
+| [2026-09-23-share-and-fusion.md](results/2026-09-23-share-and-fusion.md) | The batch share stops being a constant: the two models want opposite ends of it, so the backend now measures which side is the slower and moves the share until they finish together, which beats the better constant on the dense model and matches it on the mixture (pp512 14.42 against the host alone at 9.16, tg32 1.67 against 1.06), plus two versions of the estimator that were wrong and why
 
 The transport these records build on (the block path between the
 window and the card, its pipelining, huge pages, the card poller) is the

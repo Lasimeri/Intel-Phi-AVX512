@@ -54,3 +54,11 @@ matrix multiply runs on the program's own threads and those contend with
 the card daemons just as badly. At 16 of this machine's 16 hardware
 threads the 27B generates 0.29 tokens per second against 1.53 at 12
 (`../src/lib.md`).
+
+`PHI_GGML_GRAPH=N` prints the first N sub-graphs the scheduler hands
+this backend, one line per node with the activation tensor's address.
+It is how the fusion question is answered without guessing: on
+Qwen3.8-27B it shows `ffn_gate` and `ffn_up` arriving in one sub-graph
+against one `attn_post_norm` tensor, and `ffn_down` arriving alone
+behind a `ffn_swiglu` the CPU computed, because this backend does not
+claim the gated-linear op.

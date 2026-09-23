@@ -84,6 +84,30 @@ struct Ctx {
     /// its resident rows (the host takes the rest): the cards are slower
     /// per flop than the host is, and faster per weight byte.
     pp_share: f64,
+    /// Whether that share then follows what the two sides measure
+    /// (`PHI_GGML_PP_ADAPT`, on by default; 0 freezes it at
+    /// `PHI_GGML_PP_SHARE`, which is what a comparison between two fixed
+    /// shares needs).
+    ///
+    /// The share is one number for the whole model, not one per tensor,
+    /// for two reasons. It is a property of this machine's two sides at
+    /// this batch size rather than of any tensor: both sides scale with
+    /// the rows, so the ratio is the same shape everywhere. And a
+    /// prompt pass visits each tensor about three times, which is not
+    /// enough to learn anything from, while it makes some hundreds of
+    /// batch multiplies in total, which is.
+    pp_adapt: bool,
+    /// The relative gap between the two sides, summed over the batch
+    /// multiplies since the share last moved, and how many are in the
+    /// sum. Never one call: a card's time for the same work varies by up
+    /// to 3.7x with the state of its thread pool
+    /// (`docs/results/2026-09-23-ceilings-and-residency.md`), which is
+    /// larger than the difference being measured.
+    pp_gap: f64,
+    pp_n: u32,
+    /// How many times the share has moved. The step is fixed and the
+    /// count is capped, so it settles rather than hunting.
+    pp_steps: u32,
     /// Send the activations as float16, which the quantized kernels'
     /// memory operands up-convert for nothing (`PHI_GGML_ACT`, 1 by
     /// default; 0 sends float32, which is what the comparison in
@@ -180,6 +204,10 @@ pub extern "C" fn phi_ggml_open() -> i32 {
         too_small: 0,
         judged: None,
         pp_share,
+        pp_adapt: env_or("PHI_GGML_PP_ADAPT", 1u32) != 0,
+        pp_gap: 0.0,
+        pp_n: 0,
+        pp_steps: 0,
         half_act: env_or("PHI_GGML_ACT", 1u32) != 0,
         host_ranges: Vec::new(),
         verbose,
@@ -199,6 +227,15 @@ pub extern "C" fn phi_ggml_open() -> i32 {
 /// against 127 at n 64). It keeps the 64-byte alignment the operands
 /// need.
 const B_PAD: u64 = 256;
+
+/// How many times a tensor's batch share may be moved before it is left
+/// alone, and how small it may become. The floor is where a card stops
+/// being worth its round trip on anything; below it the `min_bytes` rule
+/// declines the multiply outright, which is the right answer anyway.
+const PP_STEPS: u32 = 24;
+const PP_MIN: f64 = 0.2;
+/// Batch calls averaged before the share is moved once.
+const PP_WINDOW: u32 = 8;
 
 /// Write `n` floats as float16 into the card's window. The card's
 /// memory operands up-convert `{float16}` for no instruction
@@ -709,6 +746,8 @@ pub unsafe extern "C" fn phi_ggml_end_id(d: *mut u8, nb_d: u64, nb_d2: u64) -> i
     let t_host = ctx.t_begin.elapsed();
     let mut lines = Vec::new();
     let mut ok = true;
+    // The slowest card of this multiply, by its own clock.
+    let mut t_card = Duration::ZERO;
     let t0 = Instant::now();
     for card in ctx.cards.iter_mut() {
         let Some(Pending {
@@ -747,6 +786,7 @@ pub unsafe extern "C" fn phi_ggml_end_id(d: *mut u8, nb_d: u64, nb_d2: u64) -> i
             };
         }
         card.busy += rep_time(&rep);
+        t_card = t_card.max(rep_time(&rep));
         if ctx.verbose {
             lines.push(format!(
                 "card {} rows {}: {:.3} ms (pull {:.3}, compute {:.3}, push {:.3})",
@@ -787,6 +827,35 @@ pub unsafe extern "C" fn phi_ggml_end_id(d: *mut u8, nb_d: u64, nb_d2: u64) -> i
                 }
             } else {
                 split.bad[j.class] = 0;
+            }
+        }
+        // And how much of its slice should each card take at a batch?
+        // The multiply is over when the slower of the two sides is, so
+        // the share to aim at is the one that finishes them together,
+        // and both sides are measured: `t_host` here and the card's own
+        // total in its reply. Average the relative gap over a window of
+        // multiplies before moving, because one card time is worth
+        // nothing; move by half of it; stop after `PP_STEPS`.
+        if j.class == 1 && ctx.pp_adapt && ctx.pp_steps < PP_STEPS && !t_card.is_zero() {
+            let (th, tc) = (t_host.as_secs_f64(), t_card.as_secs_f64());
+            ctx.pp_gap += (th - tc) / th.max(tc);
+            ctx.pp_n += 1;
+            if ctx.pp_n == PP_WINDOW {
+                let gap = ctx.pp_gap / PP_WINDOW as f64;
+                ctx.pp_gap = 0.0;
+                ctx.pp_n = 0;
+                let was = ctx.pp_share;
+                ctx.pp_share = (was * (1.0 + 0.5 * gap)).clamp(PP_MIN, 1.0);
+                if ctx.pp_share != was {
+                    ctx.pp_steps += 1;
+                    if ctx.verbose {
+                        say(&format!(
+                            "over {PP_WINDOW} batch multiplies the host ran {:+.0} percent against the slowest card, so the batch share goes {was:.2} to {:.2}",
+                            gap * 100.0,
+                            ctx.pp_share
+                        ));
+                    }
+                }
             }
         }
     }

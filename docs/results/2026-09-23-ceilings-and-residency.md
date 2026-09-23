@@ -166,7 +166,9 @@ ggml's barrier spins, so a descheduled thread costs a timeslice.
 
 The cards' share at prompt sizes was measured too (`PHI_GGML_PP_SHARE`,
 the part of its resident rows a card computes at n 8 or more): 0.5 gives
-pp64 9.96, 0.75 gives 9.23, 1.0 gives 7.54. The host's Q4_K kernels work
+pp64 9.96, 0.75 gives 9.23, 1.0 gives 7.54. (Superseded the same day:
+the float16 activations moved this balance and it is no longer a
+constant, `2026-09-23-share-and-fusion.md`.) The host's Q4_K kernels work
 in int8 against the cards' float32, so per row of arithmetic the host is
 about twice the two cards together; half is the balance.
 

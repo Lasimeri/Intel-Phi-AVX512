@@ -34,11 +34,31 @@ card, its rows a multiple of 64 so the host's remainder keeps ggml's
 fast paths (measured 0.43 against 7.7 ms for an odd count), until a card
 has `PHI_GGML_CARD_BYTES` (4.4 GB) resident or refuses an upload, after
 which the card keeps nothing more of later tensors. At eight activation
-rows or more (a prompt) each card computes only `PHI_GGML_PP_SHARE`
-(0.75) of its slice and the host the rest of it as another range: the
-cards are slower per flop than the host is, and faster per weight byte,
-so the two cases want different shares. Only tensors ggml names
-`*.weight` are shared; anything else the host does whole.
+rows or more (a prompt) each card computes only a share of its slice and
+the host the rest of it as another range: the cards are slower per flop
+than the host is, and faster per weight byte, so the two cases want
+different shares. Only tensors ggml names `*.weight` are shared;
+anything else the host does whole.
+
+**That share is measured, not set.** A multiply is over when the slower
+of its two sides is over, so the share to aim at is the one that
+finishes them together, and both sides are already timed: the host's
+part here and each card's own total in its reply. Every batch multiply
+adds its relative gap to a running sum; every eighth, the share moves
+by half the average gap and the sum resets; after 24 moves it is left
+alone (`PP_WINDOW`, `PP_STEPS`, `PP_MIN`). `PHI_GGML_PP_SHARE` (0.75) is
+where it starts and `PHI_GGML_PP_ADAPT=0` freezes it there, which is
+what comparing two fixed shares needs.
+
+It is one share for the model rather than one per tensor, which is not
+an approximation but the only version that can learn: a prompt pass
+visits each weight tensor about three times and makes some hundreds of
+batch multiplies in total, and what is being learned is a property of
+the two sides at that batch size, not of a tensor. Both wrong versions
+were built and measured first
+(`docs/results/2026-09-23-share-and-fusion.md`): per tensor per call
+oscillates on the 3.7x pool-wake variance, per tensor over a window
+never fills it.
 
 `PHI_GGML_CARDS` names the cards (a comma list of indices; default every
 card whose window exists), `PHI_GGML_THREADS` the card threads per
@@ -92,8 +112,8 @@ k 5120 the tensor's stride is 5 x 4096: eight rows then take the same
 sets of a 64-set L1 and the eight-row kernels run at a quarter of their
 instruction count. This is worth about twice the card's prompt-size
 arithmetic (127 to 240 GFLOP/s at n 64) and nothing at n 1, where one
-row cannot conflict with itself. `PHI_GGML_PP_SHARE` followed it from
-0.5 to 0.75.
+row cannot conflict with itself. The batch share followed it from 0.5 to
+0.75, and then stopped being a constant at all (above).
 
 ## Mixtures of experts, and when a card is worth using
 

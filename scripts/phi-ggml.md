@@ -29,7 +29,9 @@ Settings, all environment variables (`host/crates/phi-ggml/src/lib.md`):
 `--card N` sets it to one), `PHI_GGML_FRACTION` (rows per card; unset,
 this script works it out from the model's size and the budget, below),
 `PHI_GGML_CARD_BYTES` (resident bytes per card, 4.4 GB),
-`PHI_GGML_PP_SHARE` (the cards' share at prompt sizes, 0.75),
+`PHI_GGML_PP_SHARE` (where the cards' share at prompt sizes starts,
+0.75; it then follows what the two sides measure, and
+`PHI_GGML_PP_ADAPT=0` holds it still),
 `PHI_GGML_HOST_THREADS` (the host's threads for its rows, 12: leave the
 card daemons a CPU each, and give the program the same `-t`),
 `PHI_GGML_THREADS` (card threads, 57). `--verbose`
