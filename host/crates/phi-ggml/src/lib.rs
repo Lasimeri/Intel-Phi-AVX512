@@ -107,6 +107,11 @@ fn open_card(index: usize, threads: u32, budget: u64) -> Result<Card, String> {
 /// initialise and llama.cpp runs without it).
 #[no_mangle]
 pub extern "C" fn phi_ggml_open() -> i32 {
+    // llama.cpp initialises the backend once per model (the draft model
+    // too); the cards and the resident slices are one state for all of them.
+    if let Some(ctx) = CTX.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        return ctx.cards.len() as i32;
+    }
     let threads = env_or("PHI_GGML_THREADS", 57u32);
     let budget = env_or("PHI_GGML_CARD_BYTES", 3_400_000_000u64);
     let fraction = env_or("PHI_GGML_FRACTION", 0.2f64).clamp(0.0, 1.0);
@@ -311,6 +316,11 @@ pub unsafe extern "C" fn phi_ggml_begin(
     };
     ctx.calls += 1;
     ctx.t_begin = Instant::now();
+    if n == 0 {
+        // llama-server asks for the logits of no tokens sometimes: nothing to compute.
+        ctx.host_ranges.clear();
+        return 0;
+    }
     if keep == 0 || phi_ggml_supports(a_type, m, k, nb_a, nb_b, n) == 0 {
         ctx.host_only += 1;
         ctx.host_ranges = vec![(0, m)];

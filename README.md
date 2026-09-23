@@ -100,6 +100,8 @@ cards, each keeping a fifth of every weight matrix, llama-bench,
 | --- | --- | --- |
 | host alone, 16 threads | 9.34 | 1.07 |
 | host (12 threads) and both cards | 9.05 | 1.45 |
+| llama-server with the MTP draft: host alone | 7.79 | 2.26 |
+| llama-server with the MTP draft: host and both cards | 6.00 | 2.77 |
 
 Token generation is bound by weight bandwidth, and the cards add
 theirs to the host's; the per-multiply floor of the cards hides under

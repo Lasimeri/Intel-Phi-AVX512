@@ -92,6 +92,22 @@ The 27B with the host (12 threads) and both cards, llama-bench:
 | pp64 | 9.34 | 9.05 | -3 percent |
 | tg16 | 1.07 | 1.45 | +36 percent |
 
+And llama-server (68-token prompt, 128 tokens, greedy), the host alone
+against the host with both cards, plain and with the MTP draft:
+
+| llama-server | pp tok/s | tg tok/s |
+| --- | --- | --- |
+| host alone, 16 threads, plain | 8.30 | 1.04 |
+| host alone, 16 threads, MTP draft | 7.79 | 2.26 (acceptance 61.7 percent, mean draft 2.82) |
+| host (12 threads) and both cards, plain | 7.82 | 1.47 |
+| host (12 threads) and both cards, MTP draft | 6.00 | 2.77 (acceptance 65.1 percent, mean draft 2.95) |
+
+The draft model (1.4 GB, Q4_K and Q6_K) is shared the same way. One
+server case the bench never produced: a multiply of the output matrix
+against zero activation rows (a batch that wants no logits), which the
+card refuses; the backend now returns no work for it. llama.cpp also
+initialises the backend once per model, so its open is idempotent.
+
 Per multiply at one token (verbose): the host part 1.09 ms, the cards
 done 0.19 ms earlier on average, so the host is the long pole with 60
 percent of the rows; each card's part is 0.25 ms of pull, 0.8 of compute,
