@@ -4,7 +4,11 @@
 `GGML_BACKEND_PATH` (`scripts/phi-ggml.sh` sets it). ggml's scheduler
 gives the backend every `MUL_MAT` and `MUL_MAT_ID` whose weight type
 and shape `csrc/ggml-phi.c` accepts; this file shares each one by rows of the
-weight matrix between the host and the cards:
+weight matrix between the host and the cards, **when the cards are worth
+using for it**, which it decides per weight tensor from what it measures
+("Mixtures of experts, and when a card is worth using" below: a card
+costs about 0.45 ms to involve, so a multiply the host finishes sooner
+stays with the host and this table does not apply to it):
 
 | who | rows | how |
 | --- | --- | --- |

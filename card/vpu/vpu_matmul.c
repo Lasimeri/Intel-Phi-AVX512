@@ -1,8 +1,9 @@
 /* vpu_matmul.c: whole matrix multiplies for the ggml backend, across the
  * pool. The host uploads a program's weight tensors once (UPLOAD, kept by
  * id in the card's memory), then each MUL_MAT of the model is one MATMUL
- * request: d[n][m] = a[m][k] . b[n][k]. The rows of a are split across
- * the threads; each dot product is a kernel of vpu_matmul_kernel.S (the
+ * request and each MUL_MAT_ID a MATMUL_ID one (a mixture of experts, one
+ * matrix per column): d[n][m] = a[m][k] . b[n][k]. The rows of a are
+ * split across the threads; each dot product is a kernel of vpu_matmul_kernel.S (the
  * card's 16-lane fused multiply-adds), whose 16 partial sums are added
  * here.
  *

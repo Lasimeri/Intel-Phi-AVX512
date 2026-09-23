@@ -1,6 +1,6 @@
 # vpu_matmul.c and vpu_matmul.h: the card as a matrix-multiply engine
 
-The service behind the ggml backend (`host/crates/phi-ggml`): three
+The service behind the ggml backend (`host/crates/phi-ggml`): four
 request kinds on the worker's doorbell, with a descriptor
 (`struct vpu_matmul`, 128 bytes) in the control area at
 `VPU_OFF_MATMUL`.
@@ -10,6 +10,9 @@ request kinds on the worker's doorbell, with a descriptor
   else 4 KiB pages; each mapping remembers its own length and kind, see
   below) and keeps them under an id. A tensor uploaded again under the
   same id replaces the old one.
+- `VPU_K_MATMUL_ID`: the same with one matrix per column, ggml's
+  `MUL_MAT_ID`, which is where a mixture-of-experts model keeps almost
+  all of its weights (the section below).
 - `VPU_K_MATMUL`: `d[n][m] = a[m][k] . b[n][k]`, ggml's `MUL_MAT`
   (the result transposed, as ggml lays it out). `a` is a resident tensor
   (`a_id`) or, for a tensor the host does not keep, in the window; `b`
