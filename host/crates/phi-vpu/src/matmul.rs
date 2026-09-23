@@ -599,8 +599,18 @@ pub fn check(
         // A mixture: eight experts of the same rows, three picked per
         // token, with the activations shared between a token's columns
         // (a gate projection) and then one row per column (a down one).
-        for &(n_used, n_tokens, b_rows) in &[(3u64, 1u64, 1u64), (3, 5, 1), (3, 5, 3), (8, 2, 8)] {
-            check_id(w, threads, t, 61, 512, 8, n_used, n_tokens, b_rows, id, &mut rng)?;
+        for &(experts, n_used, n_tokens, b_rows) in &[
+            (8u64, 3u64, 1u64, 1u64),
+            (8, 3, 5, 1),
+            (8, 3, 5, 3),
+            (8, 8, 2, 8),
+            (2, 2, 32, 1),
+            (3, 4, 9, 4),
+        ] {
+            // The last two put many columns on one expert, so the card
+            // groups them eight and four at a time with their activation
+            // rows scattered; the first four leave groups of one.
+            check_id(w, threads, t, 61, 512, experts, n_used, n_tokens, b_rows, id, &mut rng)?;
             id += 1;
         }
         println!(
@@ -689,6 +699,11 @@ pub fn probe(w: &Window, threads: u32) -> Result<()> {
         t(11) / 1e3 / 1000.0
     );
     println!("the card's ceilings, all {threads} threads at once:");
+    println!(
+        "  phi_q4k_8 on a superblock in L1, every thread:      {:.0} ns per call ({:.1} GFLOP/s)",
+        t(18) / 20000.0,
+        threads as f64 * 20000.0 * 4096.0 / t(18)
+    );
     println!(
         "  aggregate read bandwidth (4 MiB each, prefetched): {:.1} GB/s",
         threads as f64 * 4.0 * 1048576.0 / t(12)

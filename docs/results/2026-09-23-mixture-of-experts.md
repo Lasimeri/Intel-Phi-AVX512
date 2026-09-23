@@ -152,3 +152,62 @@ cheaper road today. Fusing a whole expert feed-forward into one request
 (gate, up, the SiLU, the product, down, with the down projection split
 by its columns so the card needs nothing from the host in between) would
 turn three requests per layer into one and is the shape this wants next.
+
+## Grouping the columns by expert (later the same day)
+
+The gap above is closed as far as this loop can close it. The card now
+sorts a mixture's columns by the expert they chose (a counting sort over
+the ids, two passes, on the dispatcher before the pool runs) and cuts
+each expert's run into groups of eight, four or one, so an expert's rows
+are read once per group instead of once per column. The kernels take the
+group's activation rows as an array of pointers rather than a stride,
+which costs nothing: the prologue loads T - 1 pointers where it computed
+T - 1 addresses.
+
+On the 35B-A3B's big mixture multiply at 512 tokens, per card:
+
+| | host part | card compute | card total |
+| --- | --- | --- | --- |
+| one column at a time | 32.5 ms | 39.2 ms | 44.8 ms |
+| grouped by expert | 21.5 ms | **20.4 ms** | 27.3 ms |
+
+The card's arithmetic halved. What it did not do is make the card faster
+than the host at this: the host groups the same way and its kernels work
+in int8 against the card's float32, so per unit of work it remains about
+twice as quick, and the card's 8 ms of transport sits on top. Interleaved
+against the host alone, the whole model with the mixtures now going to
+the cards is pp512 86.6 against 85.8 and tg32 8.69 against 8.25: +1
+percent and +5. Leaving the batched mixtures with the host instead gives
+pp512 +3.7 percent, so that is still the better arrangement of the two,
+and the backend's per-tensor judgement is what chooses.
+
+## Two threads per core, since the kernel has issue to spare
+
+With the columns grouped, a thread's working set is about 24 KiB against
+a 32 KiB L1, which suggested that two threads per core would now be
+worth trying: the card's vector units are what it has most of, and
+bandwidth, on the link and to the host, what it has least of. Splitting
+each group's columns between the two threads (four each, both walking
+every row, so they read the same weight bytes and need no recombination,
+since the halves write different columns) halves the working set to 12
+KiB. It is implemented, correct, and not faster:
+
+| q6_K, 4096 x 5120, n 64 | 57 threads | 114 threads |
+| --- | --- | --- |
+| the loop | **209 GFLOP/s** | 188 (columns split), 190 (rows split) |
+| the kernel alone, a superblock in L1 | 413 GFLOP/s | **668** |
+
+The second thread does have issue to spare: the same kernel on
+L1-resident data goes from 413 to 668 GFLOP/s across the pool. The loop
+reaches only 65 percent of the one-thread figure because its activation
+blocks arrive from L2, and a second thread doubles that traffic. Nor is
+the footprint the problem: at one thread per core, chunks of 64, 32, 16
+and 8 give 206, 208, 197 and 161 GFLOP/s, so amortizing each 8 KiB block
+load over more rows matters more than fitting in L1.
+
+What that leaves as the way to spend the card's arithmetic on its
+bandwidth problem is not more threads but more arithmetic per byte
+across the link: a fused expert feed-forward (gate, up, the SiLU, the
+product, down, with the down projection split by its columns so the card
+needs nothing from the host in between) does three matrices' work for
+one round trip instead of three.

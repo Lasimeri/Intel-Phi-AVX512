@@ -109,3 +109,47 @@ row slicing for each, so a column is one activation row: right for
 generation, where every column of a token is a different expert, and
 not yet grouped by expert for a batch
 (`docs/results/2026-09-23-mixture-of-experts.md`).
+
+## Grouping a mixture's columns by expert
+
+A mixture's `n = n_used * n_tokens` columns each name an expert, and
+several of them name the same one. `groups_mixture` sorts the columns by
+expert (a counting sort, two passes over the ids) and cuts each expert's
+run into groups of eight, four or one, so the card reads that expert's
+rows once per group instead of once per column: at 512 tokens with eight
+experts used that is about 512 groups against 4096 columns. An ordinary
+multiply's groups are just its consecutive columns (`groups_plain`), so
+one loop serves both.
+
+The kernels take the group's activation rows as an **array of pointers**
+(`rdx`), not a stride, because the columns that chose an expert belong
+to whichever tokens chose it. That costs nothing: the prologue loads
+T - 1 pointers where it used to compute T - 1 addresses
+(`kernelgen/quant.md`).
+
+Measured on card 0, the mixture multiply of the 35B-A3B at 512 tokens:
+the card's compute fell from 39.2 ms to 20.4 ms. What it did not do is
+make the card faster than the host on those multiplies: the host groups
+the same way and its kernels work in int8, so per unit of work it stays
+about twice as quick, and the backend's judgement still decides case by
+case (`host/crates/phi-ggml/src/lib.md`).
+
+## Two threads per core, measured again
+
+With the columns grouped, a thread's working set is about 24 KiB (eight
+activation blocks and `chunk` x 8 accumulator vectors) against a 32 KiB
+L1, so two threads on a core cannot both hold one. Splitting a group's
+columns between them (four each, both walking every row, reading the
+same weight bytes) halves that to 12 KiB and needs no recombination,
+since the halves write different columns. It is implemented and it is
+still not better: q6_K at n 64 gives 188 GFLOP/s against 209 for one
+thread per core, at every chunk from 8 to 64.
+
+The reason is that the loop is not short of issue. The same kernel on a
+superblock held in L1 goes from 413 GFLOP/s across 57 threads to 668
+across 114, so the second thread has issue to spare; the real loop runs
+at about 65 percent of that rate because its activation blocks arrive
+from L2, and a second thread doubles that traffic. Shrinking the
+footprint does not help either: at one thread per core, chunks of 64,
+32, 16 and 8 give 206, 208, 197 and 161 GFLOP/s, because what matters is
+amortizing each 8 KiB block load over more rows, not fitting in L1.

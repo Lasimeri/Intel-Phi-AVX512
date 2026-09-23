@@ -41,11 +41,15 @@ void phi_dot4_f32(const void *a, const float *b, long k16, float *out, uint64_t 
 
 /* The quantized kernels: one superblock (256 weights) of a row against
  * 1, 4 or 8 activation rows (kernelgen/quant.md has the convention). */
-typedef void (*qkern)(const uint8_t *blk, const float *x, uint64_t xstride, float *scratch, float *acc, const float *consts, uint64_t next);
+/* `rows` is the array of T activation rows, whose first entry is also
+ * passed in `x`: a mixture's columns are grouped by the expert they
+ * chose, and their rows are wherever those tokens are, not a stride
+ * apart (kernelgen/quant.md). */
+typedef void (*qkern)(const uint8_t *blk, const float *x, const float *const *rows, float *scratch, float *acc, const float *consts, uint64_t next);
 #define QK(fmt) \
-    void phi_##fmt##_1(const uint8_t *, const float *, uint64_t, float *, float *, const float *, uint64_t); \
-    void phi_##fmt##_4(const uint8_t *, const float *, uint64_t, float *, float *, const float *, uint64_t); \
-    void phi_##fmt##_8(const uint8_t *, const float *, uint64_t, float *, float *, const float *, uint64_t);
+    void phi_##fmt##_1(const uint8_t *, const float *, const float *const *, float *, float *, const float *, uint64_t); \
+    void phi_##fmt##_4(const uint8_t *, const float *, const float *const *, float *, float *, const float *, uint64_t); \
+    void phi_##fmt##_8(const uint8_t *, const float *, const float *const *, float *, float *, const float *, uint64_t);
 QK(q4k) QK(q5k) QK(q6k) QK(q8_0) QK(iq4xs)
 void phi_probe(const uint8_t *blk, const float *x, const float *consts, float *out);
 void phi_bench(long kind, const void *buf, long count);
@@ -62,6 +66,9 @@ static int g_ncache;
 
 /* Streaming buffers, grown as needed. */
 static struct { struct mapping m; size_t cap; } g_a, g_b, g_d;
+/* The column groups of one request, and the counting sort behind a
+ * mixture's (struct group[] and uint32_t[]). */
+static struct { struct mapping m; size_t cap; } g_groups, g_order;
 
 /* Every buffer carries this much past its data: the unaligned load pairs
  * of the quantized kernels read up to 63 bytes beyond a block. */
@@ -237,6 +244,22 @@ static float q8_0_tail(const uint8_t *blk, const float *x, int nblocks)
 #define ROW_CHUNK_MAX 64
 #define POOL_SLOTS 58
 
+/* Up to eight columns that share a weight matrix, which is what one
+ * call of a kernel takes: which matrix, where each column's activation
+ * row starts, and which column of d it writes. An ordinary multiply's
+ * columns are consecutive and all share the one matrix; a mixture's are
+ * the columns that chose the same expert, gathered from wherever their
+ * tokens are. Grouping them is what makes the card read an expert's
+ * rows once per group instead of once per column, as ggml's own kernel
+ * does with the tokens it gathers per expert. */
+#define GROUP_MAX 8
+struct group {
+    const unsigned char *a;
+    const float *x[GROUP_MAX];
+    uint32_t dst[GROUP_MAX];
+    int n;                          /* 1, 4 or 8: the kernel variants */
+};
+
 struct job {
     const unsigned char *a;
     const unsigned char *b;
@@ -244,6 +267,9 @@ struct job {
     uint64_t m, n, k, nb_a, nb_b;
     uint32_t type;
     uint32_t chunk;
+    /* The column groups, built once per request before the pool runs. */
+    const struct group *groups;
+    uint64_t ngroups;
     /* MUL_MAT_ID: the n columns each pick an expert. Column p (which is
      * j + t * n_used) multiplies expert ids[p], whose m rows start at
      * a + ids[p] * a_stride, by b's row (j % b_rows) + t * b_rows. */
@@ -306,34 +332,119 @@ static void rows_slice_q(void *arg, int slice, int nslices)
     uint64_t chunk = j->chunk;
     for (uint64_t i = i0; i < i1; i += chunk) {
         uint64_t rows = i1 - i < chunk ? i1 - i : chunk;
-        uint64_t c = 0;
-        while (c < j->n) {
-            int T = group_of(j->n - c);
+        for (uint64_t gi = 0; gi < j->ngroups; gi++) {
+            const struct group *g = &j->groups[gi];
+            /* How two threads sharing a core divide a group: by columns
+             * (both walk every row, each takes four of the eight) rather
+             * than by rows, so they read the same weight bytes and hold
+             * half the activation blocks and half the accumulators each.
+             * Measured 2026-09-23 and kept because it is the better of
+             * the two, but **neither beats one thread per core** on this
+             * loop: 188 GFLOP/s against 209 for q6_K at n 64. The second
+             * thread has issue to spare (the kernel alone, on a
+             * superblock in L1, goes from 413 to 668 GFLOP/s across the
+             * pool) and what stops the loop reaching it is the
+             * activation blocks arriving from L2, which the second
+             * thread doubles. The pool is started with one thread per
+             * core for that reason; this path runs only if it is not. */
+            int T = g->n, c0 = 0;
+            uint64_t r0 = mate, rstep = nmates;
+            if (nmates == 2 && T == 8) {
+                T = 4;
+                c0 = mate * 4;
+                r0 = 0;
+                rstep = 1;
+            }
             qkern kern = T == 8 ? f->k8 : T == 4 ? f->k4 : f->k1;
-            const float *x = (const float *)(j->b + c * j->nb_b);
-            const uint8_t *base = (const uint8_t *)j->a + i * j->nb_a;
+            const uint8_t *base = (const uint8_t *)g->a + i * j->nb_a;
             uint64_t mine = 0;
-            for (uint64_t r = mate; r < rows; r += nmates) mine++;
+            for (uint64_t r = r0; r < rows; r += rstep) mine++;
             memset(acc, 0, mine * (size_t)T * 64);
             /* superblock outermost: its activation block and the accumulators
              * stay in L1 across the rows; the weights stream */
             for (uint64_t s = 0; s < ns; s++) {
+                const float *xs[GROUP_MAX];
                 float *a = acc[0];
-                for (uint64_t r = mate; r < rows; r += nmates, a += T * 16)
-                    kern(base + r * j->nb_a + s * bb, x + s * 256, j->nb_b, scratch, a, cs, (uint64_t)nmates * j->nb_a);
+                for (int q = 0; q < T; q++) xs[q] = g->x[c0 + q] + s * 256;
+                for (uint64_t r = r0; r < rows; r += rstep, a += T * 16)
+                    kern(base + r * j->nb_a + s * bb, xs[0], xs, scratch, a, cs, rstep * j->nb_a);
             }
             float *a = acc[0];
-            for (uint64_t r = mate; r < rows; r += nmates, a += T * 16) {
+            for (uint64_t r = r0; r < rows; r += rstep, a += T * 16) {
                 for (int q = 0; q < T; q++) {
                     float sum = sum16(a + q * 16);
                     if (tail)
-                        sum += q8_0_tail(base + r * j->nb_a + ns * bb, x + (size_t)q * (j->nb_b / 4) + ns * 256, (int)(tail / 32));
-                    j->d[(c + q) * j->m + i + r] = sum;
+                        sum += q8_0_tail(base + r * j->nb_a + ns * bb, g->x[c0 + q] + ns * 256, (int)(tail / 32));
+                    j->d[(uint64_t)g->dst[c0 + q] * j->m + i + r] = sum;
                 }
             }
-            c += T;
         }
     }
+}
+
+/* The column groups of an ordinary multiply: consecutive columns, one
+ * matrix, eight at a time while eight are left. */
+static uint64_t groups_plain(struct group *gs, const struct job *j)
+{
+    uint64_t ng = 0;
+    for (uint64_t c = 0; c < j->n;) {
+        int T = group_of(j->n - c);
+        gs[ng].a = j->a;
+        gs[ng].n = T;
+        for (int q = 0; q < T; q++) {
+            gs[ng].x[q] = (const float *)(j->b + (c + q) * j->nb_b);
+            gs[ng].dst[q] = (uint32_t)(c + q);
+        }
+        ng++;
+        c += T;
+    }
+    return ng;
+}
+
+/* Where column p's activation row is: its expert slot picks b's row
+ * within the token, the token picks the block of rows. */
+static const float *mix_row(const struct job *j, uint64_t p)
+{
+    uint64_t t = p / j->n_used, col = p % j->n_used;
+    return (const float *)(j->b + ((col % j->b_rows) + t * j->b_rows) * j->nb_b);
+}
+
+/* The column groups of a mixture: the columns that chose each expert,
+ * in groups of eight, four or one. A counting sort over the ids (one
+ * pass to count, one to place), so an expert's rows are read once per
+ * group rather than once per column: at 512 tokens with eight experts
+ * used that is 4096 columns against about 512 groups. `order` holds
+ * `experts` counts and then the n column indices. */
+static uint64_t groups_mixture(struct group *gs, const struct job *j, uint64_t experts, uint32_t *order)
+{
+    uint32_t *count = order, *at = order + experts;
+    memset(count, 0, experts * sizeof *count);
+    for (uint64_t p = 0; p < j->n; p++) count[j->ids[p]]++;
+    uint32_t sum = 0;
+    for (uint64_t e = 0; e < experts; e++) {
+        uint32_t c = count[e];
+        count[e] = sum;
+        sum += c;
+    }
+    for (uint64_t p = 0; p < j->n; p++) at[count[j->ids[p]]++] = (uint32_t)p;
+    /* count[e] is now the end of expert e's run; walk the runs. */
+    uint64_t ng = 0, start = 0;
+    for (uint64_t e = 0; e < experts; e++) {
+        uint64_t end = count[e];
+        while (start < end) {
+            int T = group_of(end - start);
+            gs[ng].a = j->a + e * j->a_stride;
+            gs[ng].n = T;
+            for (int q = 0; q < T; q++) {
+                uint32_t p = at[start + q];
+                gs[ng].x[q] = mix_row(j, p);
+                gs[ng].dst[q] = p;
+            }
+            ng++;
+            start += T;
+        }
+    }
+    return ng;
 }
 
 static void rows_slice(void *arg, int slice, int nslices)
@@ -409,10 +520,43 @@ static uint64_t bench_pool(long kind, unsigned char *buf, size_t per, long count
     return now_ns() - t0;
 }
 
+/* The eight-row Q4_K kernel on one superblock every thread holds in its
+ * own L1, 20000 calls each: the kernel's issue rate with no memory
+ * behind it, so that the pool's scaling can be read without the working
+ * set in the way. One thread per core against two answers whether a
+ * second thread on the core can make this kernel faster at all. */
+static void kernel_slice(void *arg, int slice, int nslices)
+{
+    (void)nslices;
+    float tab[TAB_FLOATS] __attribute__((aligned(64)));
+    float acc[8][16] __attribute__((aligned(64)));
+    float x[8 * 256] __attribute__((aligned(64)));
+    unsigned char blk[256] __attribute__((aligned(64)));
+    const float *xs[GROUP_MAX];
+    memset(acc, 0, sizeof acc);
+    memset(x, 0, sizeof x);
+    memset(blk, (unsigned char)(slice + 1), sizeof blk);
+    for (int q = 0; q < GROUP_MAX; q++) xs[q] = x + q * 256;
+    for (int rep = 0; rep < 20000; rep++)
+        phi_q4k_8(blk, xs[0], xs, tab, acc[0], (const float *)arg, 144);
+}
+
+static uint64_t bench_kernel_pool(int threads)
+{
+    uint64_t t0 = now_ns();
+    vpu_pool_map(kernel_slice, g_consts, threads);
+    return now_ns() - t0;
+}
+
 /* One expert per column: the thread's rows of expert ids[p], for every
  * column p, against that column's activation row. A column at a time
  * (the one-row kernels), which is what generation asks for anyway: there
  * every column is a different expert of the same token. */
+/* A mixture with float weights: one column at a time, because the float
+ * kernels take their four columns at a fixed stride and there is
+ * nothing to group them with. The quantized types do not come here;
+ * their columns are grouped by expert before the pool runs
+ * (`groups_mixture`). */
 static void rows_slice_id(void *arg, int slice, int nslices)
 {
     struct job *j = arg;
@@ -523,18 +667,20 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
         {
             float tab[TAB_FLOATS] __attribute__((aligned(64))), acc[8][16] __attribute__((aligned(64)));
             const float *x = g_b.m.p, *cs = (const float *)g_consts;
+            const float *xs[GROUP_MAX];
+            for (int q = 0; q < GROUP_MAX; q++) xs[q] = x + q * 256;
             memset(acc, 0, sizeof acc);
             b0 = now_ns();
-            for (int rep = 0; rep < 100000; rep++) phi_q4k_1(g_a.m.p, x, 1024, tab, acc[0], cs, 144);
+            for (int rep = 0; rep < 100000; rep++) phi_q4k_1(g_a.m.p, x, xs, tab, acc[0], cs, 144);
             times[7] = now_ns() - b0;
             b0 = now_ns();
-            for (int rep = 0; rep < 100000; rep++) phi_q4k_8(g_a.m.p, x, 1024, tab, acc[0], cs, 144);
+            for (int rep = 0; rep < 100000; rep++) phi_q4k_8(g_a.m.p, x, xs, tab, acc[0], cs, 144);
             times[8] = now_ns() - b0;
             b0 = now_ns();
-            for (int rep = 0; rep < 100000; rep++) phi_q4k_1(g_a.m.p + (size_t)rep * 144, x, 1024, tab, acc[0], cs, 144);
+            for (int rep = 0; rep < 100000; rep++) phi_q4k_1(g_a.m.p + (size_t)rep * 144, x, xs, tab, acc[0], cs, 144);
             times[9] = now_ns() - b0;
             b0 = now_ns();
-            for (int rep = 0; rep < 100000; rep++) phi_q5k_1(g_a.m.p + (size_t)rep * 176, x, 1024, tab, acc[0], cs, 176);
+            for (int rep = 0; rep < 100000; rep++) phi_q5k_1(g_a.m.p + (size_t)rep * 176, x, xs, tab, acc[0], cs, 176);
             times[10] = now_ns() - b0;
         }
         /* The two ceilings, with every thread of the request working: the
@@ -544,6 +690,9 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
          * either; which one it is under tells what to work on. */
         times[12] = bench_pool(3, g_a.m.p, per, (long)(per / 64), threads);
         times[13] = bench_pool(0, NULL, 0, 1000000, threads);
+        /* the eight-row kernel itself, every thread on its own L1-resident
+         * superblock: issue scaling with no working set in the way */
+        times[18] = bench_kernel_pool(threads);
         /* The two ways bytes cross the link, at the size a token's
          * activations and results are: the block device (a request each
          * way, whose cost is nearly all fixed) and the window mapped
@@ -604,7 +753,7 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
     uint32_t chunk = (uint32_t)mm.chunk;
     if (chunk < 1 || chunk > ROW_CHUNK_MAX) chunk = ROW_CHUNK;
     struct job j = { a, (const unsigned char *)g_b.m.p + mm.ids_bytes, g_d.m.p, mm.m, mm.n, mm.k,
-                     mm.nb_a, mm.nb_b, mm.a_type, chunk, (const int32_t *)g_b.m.p,
+                     mm.nb_a, mm.nb_b, mm.a_type, chunk, NULL, 0, (const int32_t *)g_b.m.p,
                      mixture ? mm.n_used : 0, mixture ? mm.b_rows : 0, mixture ? mm.m * mm.nb_a : 0 };
     int max = vpu_pool_threads() + 1;
     if (max > POOL_SLOTS) max = POOL_SLOTS;
@@ -614,14 +763,27 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
     /* An id that would read past what this tensor's slice holds is a
      * broken request, not a segfault: the ids come from the host and are
      * checked here, once, before any thread runs. */
+    uint64_t experts = 1;
     if (mixture) {
         uint64_t have = (mm.a_id != 0) ? g_cache[cache_find(mm.a_id)].bytes : g_a.cap;
-        uint64_t experts = j.a_stride ? have / j.a_stride : 0;
+        experts = j.a_stride ? have / j.a_stride : 0;
         for (uint64_t p = 0; p < mm.n; p++)
             if (j.ids[p] >= (int32_t)experts) return VPU_E_REQUEST;
     }
+    /* The columns in groups of eight, four or one, built once here and
+     * read by every thread. The float kernels take one column at a time
+     * and do not use them. */
+    void (*slice)(void *, int, int) = mixture ? rows_slice_id : rows_slice;
+    if (quantized(mm.a_type)) {
+        if (grow(&g_groups, mm.n * sizeof(struct group)) != 0) return VPU_E_ALLOC;
+        if (mixture && grow(&g_order, (experts + mm.n) * sizeof(uint32_t)) != 0) return VPU_E_ALLOC;
+        j.groups = (const struct group *)g_groups.m.p;
+        j.ngroups = mixture ? groups_mixture((struct group *)g_groups.m.p, &j, experts, (uint32_t *)g_order.m.p)
+                            : groups_plain((struct group *)g_groups.m.p, &j);
+        slice = rows_slice;
+    }
     uint64_t c0 = now_ns();
-    *live = vpu_pool_map(mixture ? rows_slice_id : rows_slice, &j, threads);
+    *live = vpu_pool_map(slice, &j, threads);
     *compute_ns = now_ns() - c0;
 
     uint64_t p0 = now_ns();

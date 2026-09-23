@@ -14,7 +14,8 @@
 //! ```text
 //!   rdi  the superblock (the block's first byte; Q8_0: eight consecutive blocks)
 //!   rsi  the first activation row, 256 floats, 64-byte aligned
-//!   rdx  bytes between activation rows (a multiple of 64)
+//!   rdx  an array of T pointers, one per activation row (entry 0 is rsi
+//!        again); each row is 256 floats, 64-byte aligned
 //!   rcx  the superblock's table: 16 scales, 16 minuends (`TAB_SC`, `TAB_MN`)
 //!   r8   the accumulators, T x 16 floats, 64-byte aligned, read and written
 //!   r9   the constants, 64-byte aligned, the same for every call (`C_*`)
@@ -133,8 +134,14 @@ fn prologue(a: &mut Asm, name: &str, t: usize, what: &str, block_bytes: i32, pre
         a.t("push %r15");
     }
     prep(a);
-    for i in 1..t {
-        a.t(&format!("lea (%{},%{},1), %{}", ROWS[i - 1], STRIDE, ROWS[i]));
+    // The rows after the first come from the caller's array, not from a
+    // stride: a mixture of experts groups the columns that chose the
+    // same expert, and those columns' activation rows are wherever the
+    // tokens that chose it happen to be. It is the same instruction
+    // count as the chain of `lea`s this replaces, and rdx is read by
+    // nothing else in these kernels.
+    for (i, &row) in ROWS.iter().enumerate().take(t).skip(1) {
+        a.t(&format!("mov {}(%{}), %{}", 8 * i, STRIDE, row));
     }
     for i in 0..t {
         a.i(&vmovaps_load(Zmm(i as u8), Mem::new(ACC, 64 * i as i32)));

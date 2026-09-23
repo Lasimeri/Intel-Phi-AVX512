@@ -84,3 +84,10 @@ B; the stack's LLVM is patched not to emit it, `Intel-Phi-3120A`,
 with `trap invalid opcode` (2026-09-23). Compiled code cannot reach it;
 the scalar scaffolding this generator writes by hand can, so it is
 written as if for a P54C.
+
+The activation rows after the first come from an array of pointers the
+caller passes in `rdx`, not from a stride: a mixture of experts groups
+the columns that chose the same expert, and those columns belong to
+whichever tokens chose it, so their rows are not a fixed distance apart
+(`card/vpu/vpu_matmul.md`). The prologue loads T - 1 pointers where it
+used to compute T - 1 addresses, which is the same instruction count.
