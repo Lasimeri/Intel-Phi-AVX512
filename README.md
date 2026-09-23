@@ -85,8 +85,11 @@ multiplies it on its 57 threads with the kernels of
 `card/vpu/vpu_matmul_kernel.S` (the quantized formats decoded on the
 vector unit, `host/crates/phi-vpu/src/bin/kernelgen/quant.md`), while
 the host computes the rest with ggml's own CPU kernels; the results are
-gathered per multiply. The program itself is an ordinary build for this
-host.
+gathered per multiply. A card is asked only when it would finish the
+multiply sooner: three rules decide that, one of them from what the
+backend times on each weight tensor as it runs
+(`host/crates/phi-ggml/src/lib.md`). The program itself is an ordinary
+build for this host.
 
 ```
 scripts/phi-ggml.sh ./llama-cli -m model.gguf -p "..." -t 12   # the host and every card that is up
