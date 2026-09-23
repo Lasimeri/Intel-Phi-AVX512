@@ -85,6 +85,14 @@ enum Cmd {
         /// Diagnostic: print what the kernels' instructions produce on the card.
         #[arg(long)]
         probe: bool,
+        /// Rows the card takes per chunk (0: its own default, 16).
+        #[arg(long, default_value_t = 0)]
+        chunk: u64,
+        /// Times each rate shape this often and reports the best (the
+        /// weights are uploaded once, so only the first pays the pool's
+        /// wake and first touch).
+        #[arg(long, default_value_t = 7)]
+        repeat: u32,
     },
 }
 
@@ -236,13 +244,15 @@ fn main() -> Result<()> {
             only,
             pattern,
             probe,
+            repeat,
+            chunk,
         } => {
             let w = Window::open(&window, phi_vpu::matmul::WINDOW_LEN as usize)?;
             wait_ready(&w, Duration::from_secs(5))?;
             if probe {
                 return phi_vpu::matmul::probe(&w, threads);
             }
-            phi_vpu::matmul::check(&w, threads, only.as_deref(), pattern)
+            phi_vpu::matmul::check(&w, threads, only.as_deref(), pattern, repeat, chunk)
         }
     }
 }

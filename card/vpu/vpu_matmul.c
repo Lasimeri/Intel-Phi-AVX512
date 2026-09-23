@@ -46,7 +46,7 @@ typedef void (*qkern)(const uint8_t *blk, const float *x, uint64_t xstride, floa
     void phi_##fmt##_8(const uint8_t *, const float *, uint64_t, float *, float *, const float *, uint64_t);
 QK(q4k) QK(q5k) QK(q6k) QK(q8_0) QK(iq4xs)
 void phi_probe(const uint8_t *blk, const float *x, const float *consts, float *out);
-void phi_bench(long kind, const void *buf);
+void phi_bench(long kind, const void *buf, long count);
 
 /* A mapping: huge pages when the card had some left, else 4 KiB pages;
  * `len` is what was mapped, so the unmap matches (a free of the rounded
@@ -228,8 +228,11 @@ static float q8_0_tail(const uint8_t *blk, const float *x, int nblocks)
 }
 
 /* Rows go in chunks so that a chunk's weights and one group of activation
- * rows stay in the core's 512 KiB L2 together. */
-#define ROW_CHUNK 16
+ * rows stay in the core's 512 KiB L2 together. The chunk is what the
+ * host's `reserved[0]` overrides (phi-vpu matmul-check --chunk), which is
+ * how the shape was measured rather than argued. */
+#define ROW_CHUNK 32
+#define ROW_CHUNK_MAX 64
 #define POOL_SLOTS 58
 
 struct job {
@@ -238,6 +241,7 @@ struct job {
     float *d;
     uint64_t m, n, k, nb_a, nb_b;
     uint32_t type;
+    uint32_t chunk;
 };
 
 static float sum16(const float *v)
@@ -291,9 +295,10 @@ static void rows_slice_q(void *arg, int slice, int nslices)
     const float *cs = (const float *)g_consts;
     float scratch[TAB_FLOATS] __attribute__((aligned(64)));
     /* the accumulators of this thread's rows of the chunk, T vectors each, packed */
-    float acc[ROW_CHUNK * 8][16] __attribute__((aligned(64)));
-    for (uint64_t i = i0; i < i1; i += ROW_CHUNK) {
-        uint64_t rows = i1 - i < ROW_CHUNK ? i1 - i : ROW_CHUNK;
+    float acc[ROW_CHUNK_MAX * 8][16] __attribute__((aligned(64)));
+    uint64_t chunk = j->chunk;
+    for (uint64_t i = i0; i < i1; i += chunk) {
+        uint64_t rows = i1 - i < chunk ? i1 - i : chunk;
         uint64_t c = 0;
         while (c < j->n) {
             int T = group_of(j->n - c);
@@ -370,6 +375,33 @@ static void rows_slice(void *arg, int slice, int nslices)
     }
 }
 
+/* A slice that does nothing: the probe times the dispatch itself. */
+static void noop_slice(void *arg, int slice, int nslices)
+{
+    (void)arg; (void)slice; (void)nslices;
+}
+
+/* The whole pool running phi_bench at once, each thread on its own
+ * region of the buffer: the card's aggregate rates, which are what a
+ * matrix multiply is measured against (one thread's rate times 57 is
+ * not: the memory system is shared, the vector units are not). */
+struct bench_job { long kind; unsigned char *buf; size_t per; long count; };
+
+static void bench_slice(void *arg, int slice, int nslices)
+{
+    struct bench_job *b = arg;
+    (void)nslices;
+    phi_bench(b->kind, b->buf + (size_t)slice * b->per, b->count);
+}
+
+static uint64_t bench_pool(long kind, unsigned char *buf, size_t per, long count, int threads)
+{
+    struct bench_job b = { kind, buf, per, count };
+    uint64_t t0 = now_ns();
+    vpu_pool_map(bench_slice, &b, threads);
+    return now_ns() - t0;
+}
+
 static size_t blocks(uint64_t bytes)
 {
     return (size_t)((bytes + VPU_BLOCK - 1) & ~(uint64_t)(VPU_BLOCK - 1));
@@ -440,19 +472,23 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
         /* the raw rates, on this thread: issue (compute_ns), then the streaming
          * variants of phi_bench, their times in ns as 8 u64 at d + 512 */
         uint64_t b0 = now_ns();
-        phi_bench(0, NULL);
+        phi_bench(0, NULL, 0);
         *compute_ns = now_ns() - b0;
-        if (grow(&g_a, 64u << 20) != 0) return VPU_E_ALLOC;
-        memset(g_a.m.p, 0, 64u << 20);
+        /* one region per thread for the pool-wide walks, and 64 MiB for
+         * the single-thread ones */
+        size_t per = 4u << 20, want = (size_t)threads * per;
+        if (want < (64u << 20)) want = 64u << 20;
+        if (grow(&g_a, want) != 0) return VPU_E_ALLOC;
+        memset(g_a.m.p, 0, want);
         uint64_t *times = (uint64_t *)((unsigned char *)g_d.m.p + 512);
         for (long kind = 1; kind <= 5; kind++) {
             b0 = now_ns();
-            phi_bench(kind, g_a.m.p);
+            phi_bench(kind, g_a.m.p, 0);
             times[kind] = now_ns() - b0;
         }
         /* kind 1 again on a 256 KiB walk (L2 resident): 1 M loads over the same 4096 lines */
         b0 = now_ns();
-        for (int rep = 0; rep < 256; rep++) phi_bench(6, g_a.m.p);
+        for (int rep = 0; rep < 256; rep++) phi_bench(6, g_a.m.p, 0);
         times[6] = now_ns() - b0;
         /* the Q4_K kernels on one superblock held in L1 (compute only), 100 k calls,
          * one activation row and eight; then walking 64 MiB of weights, one row */
@@ -473,6 +509,19 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
             for (int rep = 0; rep < 100000; rep++) phi_q5k_1(g_a.m.p + (size_t)rep * 176, x, 1024, tab, acc[0], cs, 176);
             times[10] = now_ns() - b0;
         }
+        /* The two ceilings, with every thread of the request working: the
+         * card's aggregate read bandwidth (4 MiB per thread, prefetched)
+         * and its aggregate vector issue rate (register fused
+         * multiply-adds, nothing from memory). A multiply cannot beat
+         * either; which one it is under tells what to work on. */
+        times[12] = bench_pool(3, g_a.m.p, per, (long)(per / 64), threads);
+        times[13] = bench_pool(0, NULL, 0, 1000000, threads);
+        /* What one dispatch across `threads` threads costs with nothing to
+         * do: the pool's fixed cost per request, which a small multiply
+         * pays in full (1000 rounds). */
+        b0 = now_ns();
+        for (int rep = 0; rep < 1000; rep++) vpu_pool_map(noop_slice, NULL, threads);
+        times[11] = now_ns() - b0;
         if (vpu_push(g_d.m.p, VPU_BLOCK, mm.d_off) != 0) return VPU_E_PUSH;
         return VPU_OK;
     }
@@ -496,7 +545,9 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
     if (vpu_pull(g_b.m.p, blen, mm.b_off) != 0) return VPU_E_PULL;
     *pull_ns = now_ns() - t0;
 
-    struct job j = { a, g_b.m.p, g_d.m.p, mm.m, mm.n, mm.k, mm.nb_a, mm.nb_b, mm.a_type };
+    uint32_t chunk = (uint32_t)mm.reserved[0];
+    if (chunk < 1 || chunk > ROW_CHUNK_MAX) chunk = ROW_CHUNK;
+    struct job j = { a, g_b.m.p, g_d.m.p, mm.m, mm.n, mm.k, mm.nb_a, mm.nb_b, mm.a_type, chunk };
     int max = vpu_pool_threads() + 1;
     if (max > POOL_SLOTS) max = POOL_SLOTS;
     if (threads < 1) threads = 1;

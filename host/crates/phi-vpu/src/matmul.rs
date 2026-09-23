@@ -166,6 +166,9 @@ pub fn f32_to_f16(f: f32) -> u16 {
 /// When set, every quant byte is this value instead of random: a diagnostic
 /// (`--pattern`), so a wrong mapping shows as a fixed ratio.
 static PATTERN: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+/// The rows per chunk the card is asked to use (0: its own default),
+/// carried in the descriptor as reserved[0].
+static CHUNK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 struct Rng(u64);
 
@@ -349,9 +352,12 @@ fn as_bytes(v: &[f32]) -> &[u8] {
 
 /// One shape of one type: upload random weights, multiply against random
 /// activations on the card, compare with the host reference (f64 dot of
-/// the dequantized row); returns the card's compute time.
+/// the dequantized row); returns the card's compute times, one per
+/// repeat (the weights are uploaded once, so the repeats have no host
+/// work between them: the pool stays spinning and the first-touch and
+/// futex-wake costs land only on the first).
 #[allow(clippy::too_many_arguments)]
-fn check_one(w: &Window, threads: u32, t: u32, m: u64, k: u64, n: u64, id: u64, rng: &mut Rng) -> Result<Duration> {
+fn check_one(w: &Window, threads: u32, t: u32, m: u64, k: u64, n: u64, id: u64, rng: &mut Rng, reps: u32) -> Result<Vec<Duration>> {
     let nb_a = row_bytes(t, k);
     let nb_b = k * 4;
     let mut a = Vec::with_capacity((m * nb_a) as usize);
@@ -384,9 +390,13 @@ fn check_one(w: &Window, threads: u32, t: u32, m: u64, k: u64, n: u64, id: u64, 
         nb_b,
         b_off: OFF_B,
         d_off: OFF_D,
-        reserved: [0; 5],
+        reserved: [CHUNK.load(Ordering::Relaxed), 0, 0, 0, 0],
     };
-    let rep = request(w, threads, K_MATMUL, &mm, Duration::from_secs(60))?;
+    let mut took = Vec::with_capacity(reps.max(1) as usize);
+    for _ in 0..reps.max(1) {
+        let rep = request(w, threads, K_MATMUL, &mm, Duration::from_secs(60))?;
+        took.push(Duration::from_nanos(rep.compute_ns));
+    }
     let mut d = vec![0u8; (n * m * 4) as usize];
     w.get(OFF_D, &mut d);
     let free = Matmul {
@@ -422,13 +432,20 @@ fn check_one(w: &Window, threads: u32, t: u32, m: u64, k: u64, n: u64, id: u64, 
     if bad > 0 {
         bail!("{}: {bad} of {} results outside tolerance", type_name(t), n * m);
     }
-    Ok(Duration::from_nanos(rep.compute_ns))
+    Ok(took)
+}
+
+/// The best and the median of a set of times.
+fn best_median(mut v: Vec<Duration>) -> (f64, f64) {
+    v.sort();
+    (v[0].as_secs_f64(), v[v.len() / 2].as_secs_f64())
 }
 
 /// Every type at small odd shapes and each activation-row count the
 /// kernels distinguish, then the weight rate at a model-sized shape.
-pub fn check(w: &Window, threads: u32, only: Option<&str>, pattern: Option<u8>) -> Result<()> {
+pub fn check(w: &Window, threads: u32, only: Option<&str>, pattern: Option<u8>, reps: u32, chunk: u64) -> Result<()> {
     PATTERN.store(pattern.map_or(-1, |p| p as i32), Ordering::Relaxed);
+    CHUNK.store(chunk, Ordering::Relaxed);
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     let all = [MM_F32, MM_F16, MM_Q4_K, MM_Q5_K, MM_Q6_K, MM_Q8_0, MM_IQ4_XS];
     let types: Vec<u32> = all.iter().copied().filter(|&t| only.is_none_or(|o| o == type_name(t))).collect();
@@ -439,7 +456,7 @@ pub fn check(w: &Window, threads: u32, only: Option<&str>, pattern: Option<u8>) 
     for &t in &types {
         for &n in &[1u64, 4, 8, 13] {
             let k = if t == MM_Q8_0 && n == 13 { 544 } else { 512 };
-            check_one(w, threads, t, 61, k, n, id, &mut rng)?;
+            check_one(w, threads, t, 61, k, n, id, &mut rng, 1)?;
             id += 1;
         }
         println!(
@@ -448,18 +465,18 @@ pub fn check(w: &Window, threads: u32, only: Option<&str>, pattern: Option<u8>) 
         );
     }
     println!();
-    println!("weight rate, 4096 x 5120 rows on {threads} threads (the card's compute time only):");
+    println!("weight rate, 4096 x 5120 rows on {threads} threads, best of {reps} (the card's compute time only):");
     for &t in &types {
         let (m, k) = (4096u64, 5120u64);
         let bytes = m * row_bytes(t, k);
         for &n in &[1u64, 8, 64] {
-            let took = check_one(w, threads, t, m, k, n, id, &mut rng)?;
+            let (s, med) = best_median(check_one(w, threads, t, m, k, n, id, &mut rng, reps)?);
             id += 1;
-            let s = took.as_secs_f64();
             println!(
-                "  {:7} n {n:3}: {:8.3} ms, {:6.1} GB/s of weights, {:7.1} GFLOP/s",
+                "  {:7} n {n:3}: {:8.3} ms (median {:8.3}), {:6.1} GB/s of weights, {:7.1} GFLOP/s",
                 type_name(t),
                 s * 1e3,
+                med * 1e3,
                 bytes as f64 / s / 1e9,
                 2.0 * (m * k * n) as f64 / s / 1e9
             );
@@ -516,6 +533,20 @@ pub fn probe(w: &Window, threads: u32) -> Result<()> {
     println!("  phi_q4k_8 on one superblock in L1:           {:.0} ns per call", t(8) / 1e5);
     println!("  phi_q4k_1 walking 14 MiB of weights:         {:.0} ns per call", t(9) / 1e5);
     println!("  phi_q5k_1 walking 17 MiB of weights:         {:.0} ns per call", t(10) / 1e5);
+    println!(
+        "  one dispatch across {threads} threads, no work:    {:.1} us",
+        t(11) / 1e3 / 1000.0
+    );
+    println!("the card's ceilings, all {threads} threads at once:");
+    println!(
+        "  aggregate read bandwidth (4 MiB each, prefetched): {:.1} GB/s",
+        threads as f64 * 4.0 * 1048576.0 / t(12)
+    );
+    println!(
+        "  aggregate vector issue (register FMAs):            {:.1} GFLOP/s ({:.2} ns per FMA per thread)",
+        threads as f64 * 8e6 * 32.0 / t(13),
+        t(13) / 8e6
+    );
     let names = [
         "float unpack {uint8} at +3 (bytes 3..18)",
         "int32 unpack {uint8} at +3 (as int bits)",

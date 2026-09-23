@@ -49,3 +49,11 @@ share a worker (`phi_vpu::matmul`).
 
 `ggml_backend_init` is exported here (a `cdylib` exports only what Rust
 declares) and returns the registration built in C.
+
+`PHI_GGML_CARD_BYTES` is 4.4 GB per card now, which is what a 5.5 GiB
+card holds beside its worker when the seamless path's page pool is left
+empty (`phi-vpu-worker -e 0`, which `scripts/phi-ggml.sh` passes). For
+the 27B this is the binding constraint on generation: the host is the
+long pole in every multiply and the cards wait, so what they hold is
+what they contribute
+(`docs/results/2026-09-23-ceilings-and-residency.md`).

@@ -34,3 +34,26 @@ card daemons a CPU each, and give the program the same `-t`),
 and each card's timings, and every slice kept resident. The workers
 must know the matmul service and its formats (deploy from this tree:
 `scripts/phi-vpu.sh -c N deploy`, then `start`).
+
+## The share is taken from the model's size
+
+Each card keeps `PHI_GGML_FRACTION` of every weight matrix's rows, and
+what that should be is the card's budget over the model's bytes: too
+small and the card's memory sits empty, too large and the budget runs
+out partway through the model, leaving the last layers entirely to the
+host. With no `PHI_GGML_FRACTION` set and a `-m FILE` in the command,
+this script computes it (`budget / bytes`, capped at one card's worth of
+rows) and says so. For the 27B and two cards that is 0.251, half the
+model resident.
+
+Workers this script starts are given `-e 0` (the seamless path's 512 MiB
+page pool left to the multiplies) and `PHI_VPU_HUGEPAGES=2400`, both for
+the same reason: on this model the cards' residency is what bounds
+generation, not their speed
+(`docs/results/2026-09-23-ceilings-and-residency.md`).
+
+The cards' host windows (`~/.config/phi/cards`, the sibling stack's
+`HOSTMEM` column) need only 768 MiB for this backend. They are 6G each
+by default, and two of those on a 31 GiB host leave less page cache than
+a 17.6 GB model needs: the host then reads weights from the NVMe while
+it works (pp64 6.22 against 9.33). 2G each is the setting here.

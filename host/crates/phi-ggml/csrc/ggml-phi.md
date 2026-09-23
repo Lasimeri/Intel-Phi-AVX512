@@ -31,3 +31,11 @@ compiled against).
 
 C here is the exception the repository allows: ggml's interface is C
 structs of function pointers, and nothing else of the backend is in C.
+
+The private CPU backend takes 12 threads by default
+(`PHI_GGML_HOST_THREADS`), and the program should be given the same
+`-t`: 12 and 12 measured pp64 9.96 and tg16 1.52 on the 27B, 14 and 14
+gave 1.42, and 16 and 16 collapsed to 0.18, because ggml's barrier spins
+and one thread per CPU leaves nothing for llama.cpp's own pool or the
+two card daemons. (The code said 15 while this note said 12 until
+2026-09-23; 15 is what the 0.47 tg16 of that morning's first run was.)

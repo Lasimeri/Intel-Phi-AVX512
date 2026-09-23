@@ -56,6 +56,11 @@
 #endif
 #define MAX_CHUNKS 1024            /* 2 GiB of the program at once */
 #define HP_POOL 256                /* pre-faulted huge pages: 512 MiB of the program at once */
+/* How many the pool takes; the seamless path wants HP_POOL, a worker
+ * serving only matrix multiplies wants none of them (vpu_worker.c -e N),
+ * because every huge page it leaves is card memory the model can sit in. */
+static int g_hp_want = HP_POOL;
+void vpu_exec_pool(int pages) { g_hp_want = pages < 0 ? 0 : pages > HP_POOL ? HP_POOL : pages; }
 #define SHADOWS 8
 #define PAGES_PER_CHUNK (VPU_EXEC_CHUNK / 4096u)
 #define COMPILER_BARRIER() asm volatile("" ::: "memory")
@@ -150,7 +155,7 @@ static int mail(uint32_t kind, uint64_t addr, uint64_t len, uint32_t slot)
 
 static void hp_init(void)
 {
-    for (int i = 0; i < HP_POOL; i++) {
+    for (int i = 0; i < g_hp_want; i++) {
         void *p = mmap(NULL, VPU_EXEC_CHUNK, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
         if (p == MAP_FAILED) break;
         ((volatile char *)p)[0] = 0;   /* fault the whole huge page in now */

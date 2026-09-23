@@ -3588,7 +3588,11 @@ phi_probe:
     .globl phi_bench
     .type phi_bench, @function
 phi_bench:
+    mov %rdx, %rax
+    test %rax, %rax
+    jnz 8f
     mov $1000000, %rax
+    8:
     test %rdi, %rdi
     jnz 2f
     1:

@@ -147,6 +147,9 @@ _Static_assert(VPU_OFF_EXEC + sizeof(struct vpu_exec) <= 16384, "the descriptor 
 /* The card side (vpu_exec.c). */
 int vpu_exec_run(volatile unsigned char *ctrl, int blk_fd, int verbose);
 int vpu_exec_init(void);
+/* Huge pages the exec pool pre-faults (default 256); 0 leaves them all to
+ * the matrix multiplies. Call before vpu_exec_init. */
+void vpu_exec_pool(int pages);
 /* fs-relative displacement of the per-thread scratch area, for VPU_OFF_SCRATCH. */
 int64_t vpu_exec_scratch_tpoff(void);
 /* From vpu_worker.c: run fn(arg, slice, nslices) on nslices threads of the

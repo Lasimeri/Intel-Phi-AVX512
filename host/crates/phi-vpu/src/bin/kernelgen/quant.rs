@@ -686,18 +686,26 @@ pub fn probe() -> String {
     a.0
 }
 
-/// `phi_bench(kind, buf)`: the core's raw rates, timed by the caller.
-/// kind 0: 1 M iterations of eight independent register fused
-/// multiply-adds (8 M vector instructions); kind 1: 1 M aligned 64-byte
-/// loads walking `buf` (64 MiB, so from memory). Both leave the vector
-/// registers as they find them, which nothing depends on.
+/// `phi_bench(kind, buf, count)`: the core's raw rates, timed by the
+/// caller. kind 0: `count` iterations of eight independent register
+/// fused multiply-adds (8 vector instructions each); kind 1: `count`
+/// aligned 64-byte loads walking `buf`. `count` 0 means 1 M, which walks
+/// 64 MiB. Both leave the vector registers as they find them, which
+/// nothing depends on. The whole pool runs it at once for the card's
+/// aggregate rates (`vpu_matmul.c`, the probe).
 pub fn bench() -> String {
     let mut a = Asm(String::new());
     let name = "phi_bench";
     a.0.push_str(&format!(
         "# {name}: raw issue and streaming rates (quant.md)\n    .globl {name}\n    .type {name}, @function\n{name}:\n"
     ));
+    // A count in rdx replaces the default. Not a cmov: the card's scalar
+    // core is a P54C and has none (an invalid opcode trap, 2026-09-23).
+    a.t("mov %rdx, %rax");
+    a.t("test %rax, %rax");
+    a.t("jnz 8f");
     a.t("mov $1000000, %rax");
+    a.t("8:");
     a.t("test %rdi, %rdi");
     a.t("jnz 2f");
     a.t("1:");

@@ -12,6 +12,8 @@
  *
  *   phi-vpu-worker [-v] [-s MS] [-i US] [threads]
  *     threads 1 to 228 (57); spin MS after a job before parking (200);
+ *     -e N huge pages the seamless path pools (256; 0 leaves them all to
+ *     the matrix multiplies, which is what a ggml backend run wants);
  *     once parked, poll the doorbell every US microseconds (500)
  *
  * The threads are created once. Creating one costs about 0.58 ms on
@@ -327,6 +329,7 @@ int main(int argc, char **argv)
         if (strcmp(argv[i], "-v") == 0) verbose = 1;
         else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) spin_ns = (uint64_t)atol(argv[++i]) * 1000000ULL;
         else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) idle_us = atol(argv[++i]);
+        else if (strcmp(argv[i], "-e") == 0 && i + 1 < argc) vpu_exec_pool(atoi(argv[++i]));
         else max_threads = atoi(argv[i]);
     }
     if (max_threads < 1) max_threads = 1;

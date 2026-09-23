@@ -33,3 +33,35 @@ phi-vpu -c 0 matmul-check
 The float16 conversions here are the exact ones (`f16_to_f32`) and
 round-to-nearest-even (`f32_to_f16`), not a crate, so the check depends
 on nothing.
+
+## The rates, and the two ceilings (`--repeat`, `--chunk`, `--probe`)
+
+A single timed request is not a measurement: the first one after an idle
+gap pays the pool's futex wakes and its first touch, which is 3.7x the
+steady state (0.590, 0.621 and 2.190 ms for the same shape,
+`docs/results/2026-09-23-ceilings-and-residency.md`). The rate section
+therefore uploads the weights once and times the multiply `--repeat`
+times (7), printing the best and the median; nothing between the repeats
+touches the host, so the pool stays spinning.
+
+`--chunk N` puts N in the descriptor's `reserved[0]`, which the card
+takes as the rows per chunk (its default is 32): the loop shape is
+measured rather than argued.
+
+`--probe` prints, besides what each kernel instruction produces, the
+rates one thread reaches (issue, streaming with and without prefetch, an
+L2 walk, the Q4_K and Q5_K kernels per call) and three things measured
+across the whole pool at `--threads`:
+
+- the card's aggregate read bandwidth, every thread on its own 4 MiB,
+  prefetched: 76.9 GB/s at 57 threads, and no more at 114 or 228;
+- its aggregate vector issue in register fused multiply-adds: 810
+  GFLOP/s at 57 threads, 1116 at 114 (the in-order core needs a second
+  thread to issue every cycle), 847 at 228;
+- what one dispatch across the pool costs with nothing to do: 40 to 48
+  us at 57 threads, 61 at 114, 220 at 228, whatever the slice count.
+
+A multiply cannot beat either ceiling, and which one it is under says
+what to work on: at n 1 the quantized kernels are at 30 GB/s of the 76.9
+because they are issue bound (the instruction counts are in the results
+note), not because the weights are slow to fetch.

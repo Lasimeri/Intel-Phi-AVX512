@@ -74,3 +74,10 @@ and without prefetch, converting loads) and the C side's timing of the
 Q4_K kernels in L1 and streaming are what `phi-vpu matmul-check --probe`
 prints; the rates and what they showed are in
 `docs/results/2026-09-23-quantized-kernels.md`.
+
+`phi_bench` takes a third argument, the iteration count in `rdx` (0
+means its default 1 M), so the same kernel serves one thread and the
+whole pool at once. Its prologue picks the count with a branch, not a
+`cmov`: the card's scalar core is a P54C and has no CMOV, and one there
+killed the worker with `trap invalid opcode` (2026-09-23; the cross
+compiler never emits one, so only hand-written scalar code can hit it).

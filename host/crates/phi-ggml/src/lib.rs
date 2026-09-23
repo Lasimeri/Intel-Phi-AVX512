@@ -113,7 +113,7 @@ pub extern "C" fn phi_ggml_open() -> i32 {
         return ctx.cards.len() as i32;
     }
     let threads = env_or("PHI_GGML_THREADS", 57u32);
-    let budget = env_or("PHI_GGML_CARD_BYTES", 3_400_000_000u64);
+    let budget = env_or("PHI_GGML_CARD_BYTES", 4_400_000_000u64);
     let fraction = env_or("PHI_GGML_FRACTION", 0.2f64).clamp(0.0, 1.0);
     let pp_share = env_or("PHI_GGML_PP_SHARE", 0.5f64).clamp(0.0, 1.0);
     let verbose = std::env::var_os("PHI_GGML_VERBOSE").is_some();

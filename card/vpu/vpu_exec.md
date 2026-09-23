@@ -138,3 +138,11 @@ region, so the program's data next to its code is current (only the
 code pages arrive in the bundle; before this, those pages were whatever
 the chunk held, zero on a fresh one). Ranges mode is unaffected: its
 pages are fetched by the range list every phase.
+
+## The page pool is sizeable
+
+`vpu_exec_pool(n)` (before `vpu_exec_init`) sets how many huge pages the
+pool pre-faults, 256 by default and at most that. The worker's `-e N`
+passes it through: a worker that serves only matrix multiplies wants
+`-e 0`, because every huge page the pool does not take is card memory a
+slice of the model can sit in.

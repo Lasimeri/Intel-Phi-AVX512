@@ -74,7 +74,10 @@ static int host_backend(void)
     if (!dev) { fprintf(stderr, "ggml-phi: no CPU device registered\n"); return -1; }
     g_cpu = p_dev_init(dev, NULL);
     if (!g_cpu) { fprintf(stderr, "ggml-phi: the CPU backend would not initialise\n"); return -1; }
-    int threads = 15;
+    /* 12, not one per CPU: a host thread that shares a CPU with a card
+     * daemon stalls ggml.s barrier for a timeslice (7 ms per multiply at
+     * 15; docs/results/2026-09-23-quantized-kernels.md). */
+    int threads = 12;
     const char *e = getenv("PHI_GGML_HOST_THREADS");
     if (e && atoi(e) > 0) threads = atoi(e);
     ggml_backend_set_n_threads_t set = (ggml_backend_set_n_threads_t)p_reg_get_proc_address(p_dev_backend_reg(dev), "ggml_backend_set_n_threads");

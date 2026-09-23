@@ -69,3 +69,20 @@ keeps on the CPU), the other quantized types (Q3_K, IQ4_NL, IQ3_S stay
 on the host), a reduction tree matching the host's summation order
 (results differ from the CPU's in the last bits, as any two
 implementations do).
+
+## The rows per chunk, and the diagnostics
+
+`ROW_CHUNK` is 32 rows, measured rather than argued: the host can
+override it per request (`reserved[0]`, `phi-vpu matmul-check --chunk`),
+and at 4096 x 5120 Q4_K the sweep was 0.780, 0.604, 0.570, **0.552**,
+0.605 ms at n 1 for 4, 8, 16, 32 and 64 rows, and 33.6, 31.2, 22.4,
+**20.9**, 20.9 ms at n 64. `ROW_CHUNK_MAX` (64) sizes the accumulator
+array on the thread's stack.
+
+The probe request (`VPU_MM_PROBE`) also times, across the whole pool at
+the request's thread count: `phi_bench` streaming (each thread its own 4
+MiB) for the card's aggregate read bandwidth, `phi_bench` register
+multiply-adds for its aggregate issue rate, and 1000 empty
+`vpu_pool_map` rounds for what a dispatch costs with nothing to do.
+`docs/results/2026-09-23-ceilings-and-residency.md` has the numbers and
+what they settle (one thread per core; the kernels are issue bound).

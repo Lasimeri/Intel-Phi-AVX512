@@ -162,3 +162,13 @@ the day it first worked (`docs/results/2026-09-22-block-pipeline.md`).
 card as it is. The control mapping grew to 16 KiB for the mailbox and
 the exec descriptor. The element count and offsets are not checked for
 that kind; they belong to the polynomial request.
+
+## `-e N`: the seamless path's page pool
+
+The exec engine pre-faults 256 huge pages (512 MiB) when the worker
+starts, which a worker serving only the ggml backend's matrix multiplies
+never uses. `-e N` sets that pool (`vpu_exec_pool`), and `-e 0` leaves
+every huge page to the multiplies: on a card with 5.5 GiB it is half a
+gigabyte more of the model resident. `scripts/phi-ggml.sh` starts
+workers with `-e 0`; `scripts/phi-vpu.sh start` passes anything in
+`PHI_VPU_ARGS`.
