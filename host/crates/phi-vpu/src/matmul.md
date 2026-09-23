@@ -81,5 +81,12 @@ for quantized weights. Both the conformance cases and the rate loop
 force float32 for the `f32` and `f16` weight types, because only the
 generated quantized kernels have float16 twins and the card rejects the
 combination. The reference the conformance compares against is the
-host's own dot product over the float32 rows the float16 ones were
-rounded from, so the tolerance covers the rounding and nothing else.
+host's own dot product over the rows **as the card sees them**, the
+float32 values put through float16 and back (`act_round`), so the
+tolerance measures the card's arithmetic and not the rounding: the
+same `4e-6 * |terms| + 1e-6` as for float32 activations.
+
+The rate loop calls the same checked path, so the shape the backend
+ships (`--m 4096 --k 5120 --pad 256 --act 1`, in chunks of 32) is
+verified against the host at n 1, 8 and 64, not only the conformance
+shapes above it.

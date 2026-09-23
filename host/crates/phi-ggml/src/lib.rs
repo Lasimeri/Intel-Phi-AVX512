@@ -855,6 +855,16 @@ pub unsafe extern "C" fn phi_ggml_end_id(d: *mut u8, nb_d: u64, nb_d2: u64) -> i
                             ctx.pp_share
                         ));
                     }
+                    // At the floor a card's part of a batch multiply can
+                    // fall under `min_bytes`, which then declines it
+                    // without the `avoid` judgement saying so. Worth a
+                    // word, or the tensor goes quiet for no visible reason.
+                    if ctx.pp_share <= PP_MIN {
+                        say(&format!(
+                            "the batch share is at its floor ({PP_MIN}): the cards are the slower side at this batch size, and a multiply whose card part now falls under {} bytes goes to the host whole",
+                            ctx.min_bytes
+                        ));
+                    }
                 }
             }
         }

@@ -54,11 +54,18 @@ It is one share for the model rather than one per tensor, which is not
 an approximation but the only version that can learn: a prompt pass
 visits each weight tensor about three times and makes some hundreds of
 batch multiplies in total, and what is being learned is a property of
-the two sides at that batch size, not of a tensor. Both wrong versions
-were built and measured first
-(`docs/results/2026-09-23-share-and-fusion.md`): per tensor per call
-oscillates on the 3.7x pool-wake variance, per tensor over a window
-never fills it.
+the two sides rather than of a tensor. Both wrong versions were built
+and measured first (`docs/results/2026-09-23-share-and-fusion.md`): per
+tensor per call oscillates on the 3.7x pool-wake variance, per tensor
+over a window never fills it.
+
+Measured only where one batch size runs throughout, which is what
+`llama-bench` does. One number serves every batch of eight rows or more,
+so a server mixing long prompts with short ones feeds them all to the
+same estimator, and after `PP_STEPS` moves it stops wherever the last
+windows left it. That is untested here; no server measurement exists to
+say whether it wants classes, and none has been invented. `PP_ADAPT=0`
+pins the old behaviour if it turns out to.
 
 `PHI_GGML_CARDS` names the cards (a comma list of indices; default every
 card whose window exists), `PHI_GGML_THREADS` the card threads per
