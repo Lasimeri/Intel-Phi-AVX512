@@ -9,7 +9,9 @@ install can reproduce every result here without asking anyone.
   that runs on the host, and card userland where the toolchain permits.
 - **C** only where Rust is not an option: the card-side worker (`card/vpu`,
   built on the card by its own clang), the card kernels and examples, the
-  shared protocol headers, and small helpers under `tools/` that must see
+  shared protocol headers, the glue a C interface of an upstream project
+  requires (ggml's backend tables, `host/crates/phi-ggml/csrc`), and small
+  helpers under `tools/` that must see
   the C headers as C sees them. Those helpers are compiled and run with
   `tcc`. The cards' kernel and its patches live in the stack's repository.
 - **Shell** (`sh`, POSIX where practical, `bash` when arrays are needed) for

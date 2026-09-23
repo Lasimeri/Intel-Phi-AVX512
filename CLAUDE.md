@@ -4,7 +4,9 @@ Read `CONTRIBUTING.md` first; it is the authority. Summary of the non-obvious
 rules:
 
 - Rust first. C only for the card-side worker (`card/vpu`), the card kernels
-  and examples, and `tcc`-compiled layout helpers. No Python for tooling, ever.
+  and examples, `tcc`-compiled layout helpers, and the glue a C interface of
+  an upstream project requires (`host/crates/phi-ggml/csrc`, ggml's backend
+  tables). No Python for tooling, ever.
 - Every code file gets a sibling `.md` with the same stem. Write it in the same
   change as the code.
 - No em dash characters in any file.

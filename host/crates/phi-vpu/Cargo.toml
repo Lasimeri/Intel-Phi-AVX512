@@ -11,3 +11,4 @@ description = "Host side of the AVX-512 co-processor: hand work to the card's ve
 libc = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+knc-mvex = { path = "../knc-mvex" }

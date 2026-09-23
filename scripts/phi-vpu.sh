@@ -72,6 +72,7 @@ case "$cmd" in
         ssh_ "mkdir -p '$dir'"
         scp_ "$root/card/vpu/vpu_proto.h" "$root/card/vpu/vpu_exec.h" "$root/card/vpu/vpu_exec_regs.h" \
             "$root/card/vpu/vpu_worker.c" "$root/card/vpu/vpu_exec.c" "$root/card/vpu/build.sh" \
+            "$root/card/vpu/vpu_matmul.h" "$root/card/vpu/vpu_matmul.c" "$root/card/vpu/vpu_matmul_kernel.S" \
             "$root/card/examples/avx512_poly.S" "root@127.0.0.1:$dir/"
         # Built on the host with the stack's cross toolchain when it is there
         # (the files in parallel, under a second), else on another card that
@@ -86,8 +87,10 @@ case "$cmd" in
                 knc-cc -O2 -I. -c vpu_worker.c -o "$work/vpu_worker.o" &
                 knc-cc -O2 -I. -c vpu_exec.c -o "$work/vpu_exec.o" &
                 knc-cc -O2 -I. -c ../examples/avx512_poly.S -o "$work/avx512_poly.o" &
+                knc-cc -O2 -I. -c vpu_matmul.c -o "$work/vpu_matmul.o" &
+                knc-cc -O2 -I. -c vpu_matmul_kernel.S -o "$work/vpu_matmul_kernel.o" &
                 wait
-                knc-cc -static -o "$work/phi-vpu-worker" "$work/vpu_worker.o" "$work/vpu_exec.o" "$work/avx512_poly.o" -lpthread
+                knc-cc -static -o "$work/phi-vpu-worker" "$work/vpu_worker.o" "$work/vpu_exec.o" "$work/avx512_poly.o" "$work/vpu_matmul.o" "$work/vpu_matmul_kernel.o" -lpthread
             ) 2>"$work/build.log"; then
                 scp_ "$work/phi-vpu-worker" "root@127.0.0.1:$dir/phi-vpu-worker"
                 echo "built on the host ($(nproc) cores), pushed to card $PHI_CARD"

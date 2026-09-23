@@ -67,6 +67,8 @@ struct chunk {
     uint8_t dirty, exec, writable;
     uint8_t demand;                /* filled by a demand fault: stale after the phase, unmapped at its end */
     uint8_t used;                  /* touched by this region: kept mapped for the next */
+    uint8_t fourk;                 /* RANGES: 4 KiB pages, PROT_NONE except the pages fetched, so an
+                                      undeclared access faults instead of reading stale memory */
     void *shadow;                  /* DEMAND: the chunk before its first write */
     uint64_t filled[PAGES_PER_CHUNK / 64];   /* RANGES: pages fetched so far */
 };
@@ -222,16 +224,34 @@ static void evict_unused(void)
     g_nchunks = keep;
 }
 
-static int new_chunk(uint64_t base, int exec, struct chunk **out)
+/* A chunk at `base`, empty. `fourk`: 4 KiB pages, none accessible until
+ * fetched (RANGES mode: an access the host did not declare must fault,
+ * not read whatever the chunk held); else a pooled huge page (DEMAND
+ * mode, where the whole chunk is fetched on the first touch). */
+static int new_chunk(uint64_t base, int exec, int fourk, struct chunk **out)
 {
     /* Chunks of earlier regions stay mapped to save the next region the
      * mapping; when the pool is dry they go. */
-    if (g_hp_nfree == 0 || g_nchunks >= MAX_CHUNKS) evict_unused();
+    if ((!fourk && g_hp_nfree == 0) || g_nchunks >= MAX_CHUNKS) evict_unused();
     if (g_nchunks >= MAX_CHUNKS) return VPU_EXIT_LIMIT;
     struct chunk *c = &g_chunks[g_nchunks];
     memset(c, 0, sizeof *c);
     c->base = base;
     c->exec = exec;
+    if (fourk) {
+        void *p = mmap((void *)base, VPU_EXEC_CHUNK, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        if (p == MAP_FAILED || (uint64_t)p != base) {
+            if (p != MAP_FAILED) munmap(p, VPU_EXEC_CHUNK);
+            return VPU_EXIT_COLLISION;
+        }
+        c->hp = -1;
+        c->fourk = 1;
+        c->writable = 0;
+        c->used = 1;
+        g_nchunks++;
+        *out = c;
+        return 0;
+    }
     int r = hp_map(base, &c->hp);
     if (r) return r;
     c->writable = 1;
@@ -242,10 +262,20 @@ static int new_chunk(uint64_t base, int exec, struct chunk **out)
     return 0;
 }
 
+/* The protection of a 4 KiB-page chunk's range: what a fetch, a code copy
+ * or a dense write range needs, page by page. */
+static void open_pages(struct chunk *c, uint64_t addr, uint64_t len)
+{
+    if (!c->fourk) return;
+    mprotect((void *)addr, len, PROT_READ | PROT_WRITE | (c->exec ? PROT_EXEC : 0));
+}
+
 /* Every change of protection flushes the TLB on every CPU a thread of this
- * process runs on, 57 of them: only when it changes. */
+ * process runs on, 57 of them: only when it changes. A 4 KiB-page chunk
+ * is protected page by page (open_pages) and ignores this. */
 static void set_prot(struct chunk *c, int writable)
 {
+    if (c->fourk) return;
     if (c->writable == writable) return;
     mprotect((void *)c->base, VPU_EXEC_CHUNK, PROT_READ | (writable ? PROT_WRITE : 0) | (c->exec ? PROT_EXEC : 0));
     c->writable = writable;
@@ -272,6 +302,7 @@ static int fetch_pages(struct chunk *c, uint64_t addr, uint64_t len)
         /* Alternate slots: the host fills the other one with the next piece
          * of the range while this one is read. */
         uint32_t slot = g_fetch_slot++ & 1;
+        open_pages(c, addr, n);
         if (mail(VPU_MAIL_FETCH, addr, n, slot) != 0) return VPU_EXIT_FAULT;
         if (pread(g_blk, (void *)addr, n, VPU_OFF_EXEC_FETCH + (off_t)slot * VPU_EXEC_CHUNK) != (ssize_t)n) return VPU_EXIT_FAULT;
         for (uint64_t a = addr; a < addr + n; a += 4096) {
@@ -497,7 +528,7 @@ static void on_segv(int sig, siginfo_t *si, void *ctx)
         leave(uc, VPU_EXIT_FAULT, addr);
         return;
     }
-    int r = new_chunk(base, 0, &c);
+    int r = new_chunk(base, 0, 0, &c);
     if (r == 0) {
         uint32_t slot = g_fetch_slot++ & 1;
         if (mail(VPU_MAIL_FETCH, base, VPU_EXEC_CHUNK, slot) != 0 ||
@@ -577,6 +608,13 @@ static void end_region(void)
     for (int i = 0; i < g_nchunks; i++) {
         struct chunk *c = &g_chunks[i];
         if (c->demand) { hp_unmap(c); continue; }
+        /* A kept chunk's pages are stale once the program runs again: a
+         * 4 KiB-page chunk closes them all (one protection change), so
+         * the next region fetches what it declares and faults on the rest. */
+        if (c->fourk) {
+            mprotect((void *)c->base, VPU_EXEC_CHUNK, PROT_NONE);
+            c->writable = 0;
+        }
         memset(c->filled, 0, sizeof c->filled);
         c->dirty = 0;
         c->shadow = NULL;
@@ -696,7 +734,7 @@ int vpu_exec_run(volatile unsigned char *ctrl, int blk_fd, int verbose)
         int keep = 0;
         for (int i = 0; i < g_nchunks; i++) {
             struct chunk *c = &g_chunks[i];
-            if (c->demand || c->base == g_desc.code_addr || c->base == tbase0) {
+            if (c->demand || ((c->base == g_desc.code_addr || c->base == tbase0) && !c->fourk)) {
                 if (keep != i) g_chunks[keep] = *c;
                 keep++;
                 continue;
@@ -706,7 +744,7 @@ int vpu_exec_run(volatile unsigned char *ctrl, int blk_fd, int verbose)
         g_nchunks = keep;
     }
     struct chunk *code = find_chunk(g_desc.code_addr), *thunk = find_chunk(tbase0);
-    if (!code && (r = new_chunk(g_desc.code_addr, 1, &code)) != 0) goto fail;
+    if (!code && (r = new_chunk(g_desc.code_addr, 1, g_desc.mode == VPU_MODE_RANGES, &code)) != 0) goto fail;
     code->used = 1;
     set_prot(code, 1);
     if (g_desc.mode == VPU_MODE_DEMAND && !code->demand) {
@@ -726,15 +764,17 @@ int vpu_exec_run(volatile unsigned char *ctrl, int blk_fd, int verbose)
     for (uint32_t i = 0; i < g_desc.code_pages; i++) {
         uint64_t a = g_desc.code_page[i];
         if (a < g_desc.code_addr || a >= g_desc.code_addr + VPU_EXEC_CHUNK) { r = VPU_EXIT_FAULT; g_desc.fault_addr = a; goto fail; }
+        open_pages(code, a, 4096);
         memcpy((void *)a, b_code + (size_t)i * 4096, 4096);
         uint64_t q = (a - g_desc.code_addr) / 4096;
         code->filled[q / 64] |= 1ULL << (q % 64);
     }
     uint64_t tbase = g_desc.thunk_addr & ~(uint64_t)(VPU_EXEC_CHUNK - 1);
     if (tbase == g_desc.code_addr) thunk = code;
-    if (!thunk && (r = new_chunk(tbase, 1, &thunk)) != 0) goto fail;
+    if (!thunk && (r = new_chunk(tbase, 1, g_desc.mode == VPU_MODE_RANGES, &thunk)) != 0) goto fail;
     thunk->used = 1;
     set_prot(thunk, 1);
+    open_pages(thunk, g_desc.thunk_addr, g_desc.thunk_len);
     memcpy((void *)g_desc.thunk_addr, b_thunk, g_desc.thunk_len);
     for (uint64_t a = g_desc.thunk_addr; a < g_desc.thunk_addr + g_desc.thunk_len; a += 4096) {
         uint64_t q = (a - tbase) / 4096;
@@ -749,7 +789,7 @@ int vpu_exec_run(volatile unsigned char *ctrl, int blk_fd, int verbose)
             while (a < e) {
                 uint64_t base = a & ~(uint64_t)(VPU_EXEC_CHUNK - 1), stop = base + VPU_EXEC_CHUNK < e ? base + VPU_EXEC_CHUNK : e;
                 struct chunk *c = find_chunk(base);
-                if (!c && (r = new_chunk(base, 0, &c)) != 0) { g_desc.fault_addr = a; goto fail; }
+                if (!c && (r = new_chunk(base, 0, 1, &c)) != 0) { g_desc.fault_addr = a; goto fail; }
                 set_prot(c, 1);
                 c->used = 1;
                 if (g_desc.ranges[i].flags & VPU_RANGE_DENSE) {
@@ -757,6 +797,7 @@ int vpu_exec_run(volatile unsigned char *ctrl, int blk_fd, int verbose)
                      * hold bytes of the program that the write-back could carry. */
                     if ((r = fetch_pages(c, a, 4096)) != 0) { g_desc.fault_addr = a; goto fail; }
                     if (stop - 4096 > a && (r = fetch_pages(c, stop - 4096, 4096)) != 0) { g_desc.fault_addr = a; goto fail; }
+                    open_pages(c, a, stop - a);
                     for (uint64_t p = a; p < stop; p += 4096) {
                         uint64_t q = (p - c->base) / 4096;
                         c->filled[q / 64] |= 1ULL << (q % 64);

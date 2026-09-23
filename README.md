@@ -69,6 +69,25 @@ The explicit path is still there for a program written for the card:
 The software emulator that preceded the card path stays as the fallback
 behind `--emulate`.
 
+## The card as a GPU for AVX-512: the ggml backend
+
+The instruction-level path above is exact but pays a fixed cost per
+region, and a program like llama.cpp has millions of tiny regions per
+token (`docs/results/2026-09-22-full-avx512.md`). For it the card is
+used the way a GPU is: whole operators at a time. `host/crates/phi-ggml`
+builds `libggml_phi.so`, a ggml backend that an unmodified llama.cpp
+loads through `GGML_BACKEND_PATH`; its scheduler hands the backend
+every matrix multiply it accepts, the model's weights are uploaded to
+the card once and stay resident, the activations cross the window per
+multiply, and each multiply runs across the card's 57 threads with
+16-lane fused multiply-add kernels (`card/vpu/vpu_matmul.md`). The
+program itself is an ordinary build for this host.
+
+```
+scripts/phi-ggml.sh ./llama-completion -m model.gguf -p "..."     # the multiplies on the card
+scripts/phi-ggml.sh --verbose ...                                  # each multiply and its times
+```
+
 ## Layout
 
 | path | what |

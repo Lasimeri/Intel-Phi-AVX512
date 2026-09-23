@@ -1,0 +1,18 @@
+[package]
+name = "phi-ggml"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "ggml_phi"
+crate-type = ["cdylib"]
+
+[dependencies]
+libc = { workspace = true }
+phi-vpu = { path = "../phi-vpu" }
+
+[build-dependencies]
+cc = { workspace = true }

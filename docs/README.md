@@ -16,6 +16,7 @@
 | [2026-09-22-seamless-test.md](results/2026-09-22-seamless-test.md) | The transparent path tested from the user's side, when it still ended in the emulator |
 | [2026-09-22-seamless-card.md](results/2026-09-22-seamless-card.md) | The join: the card executes the program's AVX-512 from the SIGILL handler; then the planner, phases, the 57-thread split, exact ranges, overlapped transport, and the numbers |
 | [2026-09-22-full-avx512.md](results/2026-09-22-full-avx512.md) | The full instruction set: 128-bit and 256-bit forms, masks, scalars, conversions, divides, permutes, mask instructions; llama.cpp region by region, and why the region floor, not the translator, is the limit |
+| [2026-09-22-ggml-backend.md](results/2026-09-22-ggml-backend.md) | The instruction-level path made sound (4 KiB-page ranges, byte-exact write-back, atomics on the host), and the card as a ggml device: llama.cpp unmodified, its matrix multiplies on the card, 11.5 tokens per second against the host CPU alone at 20.9 |
 
 The transport these records build on (the block path between the
 window and the card, its pipelining, huge pages, the card poller) is the

@@ -126,6 +126,27 @@ struct Card {
 
 static CARD: Mutex<Option<Card>> = Mutex::new(None);
 
+/// The pages sent to the card during one region's run, as sent: a
+/// write-back is compared with them and only the bytes the card changed
+/// are written, so a byte another thread of the program changed
+/// meanwhile in the same line survives (ggml's OpenMP barrier counter
+/// shares a line with what its region writes). Cleared per run.
+static STASH: std::sync::LazyLock<Mutex<std::collections::HashMap<u64, Box<[u8; 4096]>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+fn stash_pages(addr: u64, bytes: &[u8]) {
+    let mut st = STASH.lock().unwrap_or_else(|e| e.into_inner());
+    let mut a = addr & !(PAGE - 1);
+    let mut off = 0usize;
+    while off + 4096 <= bytes.len() {
+        let mut page = Box::new([0u8; 4096]);
+        page.copy_from_slice(&bytes[off..off + 4096]);
+        st.insert(a, page);
+        a += PAGE;
+        off += 4096;
+    }
+}
+
 /// One phase's cost, for the verbose report.
 pub struct PhaseStats {
     pub what: &'static str,
@@ -303,6 +324,7 @@ fn apply_pages(maps: &[Map], slot: &[u8], n: usize) -> i32 {
         remote.clear();
     };
     let mut any = false;
+    let mut stash = STASH.lock().unwrap_or_else(|e| e.into_inner());
     for i in 0..n {
         let e = &slot[i * 16..i * 16 + 16];
         let addr = u64::from_le_bytes(e[..8].try_into().unwrap());
@@ -312,27 +334,77 @@ fn apply_pages(maps: &[Map], slot: &[u8], n: usize) -> i32 {
         }
         any = true;
         let page = &slot[WB_TABLE as usize + i * 4096..WB_TABLE as usize + (i + 1) * 4096];
-        let mut line = 0;
-        while line < 64 {
-            if lines >> line & 1 == 0 {
-                line += 1;
-                continue;
-            }
-            let start = line;
-            while line < 64 && lines >> line & 1 == 1 {
-                line += 1;
-            }
-            let bytes = (line - start) * 64;
+        if std::env::var_os("PHI512_VERBOSE").is_some() {
+            let text = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
+            let name = text
+                .lines()
+                .find(|l| {
+                    let mut it = l.split('-');
+                    let lo = u64::from_str_radix(it.next().unwrap_or(""), 16).unwrap_or(0);
+                    let hi = u64::from_str_radix(it.next().unwrap_or("").split(' ').next().unwrap_or(""), 16).unwrap_or(0);
+                    addr >= lo && addr < hi
+                })
+                .map(|l| l.split_whitespace().skip(5).collect::<Vec<_>>().join(" "))
+                .unwrap_or_default();
+            eprintln!(
+                "phi512:     write-back page {addr:#x} lines {lines:#018x}{} [{name}]",
+                if stash.contains_key(&addr) {
+                    ""
+                } else {
+                    " (whole lines: not fetched)"
+                }
+            );
+        }
+        // With the page as it was sent, only the bytes the card changed
+        // go back (runs of differing bytes); without it, whole lines.
+        let push = |local: &mut Vec<libc::iovec>, remote: &mut Vec<libc::iovec>, off: usize, len: usize| {
             local.push(libc::iovec {
-                iov_base: page[start * 64..].as_ptr() as *mut libc::c_void,
-                iov_len: bytes,
+                iov_base: page[off..].as_ptr() as *mut libc::c_void,
+                iov_len: len,
             });
             remote.push(libc::iovec {
-                iov_base: (addr + start as u64 * 64) as *mut libc::c_void,
-                iov_len: bytes,
+                iov_base: (addr + off as u64) as *mut libc::c_void,
+                iov_len: len,
             });
             if local.len() == 1024 {
-                flush(&mut local, &mut remote);
+                flush(local, remote);
+            }
+        };
+        match stash.get_mut(&addr) {
+            Some(orig) => {
+                for line in 0..64 {
+                    if lines >> line & 1 == 0 {
+                        continue;
+                    }
+                    let (lo, hi) = (line * 64, line * 64 + 64);
+                    let mut b = lo;
+                    while b < hi {
+                        if page[b] == orig[b] {
+                            b += 1;
+                            continue;
+                        }
+                        let start = b;
+                        while b < hi && page[b] != orig[b] {
+                            b += 1;
+                        }
+                        push(&mut local, &mut remote, start, b - start);
+                    }
+                    orig[lo..hi].copy_from_slice(&page[lo..hi]);
+                }
+            }
+            None => {
+                let mut line = 0;
+                while line < 64 {
+                    if lines >> line & 1 == 0 {
+                        line += 1;
+                        continue;
+                    }
+                    let start = line;
+                    while line < 64 && lines >> line & 1 == 1 {
+                        line += 1;
+                    }
+                    push(&mut local, &mut remote, start * 64, (line - start) * 64);
+                }
             }
         }
     }
@@ -351,6 +423,16 @@ fn apply_pages(maps: &[Map], slot: &[u8], n: usize) -> i32 {
 /// segment prefix ends the region too.
 fn card_can_run(insn: &Instruction) -> bool {
     if insn.segment_prefix() != Register::None {
+        return false;
+    }
+    // An atomic read-modify-write (a lock prefix, or xchg with memory,
+    // which locks implicitly) is a synchronisation with other threads of
+    // the program, which keep running on the host: on the card it would
+    // update the card's copy and the write-back would lose theirs (ggml's
+    // OpenMP barrier counter hung the program this way). The host runs it.
+    if insn.has_lock_prefix()
+        || (insn.mnemonic() == iced_x86::Mnemonic::Xchg && (0..insn.op_count()).any(|i| insn.op_kind(i) == iced_x86::OpKind::Memory))
+    {
         return false;
     }
     insn.cpuid_features().iter().all(|f| {
@@ -504,6 +586,10 @@ fn analyze(id: u64, entry: u64, maps: &[Map], tg: &Target) -> Result<Region, Str
     if included.is_empty() {
         return Err("empty region".into());
     }
+    let trace = std::env::var_os("PHI512_VERBOSE").is_some();
+    if trace {
+        eprintln!("phi512:     walked {} instructions, {} exits", included.len(), exits.len());
+    }
     let lo = *included.keys().next().unwrap();
     let hi = included.iter().map(|(a, (i, _))| a + i.len() as u64).max().unwrap();
     for &e in &exits {
@@ -528,6 +614,9 @@ fn analyze(id: u64, entry: u64, maps: &[Map], tg: &Target) -> Result<Region, Str
     // address space beyond the code chunk, within reach of a rel32. Its
     // first kilobyte is the card's: entry stubs, one per thread.
     let thunk_addr = free_range(maps, (code_addr + EXEC_CHUNK).max(text.hi), EXEC_THUNK_MAX, lo)?;
+    if trace {
+        eprintln!("phi512:     thunk area at {thunk_addr:#x}");
+    }
     // The card owns the first kilobyte (an entry stub per thread) and the
     // slot after it (the split loop exit jump); host thunks follow.
     let mut thunk: Vec<u8> = vec![0xcc; 16 * EXEC_MAX_THREADS + 16];
@@ -665,7 +754,13 @@ fn analyze(id: u64, entry: u64, maps: &[Map], tg: &Target) -> Result<Region, Str
     }
     thunk.resize(((thunk.len() as u64 + PAGE - 1) & !(PAGE - 1)) as usize, 0xcc);
     let insns: Insns = included.iter().map(|(a, (i, _))| (*a, *i)).collect();
+    if trace {
+        eprintln!("phi512:     thunks laid out ({} bytes), finding the loop", thunk.len());
+    }
     let lp = plan::find_loop(&insns, entry, &exits);
+    if trace {
+        eprintln!("phi512:     loop: {}", lp.is_some());
+    }
     Ok(Region {
         id,
         entry,
@@ -755,6 +850,14 @@ fn wait_serving(w: &Window, maps: &[Map], ranges: &[Range], seq: u64) -> Result<
                     } else {
                         -1
                     };
+                    if status == 0 {
+                        // SAFETY: the slot lies inside the window mapping and was just filled.
+                        let sent = unsafe { std::slice::from_raw_parts(w.ptr(slot_off, len), len) };
+                        stash_pages(m.addr, sent);
+                        if std::env::var_os("PHI512_TRACE_REGS").is_some() {
+                            eprintln!("phi512:     fetch {:#x}+{:#x}", m.addr, m.len);
+                        }
+                    }
                     w.write(OFF_MAIL + 40, status);
                     fence(Ordering::SeqCst);
                     w.write(OFF_MAIL + 32, m.seq);
@@ -993,6 +1096,18 @@ fn submit(w: &Window, maps: &[Map], desc: &Exec, index: usize, region: &Region, 
         return Err(format!("card {index}: {}", status_name(rep.status)));
     }
     let out: Exec = w.read(OFF_EXEC);
+    if std::env::var_os("PHI512_TRACE_REGS").is_some() {
+        let names = [
+            "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+        ];
+        let mut s = format!("phi512:     regs {entry:#x} -> {:#x} kind {}:", out.exit_rip, out.exit_kind);
+        for (i, n) in names.iter().enumerate() {
+            if desc.regs.gpr[i] != out.regs.gpr[i] {
+                s.push_str(&format!(" {n} {:#x}->{:#x}", desc.regs.gpr[i], out.regs.gpr[i]));
+            }
+        }
+        eprintln!("{s}");
+    }
     match out.exit_kind {
         EXIT_LEFT => Ok((out, rep.total_ns / 1000)),
         EXIT_FAULT if desc.mode == MODE_RANGES => Err(format!(
@@ -1071,6 +1186,7 @@ pub unsafe fn run(uc: *mut libc::ucontext_t, rip: u64, st: &mut VState) -> Resul
     let mut guard = CARD.lock().unwrap_or_else(|e| e.into_inner());
     let card = guard.as_mut().ok_or("no card")?;
     card.maps = read_maps();
+    STASH.lock().unwrap_or_else(|e| e.into_inner()).clear();
     let mut cached = true;
     let idx = match card.regions.iter().position(|r| r.entry == rip) {
         Some(i) => i,

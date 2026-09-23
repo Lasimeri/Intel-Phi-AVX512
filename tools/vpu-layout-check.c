@@ -9,6 +9,7 @@
 
 #include "../card/vpu/vpu_proto.h"
 #include "../card/vpu/vpu_exec.h"
+#include "../card/vpu/vpu_matmul.h"
 
 static int fails;
 
@@ -65,6 +66,22 @@ int main(void)
 	check("reply.threads", offsetof(struct vpu_reply, threads), 44);
 
 	check("VPU_OFF_READY", VPU_OFF_READY, 0);
+	check("VPU_OFF_MATMUL", VPU_OFF_MATMUL, 13312);
+	check("VPU_K_UPLOAD", VPU_K_UPLOAD, 3);
+	check("VPU_K_MATMUL", VPU_K_MATMUL, 4);
+	check("VPU_K_FREE", VPU_K_FREE, 5);
+	check("matmul.a_id", offsetof(struct vpu_matmul, a_id), 0);
+	check("matmul.a_off", offsetof(struct vpu_matmul, a_off), 8);
+	check("matmul.bytes", offsetof(struct vpu_matmul, bytes), 16);
+	check("matmul.a_type", offsetof(struct vpu_matmul, a_type), 24);
+	check("matmul.m", offsetof(struct vpu_matmul, m), 32);
+	check("matmul.n", offsetof(struct vpu_matmul, n), 40);
+	check("matmul.k", offsetof(struct vpu_matmul, k), 48);
+	check("matmul.nb_a", offsetof(struct vpu_matmul, nb_a), 56);
+	check("matmul.nb_b", offsetof(struct vpu_matmul, nb_b), 64);
+	check("matmul.b_off", offsetof(struct vpu_matmul, b_off), 72);
+	check("matmul.d_off", offsetof(struct vpu_matmul, d_off), 80);
+	check("sizeof matmul", sizeof(struct vpu_matmul), 128);
 	check("VPU_OFF_SCRATCH", VPU_OFF_SCRATCH, 8);
 	check("VPU_OFF_REQ", VPU_OFF_REQ, 64);
 	check("VPU_OFF_REPLY", VPU_OFF_REPLY, 256);

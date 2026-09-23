@@ -331,3 +331,52 @@ const _: [(); 24] = [(); std::mem::size_of::<Range>()];
 const _: [(); 256 + 2256 + 512 + 1536] = [(); std::mem::size_of::<Exec>()];
 const _: [(); 48] = [(); std::mem::size_of::<Mail>()];
 const _: [(); 16] = [(); std::mem::size_of::<WbPage>()];
+
+// ---- the matrix-multiply service (card/vpu/vpu_matmul.h) ----
+
+/// Keep `bytes` from the window at `a_off` under `a_id`.
+pub const K_UPLOAD: u32 = 3;
+/// d = a . b^T with a cached (`a_id`) or in the window (`a_off`).
+pub const K_MATMUL: u32 = 4;
+/// Drop `a_id` (0: everything).
+pub const K_FREE: u32 = 5;
+/// Window offset of the matmul descriptor, in the control area.
+pub const OFF_MATMUL: usize = 13312;
+pub const MM_F32: u32 = 0;
+pub const MM_F16: u32 = 1;
+
+/// `struct vpu_matmul`: one upload, multiply or free.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Matmul {
+    pub a_id: u64,
+    pub a_off: u64,
+    pub bytes: u64,
+    pub a_type: u32,
+    pub reserved0: u32,
+    pub m: u64,
+    pub n: u64,
+    pub k: u64,
+    pub nb_a: u64,
+    pub nb_b: u64,
+    pub b_off: u64,
+    pub d_off: u64,
+    pub reserved: [u64; 5],
+}
+
+#[cfg(test)]
+mod matmul_layout {
+    use super::*;
+    use std::mem::{offset_of, size_of};
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn matmul_descriptor_matches_the_c_struct() {
+        assert_eq!(size_of::<Matmul>(), 128);
+        assert_eq!(offset_of!(Matmul, a_type), 24);
+        assert_eq!(offset_of!(Matmul, m), 32);
+        assert_eq!(offset_of!(Matmul, nb_a), 56);
+        assert_eq!(offset_of!(Matmul, b_off), 72);
+        assert_eq!(offset_of!(Matmul, d_off), 80);
+        assert!(OFF_MATMUL >= OFF_EXEC + 4560 && OFF_MATMUL + 128 <= 16384);
+    }
+}

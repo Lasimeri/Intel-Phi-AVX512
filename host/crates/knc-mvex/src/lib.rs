@@ -285,6 +285,18 @@ pub fn vmovaps_load(dst: Zmm, mem: Mem) -> Insn {
     }
 }
 
+/// `vmovaps zmm1, mt {float16}`: 16 halfs up-converted to float32 as they
+/// load (MVEX.512.0F.W0 28 with SSS 011, the Uf32 float16 conversion,
+/// ISA reference table 2.9); the 32 bytes must be 32-byte aligned.
+pub fn vmovaps_load_f16(dst: Zmm, mem: Mem) -> Insn {
+    let mut bytes = mvex(Map::M0F, Pp::None, false, dst.0, 0, Rm::Mem(mem), 0, 0x28, None);
+    bytes[3] |= 3 << 4;
+    Insn {
+        bytes,
+        text: format!("vmovaps {dst}, {mem} {{float16}}"),
+    }
+}
+
 /// `vmovapd zmm1 {k}, zmm2/mt`: float64 vector move (MVEX.512.66.0F.W1 28).
 pub fn vmovapd_load(dst: Zmm, src: Src, k: K) -> Insn {
     Insn {

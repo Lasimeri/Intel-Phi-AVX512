@@ -36,6 +36,7 @@
 #include <unistd.h>
 #include "vpu_proto.h"
 #include "vpu_exec.h"
+#include "vpu_matmul.h"
 
 /* Translated from AVX-512 by avx512-xlate; see card/examples/avx512_poly.S */
 void poly_kernel_x8(float *d, const float *x, const float *coef, long n);
@@ -273,6 +274,10 @@ static int push(const void *src, size_t len, uint64_t off)
     return 0;
 }
 
+/* The same two, for the matrix-multiply service (vpu_matmul.c). */
+int vpu_pull(void *dst, size_t len, uint64_t off) { return pull(dst, len, off); }
+int vpu_push(const void *src, size_t len, uint64_t off) { return push(src, len, off); }
+
 /* Buffers persist across requests and only grow. Allocating per request
  * meant every request paid a page fault per 4 KiB of data on first
  * touch; the memset here takes those faults once, outside any timing.
@@ -406,6 +411,8 @@ int main(int argc, char **argv)
         size_t bytes = (size_t)n * 4;
 
         if (kernel == VPU_K_EXEC) status = vpu_exec_run(ctrl, blk, verbose);
+        else if (kernel == VPU_K_UPLOAD || kernel == VPU_K_MATMUL || kernel == VPU_K_FREE)
+            status = vpu_matmul_run(ctrl, kernel, threads, verbose, &compute_ns, &pull_ns, &push_ns, &live);
         else if (kernel != VPU_K_POLY30) status = VPU_E_KERNEL;
         else if (n <= 0 || (in_off | out_off | aux_off) % VPU_BLOCK != 0) status = VPU_E_REQUEST;
         else if (reserve(&in, bytes) || reserve(&out, bytes) || reserve(&coef, aux_len)) status = VPU_E_ALLOC;
