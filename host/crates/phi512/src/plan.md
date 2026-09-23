@@ -79,3 +79,11 @@ reads and leaves rax at -1; a copy loop with two running pointers
 not one vector. On the card (2026-09-22): all three kernels
 of the test bit-identical at 65536, 1048576 and 16777216 elements,
 `docs/results/2026-09-22-seamless-card.md`.
+
+A dense range (the card fetches only its edge pages and trusts the
+phase to write the rest whole) is only a written range nothing reads;
+`merged` drops the flag when a read part joins the merge. Until
+2026-09-22 a dense read merged into a dense write kept the flag, and the
+phase read the card's stale pages of that range: `tools/avx512-narrow-test.c`
+saw the expected values of one check computed from stale inputs, in
+some runs and not others (the merge depends on where the stack landed).

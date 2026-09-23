@@ -63,3 +63,11 @@ Both files assert the two structure sizes at compile time, the Rust unit
 tests pin every field offset, and `tools/vpu-layout-check.c` (run by
 `make layout-check`) prints the C side's offsets against the same
 numbers. Changing one file without the other fails one of those.
+
+## The scratch word (2026-09-22 night)
+
+`VPU_OFF_SCRATCH` (8, in the readiness word's line, written by the card
+only) carries the `fs`-relative displacement of the worker's per-thread
+scratch area for the seamless path's sequences (`vpu_exec.h`,
+`VPU_EXEC_SCRATCH`). The worker writes it before `VPU_MAGIC`; a host
+that reads zero refuses to use the worker.

@@ -43,6 +43,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <ucontext.h>
 #include <unistd.h>
@@ -97,6 +98,18 @@ static void *g_bundle;             /* the descriptor, thunk and code pages, read
 static struct ctx g_ctx[VPU_EXEC_MAX_THREADS];
 __thread struct ctx *vpu_exec_tctx;   /* this thread's run, while in the region; the trampoline reads it through fs */
 __thread uint64_t vpu_exec_scratch, vpu_exec_scratch2;
+/* The sequences the host puts in the thunk area keep what they clobber
+ * here, through fs, never on the program's stack, which the threads of
+ * a split loop share. Its fs-relative displacement is the same in every
+ * thread (static TLS), published at VPU_OFF_SCRATCH. */
+__thread uint8_t vpu_exec_tscratch[VPU_EXEC_SCRATCH] __attribute__((aligned(64)));
+
+int64_t vpu_exec_scratch_tpoff(void)
+{
+    uint64_t fs_base = 0;
+    if (syscall(SYS_arch_prctl, 0x1003 /* ARCH_GET_FS */, &fs_base) != 0) return 0;
+    return (int64_t)((uint64_t)vpu_exec_tscratch - fs_base);
+}
 #define t_ctx vpu_exec_tctx
 static volatile int g_in_exec, g_lock;
 static uint64_t g_fetch_ns, g_faults;
@@ -672,10 +685,44 @@ int vpu_exec_run(volatile unsigned char *ctrl, int blk_fd, int verbose)
         g_session = g_desc.reserved[0];
     }
     if (g_desc.flags & VPU_EXEC_FIRST) end_region();
-    struct chunk *code = find_chunk(g_desc.code_addr), *thunk = find_chunk(g_desc.thunk_addr & ~(uint64_t)(VPU_EXEC_CHUNK - 1));
+    uint64_t tbase0 = g_desc.thunk_addr & ~(uint64_t)(VPU_EXEC_CHUNK - 1);
+    if (g_desc.mode == VPU_MODE_DEMAND) {
+        /* Demand mode faults only on what is not mapped. A chunk kept from
+         * an earlier region holds stale pages, and is writable, so a read
+         * of it would be stale and a write would neither fault nor be
+         * snapshotted, and would never reach the host (found 2026-09-22 by
+         * tools/avx512-narrow-test.c). Every kept chunk this region did
+         * not fill by demand goes; the code chunk is refreshed below. */
+        int keep = 0;
+        for (int i = 0; i < g_nchunks; i++) {
+            struct chunk *c = &g_chunks[i];
+            if (c->demand || c->base == g_desc.code_addr || c->base == tbase0) {
+                if (keep != i) g_chunks[keep] = *c;
+                keep++;
+                continue;
+            }
+            hp_unmap(c);
+        }
+        g_nchunks = keep;
+    }
+    struct chunk *code = find_chunk(g_desc.code_addr), *thunk = find_chunk(tbase0);
     if (!code && (r = new_chunk(g_desc.code_addr, 1, &code)) != 0) goto fail;
     code->used = 1;
     set_prot(code, 1);
+    if (g_desc.mode == VPU_MODE_DEMAND && !code->demand) {
+        /* The program's data around its code (constants next to the text)
+         * must be current, and only the code pages arrive in the bundle:
+         * the whole chunk from the host, once per region. */
+        uint32_t slot = g_fetch_slot++ & 1;
+        if (mail(VPU_MAIL_FETCH, g_desc.code_addr, VPU_EXEC_CHUNK, slot) != 0 ||
+            pread(g_blk, (void *)g_desc.code_addr, VPU_EXEC_CHUNK, VPU_OFF_EXEC_FETCH + (off_t)slot * VPU_EXEC_CHUNK) != (ssize_t)VPU_EXEC_CHUNK) {
+            r = VPU_EXIT_FAULT;
+            g_desc.fault_addr = g_desc.code_addr;
+            goto fail;
+        }
+        memset(code->filled, 0xff, sizeof code->filled);
+        code->demand = 1;
+    }
     for (uint32_t i = 0; i < g_desc.code_pages; i++) {
         uint64_t a = g_desc.code_page[i];
         if (a < g_desc.code_addr || a >= g_desc.code_addr + VPU_EXEC_CHUNK) { r = VPU_EXIT_FAULT; g_desc.fault_addr = a; goto fail; }

@@ -33,7 +33,7 @@ use std::sync::atomic::{fence, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use avx512_xlate::rewrite::{rewrite, thunk_bytes, Rewrite};
+use avx512_xlate::rewrite::{rewrite, thunk_bytes, Fixup, FixupKind, Rewrite, Target};
 use iced_x86::{CpuidFeature, Decoder, DecoderOptions, EncodingKind, FlowControl, Instruction, Register};
 use phi_vpu::proto::*;
 use phi_vpu::window::{wait_ready, Window};
@@ -91,6 +91,8 @@ struct Region {
     code: Vec<u8>,
     thunk_addr: u64,
     thunk: Vec<u8>,
+    /// (start, end) offsets in `thunk` of each site's sequence, and the site.
+    sites: Vec<(u64, u64, u64)>,
     insns: Insns,
     exits: Vec<u64>,
     lp: Option<Loop>,
@@ -117,6 +119,9 @@ struct Card {
     next_id: u64,
     /// This process, to the card: its mapped chunks belong to one program.
     session: u64,
+    /// `fs`-relative displacement of the worker's per-thread scratch area,
+    /// which the thunks use instead of the program's stack.
+    scratch: i32,
 }
 
 static CARD: Mutex<Option<Card>> = Mutex::new(None);
@@ -170,7 +175,14 @@ pub fn init() -> Result<usize, String> {
         .len() as usize;
     let w = Window::open(path.to_str().unwrap_or(""), len).map_err(|e| format!("{e:#}"))?;
     wait_ready(&w, std::time::Duration::from_secs(2)).map_err(|e| format!("card {index}: {e:#} (phi -c {index} vpu start)"))?;
+    let scratch = w.read::<i64>(OFF_SCRATCH);
+    if scratch == 0 || i32::try_from(scratch).is_err() {
+        return Err(format!(
+            "card {index}: the worker publishes no scratch area (an older worker: scripts/phi-vpu.sh -c {index} deploy, then start)"
+        ));
+    }
     *CARD.lock().unwrap_or_else(|e| e.into_inner()) = Some(Card {
+        scratch: scratch as i32,
         w,
         index,
         regions: Vec::new(),
@@ -362,8 +374,65 @@ fn card_can_run(insn: &Instruction) -> bool {
     })
 }
 
+/// A VEX-encoded mask instruction (kmovw, kandw, ...): AVX-512, which
+/// the host cannot run either, so it goes to the card with the rest.
+fn is_mask_op(insn: &Instruction) -> bool {
+    insn.encoding() == EncodingKind::VEX && format!("{:?}", insn.mnemonic()).starts_with('K')
+}
+
+/// A byte or word compare whose result only feeds `kortestq`/`kortestd`
+/// (a scan for a differing byte): the card has no 64-bit masks, but the
+/// dword compare answers the same question. `text` bounds the decode of
+/// the next instruction.
+fn bytecmp_pair(insn: &Instruction, bytes: &[u8], tg: &Target, text: &Map) -> Option<Rewrite> {
+    use iced_x86::Mnemonic as M;
+    if !matches!(
+        insn.mnemonic(),
+        M::Vpcmpeqb | M::Vpcmpeqw | M::Vpcmpb | M::Vpcmpub | M::Vpcmpw | M::Vpcmpuw
+    ) {
+        return None;
+    }
+    let next = insn.next_ip();
+    if next >= text.hi {
+        return None;
+    }
+    let avail = ((text.hi - next).min(15)) as usize;
+    // SAFETY: [next, next+avail) is inside the readable, executable mapping `text`.
+    let nb = unsafe { std::slice::from_raw_parts(next as *const u8, avail) };
+    let n = Decoder::with_ip(64, nb, next, DecoderOptions::NONE).decode();
+    if !matches!(n.mnemonic(), M::Kortestq | M::Kortestd)
+        || n.op0_register() != insn.op0_register()
+        || n.op1_register() != insn.op0_register()
+    {
+        return None;
+    }
+    avx512_xlate::rewrite::rewrite_bytecmp_for_kortest(insn, bytes, tg).ok()
+}
+
+/// Where an address is, for a message: `module+offset` through `dladdr`,
+/// or, inside a region's thunk area, the site whose sequence it belongs to.
+fn whereis(addr: u64, region: Option<&Region>) -> String {
+    if let Some(r) = region {
+        if addr >= r.thunk_addr && addr < r.thunk_addr + r.thunk.len() as u64 {
+            let off = addr - r.thunk_addr;
+            if let Some((_, _, site)) = r.sites.iter().find(|(lo, hi, _)| off >= *lo && off < *hi) {
+                return format!("{addr:#x} (in the sequence for {})", whereis(*site, None));
+            }
+            return format!("{addr:#x} (in the thunk area)");
+        }
+    }
+    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+    // SAFETY: dladdr only reads the loader's tables and writes `info`.
+    if unsafe { libc::dladdr(addr as *const libc::c_void, &mut info) } != 0 && !info.dli_fname.is_null() {
+        let name = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) }.to_string_lossy();
+        let base = name.rsplit('/').next().unwrap_or(&name).to_string();
+        return format!("{addr:#x} ({base}+{:#x})", addr - info.dli_fbase as u64);
+    }
+    format!("{addr:#x}")
+}
+
 /// Build the region around `entry`. `maps` locates the text.
-fn analyze(id: u64, entry: u64, maps: &[Map]) -> Result<Region, String> {
+fn analyze(id: u64, entry: u64, maps: &[Map], tg: &Target) -> Result<Region, String> {
     let text = maps
         .iter()
         .find(|m| m.x && m.r && entry >= m.lo && entry < m.hi)
@@ -390,19 +459,21 @@ fn analyze(id: u64, entry: u64, maps: &[Map]) -> Result<Region, String> {
             continue;
         }
         let rw = match insn.encoding() {
-            EncodingKind::EVEX => match rewrite(&insn, bytes) {
-                Ok(r) => {
-                    avx512 += 1;
-                    Some(r)
-                }
-                Err(e) => {
-                    if addr == entry {
-                        return Err(format!("the card cannot run {}: {}", e.text, e.reason));
+            EncodingKind::EVEX | EncodingKind::VEX if insn.encoding() == EncodingKind::EVEX || is_mask_op(&insn) => {
+                match rewrite(&insn, bytes, tg).or_else(|e| bytecmp_pair(&insn, bytes, tg, &text).ok_or(e)) {
+                    Ok(r) => {
+                        avx512 += 1;
+                        Some(r)
                     }
-                    exits.push(addr);
-                    continue;
+                    Err(e) => {
+                        if addr == entry {
+                            return Err(format!("the card cannot run {} at {}: {}", e.text, whereis(addr, None), e.reason));
+                        }
+                        exits.push(addr);
+                        continue;
+                    }
                 }
-            },
+            }
             EncodingKind::Legacy | EncodingKind::D3NOW => {
                 if !card_can_run(&insn) {
                     exits.push(addr);
@@ -456,11 +527,74 @@ fn analyze(id: u64, entry: u64, maps: &[Map]) -> Result<Region, String> {
     // The thunk area: a free, page-aligned stretch of this process's
     // address space beyond the code chunk, within reach of a rel32. Its
     // first kilobyte is the card's: entry stubs, one per thread.
-    let thunk_addr = free_range(maps, (code_addr + EXEC_CHUNK).max(text.hi), 65536, lo)?;
+    let thunk_addr = free_range(maps, (code_addr + EXEC_CHUNK).max(text.hi), EXEC_THUNK_MAX, lo)?;
     // The card owns the first kilobyte (an entry stub per thread) and the
     // slot after it (the split loop exit jump); host thunks follow.
     let mut thunk: Vec<u8> = vec![0xcc; 16 * EXEC_MAX_THREADS + 16];
+    let mut sites: Vec<(u64, u64, u64)> = Vec::new();
+    // A site shorter than the 5-byte jump that replaces it (a 4-byte mask
+    // instruction) takes the instructions after it along into its thunk,
+    // as long as they fall through, nothing branches into them, and they
+    // are position independent (no RIP-relative operand, no thunk of their own).
+    let targets: std::collections::BTreeSet<u64> = included
+        .values()
+        .filter(|(i, _)| matches!(i.flow_control(), FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch))
+        .map(|(i, _)| i.near_branch_target())
+        .collect();
+    let mut swallowed: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    let mut extra: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
     for (a, (i, rw)) in &included {
+        if !matches!(rw, Some(Rewrite::Thunk(_))) || i.len() >= 5 {
+            continue;
+        }
+        let mut covered = i.len();
+        let mut next = i.next_ip();
+        let mut taken = Vec::new();
+        while covered < 5 {
+            let Some((j, jrw)) = included.get(&next) else {
+                return Err(format!(
+                    "the instruction at {} is too short to replace and what follows it is not in the region",
+                    whereis(*a, None)
+                ));
+            };
+            // A direct near branch may be the last one taken: it is
+            // re-encoded in the thunk with a 32-bit displacement.
+            let branch = matches!(j.flow_control(), FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch)
+                && j.near_branch_target() != 0
+                && !matches!(
+                    j.mnemonic(),
+                    iced_x86::Mnemonic::Jrcxz
+                        | iced_x86::Mnemonic::Jecxz
+                        | iced_x86::Mnemonic::Loop
+                        | iced_x86::Mnemonic::Loope
+                        | iced_x86::Mnemonic::Loopne
+                );
+            let ok = (j.flow_control() == FlowControl::Next || branch)
+                && !targets.contains(&next)
+                && next != entry
+                && !j.is_ip_rel_memory_operand()
+                && !matches!(jrw, Some(Rewrite::Thunk(_)));
+            if !ok {
+                return Err(format!(
+                    "the instruction at {} is too short to replace and the one after it cannot move",
+                    whereis(*a, None)
+                ));
+            }
+            taken.push(next);
+            covered += j.len();
+            next = j.next_ip();
+            if branch {
+                // Whatever follows the branch is reached by its own address.
+                covered = covered.max(5);
+            }
+        }
+        swallowed.extend(taken.iter().copied());
+        extra.insert(*a, taken);
+    }
+    for (a, (i, rw)) in &included {
+        if swallowed.contains(a) {
+            continue;
+        }
         match rw {
             None => {}
             Some(Rewrite::InPlace(v)) => {
@@ -469,10 +603,50 @@ fn analyze(id: u64, entry: u64, maps: &[Map]) -> Result<Region, String> {
             }
             Some(Rewrite::Thunk(seq)) => {
                 let at = thunk_addr + thunk.len() as u64;
-                let (t, s) = thunk_bytes(seq, at, *a, i.len(), i.next_ip());
+                let start = thunk.len() as u64;
+                let (seq, len, next) = match extra.get(a) {
+                    None => (seq.clone(), i.len(), i.next_ip()),
+                    Some(taken) => {
+                        let mut s = seq.clone();
+                        let mut len = i.len();
+                        let mut next = i.next_ip();
+                        for j in taken {
+                            let (ji, jrw) = &included[j];
+                            if matches!(ji.flow_control(), FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch) {
+                                // Re-encoded with a 32-bit displacement, patched at layout.
+                                if ji.flow_control() == FlowControl::UnconditionalBranch {
+                                    s.seq.push(0xe9);
+                                } else {
+                                    let cc = ji.condition_code() as u8;
+                                    s.seq.extend_from_slice(&[0x0f, 0x80 | (cc - 1)]);
+                                }
+                                let disp_at = s.seq.len();
+                                s.seq.extend_from_slice(&[0; 4]);
+                                s.fixups.push(Fixup {
+                                    disp_at,
+                                    insn_end: s.seq.len(),
+                                    what: FixupKind::Rip(ji.near_branch_target()),
+                                });
+                            } else {
+                                match jrw {
+                                    Some(Rewrite::InPlace(v)) => s.seq.extend_from_slice(v),
+                                    _ => {
+                                        let o = (j - code_addr) as usize;
+                                        s.seq.extend_from_slice(&code[o..o + ji.len()]);
+                                    }
+                                }
+                            }
+                            len += ji.len();
+                            next = ji.next_ip();
+                        }
+                        (s, len, next)
+                    }
+                };
+                let (t, s) = thunk_bytes(&seq, at, *a, len, next);
                 let o = (a - code_addr) as usize;
                 code[o..o + s.len()].copy_from_slice(&s);
                 thunk.extend_from_slice(&t);
+                sites.push((start, thunk.len() as u64, *a));
                 while thunk.len() % 16 != 0 {
                     thunk.push(0xcc);
                 }
@@ -501,6 +675,7 @@ fn analyze(id: u64, entry: u64, maps: &[Map]) -> Result<Region, String> {
         code,
         thunk_addr,
         thunk,
+        sites,
         insns,
         exits,
         lp,
@@ -821,16 +996,20 @@ fn submit(w: &Window, maps: &[Map], desc: &Exec, index: usize, region: &Region, 
     match out.exit_kind {
         EXIT_LEFT => Ok((out, rep.total_ns / 1000)),
         EXIT_FAULT if desc.mode == MODE_RANGES => Err(format!(
-            "RETRY: the phase at {entry:#x} touched {:#x} at {:#x}, outside what the planner worked out",
-            out.fault_addr, out.exit_rip
+            "RETRY: the phase at {entry:#x} touched {:#x} at {}, outside what the planner worked out",
+            out.fault_addr,
+            whereis(out.exit_rip, Some(region))
         )),
         EXIT_FAULT => Err(format!(
-            "card {index}: the phase at {entry:#x} touched {:#x} at {:#x}, which this process has not mapped",
-            out.fault_addr, out.exit_rip
+            "card {index}: the phase at {} touched {:#x} at {}, which this process has not mapped",
+            whereis(entry, None),
+            out.fault_addr,
+            whereis(out.exit_rip, Some(region))
         )),
         EXIT_ILLEGAL => Err(format!(
-            "card {index}: the card refused the instruction at {:#x} inside the region at {:#x} (a translation the card does not accept)",
-            out.exit_rip, region.entry
+            "card {index}: the card refused the instruction at {} inside the region at {} (a translation the card does not accept)",
+            whereis(out.exit_rip, Some(region)),
+            whereis(region.entry, None)
         )),
         EXIT_COLLISION => Err(format!(
             "card {index}: the program's address {:#x} is already in use on the card (the worker's own mappings); retry, or move the worker",
@@ -845,6 +1024,18 @@ fn submit(w: &Window, maps: &[Map], desc: &Exec, index: usize, region: &Region, 
 }
 
 fn stats_of(what: &'static str, entry: u64, out: &Exec, mode: &Mode, fell_back: bool, card_us: u64, t0: Instant) -> PhaseStats {
+    if std::env::var_os("PHI512_VERBOSE").is_some() {
+        if let Mode::Ranges { ranges, .. } = mode {
+            for (addr, len, written, read, dense) in ranges.iter().take(12) {
+                eprintln!(
+                    "phi512:     range {addr:#x}+{len:#x}{}{}{}",
+                    if *read { " read" } else { "" },
+                    if *written { " write" } else { "" },
+                    if *dense { " dense" } else { "" }
+                );
+            }
+        }
+    }
     let (mode_name, ranges, threads) = match (mode, fell_back) {
         (_, true) => ("demand after the planner missed an address", 0, 1),
         (Mode::Demand, _) => ("demand", 0, 1),
@@ -887,7 +1078,22 @@ pub unsafe fn run(uc: *mut libc::ucontext_t, rip: u64, st: &mut VState) -> Resul
             cached = false;
             let id = card.next_id;
             card.next_id += 1;
-            let r = analyze(id, rip, &card.maps)?;
+            let verbose = std::env::var_os("PHI512_VERBOSE").is_some();
+            if verbose {
+                eprintln!("phi512: analysing the region at {}", whereis(rip, None));
+            }
+            let ta = Instant::now();
+            let r = analyze(id, rip, &card.maps, &Target { scratch: card.scratch })?;
+            if verbose {
+                eprintln!(
+                    "phi512:   {} instructions, {} AVX-512, {} thunk bytes, {} exits, in {} us",
+                    r.insns.len(),
+                    r.avx512,
+                    r.thunk.len(),
+                    r.exits.len(),
+                    ta.elapsed().as_micros()
+                );
+            }
             if card.regions.len() >= MAX_REGIONS {
                 card.regions.remove(0);
             }

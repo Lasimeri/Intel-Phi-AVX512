@@ -363,6 +363,7 @@ int main(int argc, char **argv)
     rep->seq = 0;
     rep->status = 0;
     uint64_t last = 0;
+    *(volatile int64_t *)(ctrl + VPU_OFF_SCRATCH) = vpu_exec_scratch_tpoff();
     *ready = VPU_MAGIC;
 
     struct buf in = {0}, out = {0}, coef = {0};

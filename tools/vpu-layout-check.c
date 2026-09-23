@@ -65,6 +65,7 @@ int main(void)
 	check("reply.threads", offsetof(struct vpu_reply, threads), 44);
 
 	check("VPU_OFF_READY", VPU_OFF_READY, 0);
+	check("VPU_OFF_SCRATCH", VPU_OFF_SCRATCH, 8);
 	check("VPU_OFF_REQ", VPU_OFF_REQ, 64);
 	check("VPU_OFF_REPLY", VPU_OFF_REPLY, 256);
 	check("VPU_OFF_DATA", VPU_OFF_DATA, 1u << 20);

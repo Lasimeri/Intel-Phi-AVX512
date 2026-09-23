@@ -1,7 +1,7 @@
 # phi-vpu.sh: put the co-processor worker on the card and drive it
 
 ```
-scripts/phi-vpu.sh [-c N] deploy        copy the sources to the card and build there
+scripts/phi-vpu.sh [-c N] deploy        build the worker (host cross toolchain, else another card, else this card) and put it on the card
 scripts/phi-vpu.sh [-c N] start [T]     start the worker with T threads (default 57)
 scripts/phi-vpu.sh [-c N] stop
 scripts/phi-vpu.sh [-c N] status        worker process on the card, control words on the host
@@ -79,3 +79,16 @@ command to run. The default reservation is 768 huge pages: the seamless
 path's engine pools 256 of them at start (512 MiB of the program mapped
 at once, moved into place with `mremap`), the rest are the worker's
 buffers.
+
+## Where the worker is built (2026-09-22 night)
+
+`deploy` no longer builds on the card it deploys to unless it must. In
+order: on the host with the stack's cross toolchain (`toolchain/env.sh`
+puts `knc-cc` on PATH; the three files compile in parallel and link
+statically, under a second, and the binary is pushed), else on another
+card that is up (`PHI_VPU_BUILD_CARD`, default the first other index;
+`build-here` is the verb it uses there, and the binary comes back
+through the host), else on the card itself with `build.sh`, which
+builds alone and slowly while the card serves. The host build must be
+static: the cross toolchain's default is a dynamic executable wanting
+`/lib/ld-musl-x86_64.so.1`, which the card does not have.

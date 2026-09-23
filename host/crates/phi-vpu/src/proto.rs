@@ -8,6 +8,10 @@
 
 /// Window offset of the card's readiness word.
 pub const OFF_READY: usize = 0;
+/// Window offset of the `fs`-relative displacement (i64) of the card
+/// worker's per-thread scratch area for the seamless path's thunks
+/// (`vpu_exec.h`), written by the card before its readiness word.
+pub const OFF_SCRATCH: usize = 8;
 /// Window offset of the request descriptor.
 pub const OFF_REQ: usize = 64;
 /// Window offset of the reply descriptor.
@@ -146,7 +150,7 @@ pub const K_EXEC: u32 = 2;
 
 // The seamless path (card/vpu/vpu_exec.h).
 pub const EXEC_CHUNK: u64 = 2 << 20;
-pub const EXEC_THUNK_MAX: u64 = 64 << 10;
+pub const EXEC_THUNK_MAX: u64 = 256 << 10;
 pub const EXEC_MAX_RANGES: usize = 64;
 pub const EXEC_MAX_PAGES: usize = 64;
 pub const EXEC_MAX_THREADS: usize = 64;

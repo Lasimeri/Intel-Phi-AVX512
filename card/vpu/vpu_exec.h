@@ -24,7 +24,8 @@
 #include <stdint.h>
 
 #define VPU_EXEC_CHUNK      (2u << 20)     /* the unit of the program's memory the card maps: one huge page */
-#define VPU_EXEC_THUNK_MAX  (64u << 10)    /* thunk area: the entry stubs (first 1 KiB), then out-of-line sequences */
+#define VPU_EXEC_THUNK_MAX  (256u << 10)   /* thunk area: the entry stubs (first 1 KiB), then out-of-line sequences */
+#define VPU_EXEC_SCRATCH    512            /* per-thread scratch the sequences use through fs (host: avx512-xlate rewrite.rs S_* layout): 4 vector slots, then rax, rcx, a mask, a general register, the flags, a transfer slot at 320 */
 #define VPU_EXEC_MAX_RANGES 64
 #define VPU_EXEC_MAX_PAGES  64             /* code pages sent per phase */
 #define VPU_EXEC_MAX_THREADS 64            /* entry stubs in the thunk area */
@@ -146,6 +147,8 @@ _Static_assert(VPU_OFF_EXEC + sizeof(struct vpu_exec) <= 16384, "the descriptor 
 /* The card side (vpu_exec.c). */
 int vpu_exec_run(volatile unsigned char *ctrl, int blk_fd, int verbose);
 int vpu_exec_init(void);
+/* fs-relative displacement of the per-thread scratch area, for VPU_OFF_SCRATCH. */
+int64_t vpu_exec_scratch_tpoff(void);
 /* From vpu_worker.c: run fn(arg, slice, nslices) on nslices threads of the
  * pool (the caller's thread is the last slice) and wait for all. */
 int vpu_pool_map(void (*fn)(void *arg, int slice, int nslices), void *arg, int nslices);

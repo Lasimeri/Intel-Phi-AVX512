@@ -110,3 +110,31 @@ byte strings as the card kernel's `asm/knc_vpu.h`; regenerate with:
 awk '/knc_vpu_save/{p=1;next} p&&/asm volatile/{q=1;next} p&&q&&/^\t\t: :/{exit} p&&q{print}' \
     $KERNEL/arch/x86/include/asm/knc_vpu.h   # and the same for knc_vpu_restore; single % in this file
 ```
+
+## The scratch area (2026-09-22 night)
+
+The sequences the host puts in the thunk area (`avx512-xlate`'s
+`rewrite.rs`) need somewhere to keep what they clobber: rax, rcx, a mask
+register, the flags, up to four vector registers. The program's stack
+is not it: the threads of a split loop run with the same rsp, so two
+threads pushing the same slot corrupt each other. Every pool thread has
+`vpu_exec_tscratch` (`VPU_EXEC_SCRATCH` bytes, 64-byte aligned, thread
+local), reached through `fs` with the same displacement in every thread
+(static TLS), which the worker publishes at `VPU_OFF_SCRATCH` before its
+readiness word; the host refuses a worker that publishes none. The
+layout is `rewrite.rs`'s `S_*` constants.
+
+## Demand mode and kept chunks (2026-09-22 night)
+
+Demand mode faults only on what is not mapped. A chunk kept from an
+earlier region (ranges mode keeps them, bitmaps cleared) holds stale
+pages and is still writable, so in a demand phase a read of it was
+stale and a write neither faulted nor was snapshotted, and never
+reached the host: `tools/avx512-narrow-test.c` found two lanes of a
+result lost this way after fifty regions. A demand phase now unmaps
+every kept chunk this region did not fill by demand (the code and thunk
+chunks aside), and fetches the whole code chunk from the host once per
+region, so the program's data next to its code is current (only the
+code pages arrive in the bundle; before this, those pages were whatever
+the chunk held, zero on a fresh one). Ranges mode is unaffected: its
+pages are fetched by the range list every phase.

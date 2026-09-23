@@ -29,6 +29,7 @@
 /* Control words, each on its own 64-byte line so the two sides never
  * share one. */
 #define VPU_OFF_READY   0     /* card writes VPU_MAGIC when it is polling */
+#define VPU_OFF_SCRATCH 8    /* card writes the fs-relative displacement (int64) of its per-thread thunk scratch area (vpu_exec.h), before VPU_OFF_READY */
 #define VPU_OFF_REQ    64     /* struct vpu_request */
 #define VPU_OFF_REPLY 256     /* struct vpu_reply */
 #define VPU_OFF_DATA  (1u << 20)   /* bulk data starts here, page aligned */

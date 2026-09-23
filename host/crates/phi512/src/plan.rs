@@ -683,7 +683,14 @@ impl Tracker {
     /// two that touch or share a page become one; a merged range is dense
     /// only if every part was.
     pub fn merged(&self) -> Vec<(u64, u64, bool, bool, bool)> {
-        let mut v: Vec<(u64, u64, bool, bool, bool)> = self.ranges.iter().map(|r| (r.addr, r.len, r.write, !r.write, r.dense)).collect();
+        // Dense (the card fetches only the edge pages, the phase writes the rest
+        // whole) holds for a written range nothing reads; a merge with any
+        // read part drops it, or the reads would see the card's stale pages.
+        let mut v: Vec<(u64, u64, bool, bool, bool)> = self
+            .ranges
+            .iter()
+            .map(|r| (r.addr, r.len, r.write, !r.write, r.dense && r.write))
+            .collect();
         v.sort();
         let mut out: Vec<(u64, u64, bool, bool, bool)> = Vec::new();
         for (a, l, w, rd, d) in v {
@@ -864,7 +871,7 @@ mod tests {
         let m = t.merged();
         assert_eq!(
             m,
-            vec![(0x10000, 65536 * 4, false, true, true), (0x80000, 65536 * 4, true, false, true)],
+            vec![(0x10000, 65536 * 4, false, true, false), (0x80000, 65536 * 4, true, false, true)],
             "the output is dense and write-only"
         );
         assert!(splittable(&insns, &lp, &t).is_ok());
@@ -911,7 +918,7 @@ mod tests {
         assert!(t.resolved, "{:?}", t.ranges);
         assert_eq!(
             t.merged(),
-            vec![(0x10000, 4096 * 64, false, true, true), (0x80000, 4096 * 64, true, false, true)],
+            vec![(0x10000, 4096 * 64, false, true, false), (0x80000, 4096 * 64, true, false, true)],
             "all 4096 iterations, not the first"
         );
         assert!(splittable(&insns, &lp, &t).is_err(), "the pointers are carried");
@@ -929,7 +936,7 @@ mod tests {
         let mut t = Tracker::new(gpr, no_mem);
         t.run(&insns, 0x3000, 0x3013, None);
         assert!(t.resolved, "{:?}", t.ranges);
-        assert_eq!(t.merged(), vec![(0x50000, 30 * 4, false, true, true)]);
+        assert_eq!(t.merged(), vec![(0x50000, 30 * 4, false, true, false)]);
         assert_eq!(t.gpr[0], Val::Known(u64::MAX), "rax after the loop is -1");
     }
 }
