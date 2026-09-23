@@ -93,20 +93,24 @@ scripts/phi-ggml.sh --verbose ...                              # each multiply, 
 ```
 
 Qwen3.8-27B (UD-Q4_K_XL, 17.6 GB) on the 5800X alone and with both
-cards, each keeping a fifth of every weight matrix, llama-bench,
-2026-09-23 (`docs/results/2026-09-23-quantized-kernels.md`):
+cards, each keeping a quarter of every weight matrix, llama-bench,
+2026-09-23 (`docs/results/2026-09-23-ceilings-and-residency.md`):
 
-| | pp64 tok/s | tg16 tok/s |
-| --- | --- | --- |
-| host alone, 16 threads | 9.34 | 1.07 |
-| host (12 threads) and both cards | 9.05 | 1.45 |
-| llama-server with the MTP draft: host alone | 7.79 | 2.26 |
-| llama-server with the MTP draft: host and both cards | 6.00 | 2.77 |
+| | pp64 tok/s | pp512 tok/s | tg16 tok/s |
+| --- | --- | --- | --- |
+| host alone, 16 threads | 9.33 | 9.24 | 1.07 |
+| host (12 threads) and both cards | 11.56 | 11.79 | 1.51 |
+| llama-server with the MTP draft: host alone | 7.79 | | 2.26 |
+| llama-server with the MTP draft: host and both cards | 6.00 | | 2.77 |
 
-Token generation is bound by weight bandwidth, and the cards add
-theirs to the host's; the per-multiply floor of the cards hides under
-the host's part of the work, which is why a 0.5B model gains nothing
-from the split while a 27B does.
+Token generation is bound by weight bandwidth, and the cards add theirs
+to the host's; what bounds it now is how much of the model they hold,
+since two 6 GB cards take half of 17.6 GB and the host is the long pole
+in every multiply with the other half. Prompt processing is bound by
+arithmetic, where the cards reach 240 GFLOP/s each on Q4_K once the
+activation rows are written into the window a quarter of a page apart
+(their L1 has 64 sets, and a 5 x 4096 row stride puts eight rows in the
+same ones).
 
 ## Layout
 
