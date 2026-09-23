@@ -340,6 +340,8 @@ pub const K_UPLOAD: u32 = 3;
 pub const K_MATMUL: u32 = 4;
 /// Drop `a_id` (0: everything).
 pub const K_FREE: u32 = 5;
+/// One expert of a mixture per column (ggml's MUL_MAT_ID).
+pub const K_MATMUL_ID: u32 = 6;
 /// Window offset of the matmul descriptor, in the control area.
 pub const OFF_MATMUL: usize = 13312;
 pub const MM_F32: u32 = 0;
@@ -367,7 +369,15 @@ pub struct Matmul {
     pub nb_b: u64,
     pub b_off: u64,
     pub d_off: u64,
-    pub reserved: [u64; 5],
+    /// Rows per chunk the card works in (0: its own default).
+    pub chunk: u64,
+    /// MUL_MAT_ID only, zero otherwise: the experts used per token, the
+    /// tokens, b's rows per token (1 when every expert reads the same
+    /// row), and the bytes of ids that precede b in the window.
+    pub n_used: u64,
+    pub n_tokens: u64,
+    pub b_rows: u64,
+    pub ids_bytes: u64,
 }
 
 #[cfg(test)]

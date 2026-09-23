@@ -26,8 +26,13 @@ int phi_ggml_open(void);
 int phi_ggml_supports(uint32_t a_type, uint64_t m, uint64_t k, uint64_t nb_a, uint64_t nb_b, uint64_t n);
 int64_t phi_ggml_begin(const uint8_t *a, uint32_t a_type, uint64_t m, uint64_t k, uint64_t nb_a, int keep,
                        const uint8_t *b, uint64_t n, uint64_t nb_b);
+int64_t phi_ggml_begin_id(const uint8_t *a, uint32_t a_type, uint64_t m, uint64_t k, uint64_t nb_a, int keep,
+                          const uint8_t *b, uint64_t n, uint64_t nb_b, uint64_t experts, uint64_t nb_a2,
+                          const int32_t *ids, uint64_t n_used, uint64_t n_tokens, uint64_t ids_nb1,
+                          uint64_t b_rows, uint64_t nb_b2);
 int phi_ggml_host_range(uint64_t i, uint64_t *from, uint64_t *to);
 int phi_ggml_end(uint8_t *d, uint64_t nb_d);
+int phi_ggml_end_id(uint8_t *d, uint64_t nb_d, uint64_t nb_d2);
 void phi_ggml_free_all(void);
 
 /* ---- ggml, resolved at run time ---- */
@@ -41,7 +46,9 @@ void phi_ggml_free_all(void);
     X(size_t, tensor_overhead, ggml_tensor_overhead, (void)) \
     X(size_t, graph_overhead_custom, ggml_graph_overhead_custom, (size_t, bool)) \
     X(struct ggml_tensor *, new_tensor_2d, ggml_new_tensor_2d, (struct ggml_context *, enum ggml_type, int64_t, int64_t)) \
+    X(struct ggml_tensor *, new_tensor_3d, ggml_new_tensor_3d, (struct ggml_context *, enum ggml_type, int64_t, int64_t, int64_t)) \
     X(struct ggml_tensor *, mul_mat, ggml_mul_mat, (struct ggml_context *, struct ggml_tensor *, struct ggml_tensor *)) \
+    X(struct ggml_tensor *, mul_mat_id, ggml_mul_mat_id, (struct ggml_context *, struct ggml_tensor *, struct ggml_tensor *, struct ggml_tensor *)) \
     X(struct ggml_cgraph *, new_graph_custom, ggml_new_graph_custom, (struct ggml_context *, size_t, bool)) \
     X(void, build_forward_expand, ggml_build_forward_expand, (struct ggml_cgraph *, struct ggml_tensor *)) \
     X(enum ggml_status, backend_graph_compute, ggml_backend_graph_compute, (ggml_backend_t, struct ggml_cgraph *)) \
@@ -100,6 +107,44 @@ static struct ggml_tensor *alias(struct ggml_context *ctx, const struct ggml_ten
     return l;
 }
 
+/* The same for a mixture's weights, which are one matrix per expert:
+ * rows `from..from+rows` of every one of them. */
+static struct ggml_tensor *alias3(struct ggml_context *ctx, const struct ggml_tensor *t, int64_t from, int64_t rows)
+{
+    struct ggml_tensor *l = p_new_tensor_3d(ctx, t->type, t->ne[0], rows, t->ne[2]);
+    l->data = (char *)t->data + from * t->nb[1];
+    l->nb[0] = t->nb[0];
+    l->nb[1] = t->nb[1];
+    l->nb[2] = t->nb[2];
+    l->nb[3] = t->nb[3];
+    return l;
+}
+
+/* The host's rows of one MUL_MAT_ID: the same three leaves, with the
+ * expert list passed through untouched, and ggml's own kernel choosing
+ * the expert per column exactly as it would have. */
+static int host_rows_id(const struct ggml_tensor *node, int64_t from, int64_t to)
+{
+    const struct ggml_tensor *src0 = node->src[0], *src1 = node->src[1], *ids = node->src[2];
+    int64_t r0 = to - from;
+    struct ggml_init_params params = { p_tensor_overhead() * 16 + p_graph_overhead_custom(64, false) + 4096, NULL, true };
+    struct ggml_context *ctx = p_init(params);
+    if (!ctx) return -1;
+    struct ggml_tensor *a = alias3(ctx, src0, from, r0);
+    struct ggml_tensor *b = alias3(ctx, src1, 0, src1->ne[1]);
+    struct ggml_tensor *i = alias(ctx, ids, 0, ids->ne[1]);
+    struct ggml_tensor *c = p_mul_mat_id(ctx, a, b, i);
+    c->data = (char *)node->data + from * 4;
+    c->nb[1] = node->nb[1];
+    c->nb[2] = node->nb[2];
+    c->nb[3] = node->nb[3];
+    struct ggml_cgraph *g = p_new_graph_custom(ctx, 64, false);
+    p_build_forward_expand(g, c);
+    enum ggml_status st = p_backend_graph_compute(g_cpu, g);
+    p_free(ctx);
+    return st == GGML_STATUS_SUCCESS ? 0 : -1;
+}
+
 /* d[0..n][0..r0] = a[0..r0] . b, with ggml's own MUL_MAT on the rows the
  * host keeps: two leaves, one multiply, the result pointed straight at the
  * node's data with the node's row stride. */
@@ -147,6 +192,27 @@ static int card_type(enum ggml_type t)
     }
 }
 
+/* A mixture of experts: ggml's MUL_MAT_ID, which is what an MoE model's
+ * feed-forward weights go through. src0 is one matrix per expert, src2
+ * names the expert each column wants, and the cards keep the same rows
+ * of every expert, so the split is by rows exactly as for a plain
+ * multiply. */
+static bool phi_supports_mul_mat_id(const struct ggml_tensor *op)
+{
+    const struct ggml_tensor *src0 = op->src[0], *src1 = op->src[1], *ids = op->src[2];
+    if (!src0 || !src1 || !ids) return false;
+    int t = card_type(src0->type);
+    if (t < 0) return false;
+    if (src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) return false;
+    if (src1->nb[0] != 4 || op->nb[0] != 4) return false;
+    if (src0->ne[3] != 1 || src1->ne[3] != 1) return false;
+    if (src0->ne[0] != src1->ne[0]) return false;
+    if (!strstr(src0->name, "weight")) return false;
+    /* the card holds every expert's rows: the whole tensor is the budget */
+    return phi_ggml_supports((uint32_t)t, (uint64_t)src0->ne[1], (uint64_t)src0->ne[0], src0->nb[1], src1->nb[1],
+                             (uint64_t)(src1->ne[1] * src1->ne[2])) != 0;
+}
+
 static bool phi_supports_mul_mat(const struct ggml_tensor *op)
 {
     const struct ggml_tensor *src0 = op->src[0], *src1 = op->src[1];
@@ -188,6 +254,24 @@ static enum ggml_status phi_graph_compute(ggml_backend_t backend, struct ggml_cg
                 if (to > from && host_rows(node, (int64_t)from, (int64_t)to) != 0) return GGML_STATUS_FAILED;
             }
             if (phi_ggml_end(node->data, node->nb[1]) != 0) return GGML_STATUS_FAILED;
+            break;
+        }
+        case GGML_OP_MUL_MAT_ID: {
+            const struct ggml_tensor *src0 = node->src[0], *src1 = node->src[1], *ids = node->src[2];
+            int keep = strstr(src0->name, "weight") != NULL;
+            int64_t n = ids->ne[0] * ids->ne[1];
+            int64_t nr = phi_ggml_begin_id(src0->data, (uint32_t)card_type(src0->type), (uint64_t)src0->ne[1],
+                                           (uint64_t)src0->ne[0], src0->nb[1], keep, src1->data, (uint64_t)n, src1->nb[1],
+                                           (uint64_t)src0->ne[2], src0->nb[2], (const int32_t *)ids->data,
+                                           (uint64_t)ids->ne[0], (uint64_t)ids->ne[1], ids->nb[1],
+                                           (uint64_t)src1->ne[1], src1->nb[2]);
+            if (nr < 0) return GGML_STATUS_FAILED;
+            for (int64_t r = 0; r < nr; r++) {
+                uint64_t from, to;
+                if (!phi_ggml_host_range((uint64_t)r, &from, &to)) break;
+                if (to > from && host_rows_id(node, (int64_t)from, (int64_t)to) != 0) return GGML_STATUS_FAILED;
+            }
+            if (phi_ggml_end_id(node->data, node->nb[1], node->nb[2]) != 0) return GGML_STATUS_FAILED;
             break;
         }
         case GGML_OP_NONE:
@@ -285,6 +369,8 @@ static bool phi_dev_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor
         return true;
     case GGML_OP_MUL_MAT:
         return phi_supports_mul_mat(op);
+    case GGML_OP_MUL_MAT_ID:
+        return phi_supports_mul_mat_id(op);
     default:
         return false;
     }

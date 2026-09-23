@@ -67,3 +67,27 @@ instruction count. This is worth about twice the card's prompt-size
 arithmetic (127 to 240 GFLOP/s at n 64) and nothing at n 1, where one
 row cannot conflict with itself. `PHI_GGML_PP_SHARE` followed it from
 0.5 to 0.75.
+
+## Mixtures of experts, and when a card is worth using
+
+`phi_ggml_begin_id` is the same three steps for ggml's `MUL_MAT_ID`,
+which is what an MoE model's expert weights go through: `a` holds one
+matrix per expert, `ids` names the expert each column wants, and each
+card keeps the same rows of every expert (one upload, the experts one
+after another, so the expert an id names is `rows * nb_a` into the
+slice). The host computes its own rows with ggml's own MUL_MAT_ID over a
+leaf alias, so the two sides need no agreement about which expert a
+column chose: each does its rows of whatever the id says.
+
+A card costs about 0.45 ms to involve at all, and an MoE layer's
+multiply at one token is a few megabytes, which the host finishes
+sooner. So the backend judges every weight tensor by what it measures,
+at one token and at a batch separately: the host did `1 - share` of the
+rows in `t_host`, so alone it would have taken `t_host / (1 - share)`;
+a multiply that took longer than that with the cards, plainly longer
+once or barely longer twice, stops going to them at that batch size
+(`Split::avoid`, counted in `too_small`). This is what keeps a mixture's
+small multiplies on the host at generation and its batched ones there
+too, for now: the card computes a mixture one column at a time where
+ggml groups the tokens that chose the same expert
+(`docs/results/2026-09-23-mixture-of-experts.md`).

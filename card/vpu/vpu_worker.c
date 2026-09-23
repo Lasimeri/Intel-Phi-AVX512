@@ -44,6 +44,14 @@
 void poly_kernel_x8(float *d, const float *x, const float *coef, long n);
 
 #define CTRL_BYTES 16384   /* control words, the mailbox and the exec descriptor (vpu_exec.h) */
+#define WIN_BYTES (768UL << 20)   /* the window the matmul service uses: OFF_D + D_MAX (matmul.rs) */
+
+unsigned char *g_window;   /* the whole window, mapped; NULL when the mapping failed */
+void *vpu_window(uint64_t off, size_t len)
+{
+    if (!g_window || off + len > WIN_BYTES) return NULL;
+    return g_window + off;
+}
 #define MAX_POOL 227          /* 228 hardware threads less the dispatcher */
 #define SPIN_ROUNDS 2000      /* polls of the generation word between clock reads */
 static uint64_t spin_ns = 200000000ULL;  /* spin this long after the last job, then park; -s MS */
@@ -339,6 +347,14 @@ int main(int argc, char **argv)
     if (fd < 0) { perror("/dev/phihost"); return 1; }
     volatile unsigned char *ctrl = mmap(NULL, CTRL_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (ctrl == MAP_FAILED) { perror("mmap"); return 1; }
+    /* The whole window as well, for transfers too small to be worth a
+     * block request (vpu_matmul.c, small_pull/small_push): the mapping
+     * reaches host memory directly over PCIe, so it has no per-request
+     * cost, but each access is a link round trip, so it is only better
+     * below a few tens of kilobytes. A failure here is not fatal: the
+     * block device serves everything then. */
+    g_window = mmap(NULL, WIN_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (g_window == MAP_FAILED) { g_window = NULL; if (verbose) printf("window: no direct mapping, the block device serves every transfer\n"); }
 
     blk = open("/dev/phiblk1", O_RDWR | O_DIRECT);
     if (blk < 0) { perror("/dev/phiblk1 (O_DIRECT)"); return 1; }
@@ -414,7 +430,7 @@ int main(int argc, char **argv)
         size_t bytes = (size_t)n * 4;
 
         if (kernel == VPU_K_EXEC) status = vpu_exec_run(ctrl, blk, verbose);
-        else if (kernel == VPU_K_UPLOAD || kernel == VPU_K_MATMUL || kernel == VPU_K_FREE)
+        else if (kernel == VPU_K_UPLOAD || kernel == VPU_K_MATMUL || kernel == VPU_K_FREE || kernel == VPU_K_MATMUL_ID)
             status = vpu_matmul_run(ctrl, kernel, threads, verbose, &compute_ns, &pull_ns, &push_ns, &live);
         else if (kernel != VPU_K_POLY30) status = VPU_E_KERNEL;
         else if (n <= 0 || (in_off | out_off | aux_off) % VPU_BLOCK != 0) status = VPU_E_REQUEST;

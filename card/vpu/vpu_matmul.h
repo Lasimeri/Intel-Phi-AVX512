@@ -14,6 +14,7 @@
 #define VPU_K_UPLOAD 3   /* keep `bytes` from the window at a_off under a_id (replacing an earlier a_id) */
 #define VPU_K_MATMUL 4   /* d = a . b^T with a cached (a_id) or in the window (a_off) */
 #define VPU_K_FREE   5   /* drop a_id (0: everything) */
+#define VPU_K_MATMUL_ID 6 /* the same, but a is one expert of a mixture chosen per column (ggml's MUL_MAT_ID) */
 
 #define VPU_OFF_MATMUL 13312   /* struct vpu_matmul, in the control area */
 
@@ -37,9 +38,18 @@ struct vpu_matmul {
     uint64_t m, n, k;   /* a: m rows of k; b: n rows of k float32; d: n rows of m float32 */
     uint64_t nb_a;      /* row stride of a in bytes (32-byte aligned rows for float16) */
     uint64_t nb_b;      /* row stride of b in bytes */
-    uint64_t b_off;     /* window offset of b: n rows, stride nb_b, whole blocks */
+    uint64_t b_off;     /* window offset of b: n rows, stride nb_b, whole blocks (MATMUL_ID: the ids first, then the rows) */
     uint64_t d_off;     /* window offset for d: n rows of m float32, contiguous, whole blocks */
-    uint64_t reserved[5];
+    uint64_t chunk;     /* rows per chunk the card works in (0: its own default) */
+    /* MUL_MAT_ID only (VPU_K_MATMUL_ID), zero otherwise. a holds `experts`
+     * matrices of m rows, one after another; n is n_used * n_tokens, and
+     * column p = j + t * n_used multiplies expert ids[p] by b's row
+     * (j % b_rows) + t * b_rows. The ids are n int32 at b_off, the rows
+     * follow at b_off + ids_bytes. */
+    uint64_t n_used;
+    uint64_t n_tokens;
+    uint64_t b_rows;
+    uint64_t ids_bytes;
 };
 
 _Static_assert(sizeof(struct vpu_matmul) == 128, "matmul descriptor layout is shared with Rust");

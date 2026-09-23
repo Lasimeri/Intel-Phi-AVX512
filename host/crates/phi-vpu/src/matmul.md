@@ -69,3 +69,8 @@ note), not because the weights are slow to fetch.
 `--pad N` adds N bytes to the activation row stride, which is how the
 L1 set conflict above was found and sized; the backend's own padding
 (`phi-ggml`, `B_PAD`) is 256.
+
+`check_id` does the same for a mixture (`K_MATMUL_ID`): eight experts of
+the same rows, columns picking experts at random, with the activations
+shared between a token's columns and then one per column, against the
+host's own dot products. `matmul-check` runs it for every type.

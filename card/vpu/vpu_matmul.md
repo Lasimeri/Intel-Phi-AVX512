@@ -92,3 +92,17 @@ matters: the kernels take the rows as memory operands, so a stride that
 is a multiple of 4 KiB puts every row of a group in the same L1 sets.
 The host pads it (`phi-ggml`, `B_PAD` 256 bytes), which is twice the
 arithmetic at n 8 and above.
+
+## A mixture of experts (`VPU_K_MATMUL_ID`)
+
+The same multiply with one matrix per column: `a` holds `experts`
+matrices of `m` rows one after another, the `n = n_used * n_tokens`
+columns each name an expert in the int32 array at `b_off` (`ids_bytes`
+of them, the activation rows following), and column `p = j + t *
+n_used` multiplies expert `ids[p]` by b's row `(j % b_rows) + t *
+b_rows`. An id that would read past the slice is refused before any
+thread runs. `rows_slice_id` walks the columns and calls the ordinary
+row slicing for each, so a column is one activation row: right for
+generation, where every column of a token is a different expert, and
+not yet grouped by expert for a batch
+(`docs/results/2026-09-23-mixture-of-experts.md`).

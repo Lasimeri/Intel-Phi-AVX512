@@ -30,6 +30,7 @@
 
 int vpu_pull(void *dst, size_t len, uint64_t off);
 int vpu_push(const void *src, size_t len, uint64_t off);
+void *vpu_window(uint64_t off, size_t len);
 int vpu_pool_map(void (*fn)(void *arg, int slice, int nslices), void *arg, int nslices);
 int vpu_pool_threads(void);
 void phi_dot_f16(const void *a, const float *b, long k16, float *out);
@@ -242,6 +243,11 @@ struct job {
     uint64_t m, n, k, nb_a, nb_b;
     uint32_t type;
     uint32_t chunk;
+    /* MUL_MAT_ID: the n columns each pick an expert. Column p (which is
+     * j + t * n_used) multiplies expert ids[p], whose m rows start at
+     * a + ids[p] * a_stride, by b's row (j % b_rows) + t * b_rows. */
+    const int32_t *ids;
+    uint64_t n_used, b_rows, a_stride;
 };
 
 static float sum16(const float *v)
@@ -402,6 +408,26 @@ static uint64_t bench_pool(long kind, unsigned char *buf, size_t per, long count
     return now_ns() - t0;
 }
 
+/* One expert per column: the thread's rows of expert ids[p], for every
+ * column p, against that column's activation row. A column at a time
+ * (the one-row kernels), which is what generation asks for anyway: there
+ * every column is a different expert of the same token. */
+static void rows_slice_id(void *arg, int slice, int nslices)
+{
+    struct job *j = arg;
+    struct job one = *j;
+    one.n = 1;
+    for (uint64_t p = 0; p < j->n; p++) {
+        int32_t e = j->ids[p];
+        if (e < 0) continue;
+        uint64_t t = p / j->n_used, col = p % j->n_used;
+        one.a = j->a + (uint64_t)e * j->a_stride;
+        one.b = j->b + ((col % j->b_rows) + t * j->b_rows) * j->nb_b;
+        one.d = j->d + p * j->m;
+        rows_slice(&one, slice, nslices);
+    }
+}
+
 static size_t blocks(uint64_t bytes)
 {
     return (size_t)((bytes + VPU_BLOCK - 1) & ~(uint64_t)(VPU_BLOCK - 1));
@@ -463,6 +489,7 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
         fflush(stdout);
     }
     if (mm.m == 0 || mm.n == 0 || mm.k == 0 || mm.b_off % VPU_BLOCK != 0 || mm.d_off % VPU_BLOCK != 0) return VPU_E_REQUEST;
+    if (kernel == VPU_K_MATMUL_ID && (mm.n_used == 0 || mm.b_rows == 0 || mm.n_tokens == 0 || mm.n != mm.n_used * mm.n_tokens || mm.ids_bytes % 64 != 0 || mm.a_id == 0)) return VPU_E_REQUEST;
     if (mm.a_type == VPU_MM_PROBE) {
         if (mm.a_off % VPU_BLOCK != 0) return VPU_E_REQUEST;
         if (grow(&g_a, VPU_BLOCK) != 0 || grow(&g_b, VPU_BLOCK) != 0 || grow(&g_d, VPU_BLOCK) != 0) return VPU_E_ALLOC;
@@ -516,6 +543,29 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
          * either; which one it is under tells what to work on. */
         times[12] = bench_pool(3, g_a.m.p, per, (long)(per / 64), threads);
         times[13] = bench_pool(0, NULL, 0, 1000000, threads);
+        /* The two ways bytes cross the link, at the size a token's
+         * activations and results are: the block device (a request each
+         * way, whose cost is nearly all fixed) and the window mapped
+         * straight into the card's address space (no request, but every
+         * access is a link round trip). 100 rounds of 16 KiB each. */
+        {
+            void *win = vpu_window(mm.b_off, 65536);
+            uint64_t n = 100, bytes = 16384;
+            b0 = now_ns();
+            for (uint64_t r = 0; r < n; r++) vpu_pull(g_b.m.p, bytes, mm.b_off);
+            times[14] = now_ns() - b0;
+            b0 = now_ns();
+            for (uint64_t r = 0; r < n; r++) vpu_push(g_d.m.p, bytes, mm.d_off);
+            times[15] = now_ns() - b0;
+            if (win) {
+                b0 = now_ns();
+                for (uint64_t r = 0; r < n; r++) memcpy(g_b.m.p, win, bytes);
+                times[16] = now_ns() - b0;
+                b0 = now_ns();
+                for (uint64_t r = 0; r < n; r++) memcpy(win, g_d.m.p, bytes);
+                times[17] = now_ns() - b0;
+            }
+        }
         /* What one dispatch across `threads` threads costs with nothing to
          * do: the pool's fixed cost per request, which a small multiply
          * pays in full (1000 rounds). */
@@ -531,7 +581,8 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
     if (mm.a_id != 0) {
         int i = cache_find(mm.a_id);
         if (i < 0) return VPU_E_REQUEST;
-        if (mm.m * mm.nb_a > g_cache[i].bytes) return VPU_E_REQUEST;
+        /* an ordinary multiply reads m rows; a mixture reads m rows of each expert, which the id check below bounds */
+        if (kernel != VPU_K_MATMUL_ID && mm.m * mm.nb_a > g_cache[i].bytes) return VPU_E_REQUEST;
         a = g_cache[i].m.p;
     } else {
         if (mm.a_off % VPU_BLOCK != 0) return VPU_E_REQUEST;
@@ -540,21 +591,36 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
         if (vpu_pull(g_a.m.p, len, mm.a_off) != 0) return VPU_E_PULL;
         a = g_a.m.p;
     }
-    size_t blen = blocks(mm.n * mm.nb_b), dlen = blocks(mm.n * mm.m * 4);
+    /* The ids come first in b's area for a mixture, then the rows; one
+     * pull takes both. */
+    int mixture = (kernel == VPU_K_MATMUL_ID);
+    size_t brows = mixture ? mm.b_rows * mm.n_tokens : mm.n;
+    size_t blen = blocks(mm.ids_bytes + brows * mm.nb_b), dlen = blocks(mm.n * mm.m * 4);
     if (grow(&g_b, blen) != 0 || grow(&g_d, dlen) != 0) return VPU_E_ALLOC;
     if (vpu_pull(g_b.m.p, blen, mm.b_off) != 0) return VPU_E_PULL;
     *pull_ns = now_ns() - t0;
 
-    uint32_t chunk = (uint32_t)mm.reserved[0];
+    uint32_t chunk = (uint32_t)mm.chunk;
     if (chunk < 1 || chunk > ROW_CHUNK_MAX) chunk = ROW_CHUNK;
-    struct job j = { a, g_b.m.p, g_d.m.p, mm.m, mm.n, mm.k, mm.nb_a, mm.nb_b, mm.a_type, chunk };
+    struct job j = { a, (const unsigned char *)g_b.m.p + mm.ids_bytes, g_d.m.p, mm.m, mm.n, mm.k,
+                     mm.nb_a, mm.nb_b, mm.a_type, chunk, (const int32_t *)g_b.m.p,
+                     mixture ? mm.n_used : 0, mixture ? mm.b_rows : 0, mixture ? mm.m * mm.nb_a : 0 };
     int max = vpu_pool_threads() + 1;
     if (max > POOL_SLOTS) max = POOL_SLOTS;
     if (threads < 1) threads = 1;
     if (threads > max) threads = max;
     if ((uint64_t)threads > mm.m) threads = (int)mm.m;
+    /* An id that would read past what this tensor's slice holds is a
+     * broken request, not a segfault: the ids come from the host and are
+     * checked here, once, before any thread runs. */
+    if (mixture) {
+        uint64_t have = (mm.a_id != 0) ? g_cache[cache_find(mm.a_id)].bytes : g_a.cap;
+        uint64_t experts = j.a_stride ? have / j.a_stride : 0;
+        for (uint64_t p = 0; p < mm.n; p++)
+            if (j.ids[p] >= (int32_t)experts) return VPU_E_REQUEST;
+    }
     uint64_t c0 = now_ns();
-    *live = vpu_pool_map(rows_slice, &j, threads);
+    *live = vpu_pool_map(mixture ? rows_slice_id : rows_slice, &j, threads);
     *compute_ns = now_ns() - c0;
 
     uint64_t p0 = now_ns();

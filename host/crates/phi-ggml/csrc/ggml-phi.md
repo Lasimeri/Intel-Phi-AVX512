@@ -39,3 +39,10 @@ gave 1.42, and 16 and 16 collapsed to 0.18, because ggml's barrier spins
 and one thread per CPU leaves nothing for llama.cpp's own pool or the
 two card daemons. (The code said 15 while this note said 12 until
 2026-09-23; 15 is what the 0.47 tg16 of that morning's first run was.)
+
+`GGML_OP_MUL_MAT_ID` is accepted on the same terms as `MUL_MAT` (weight
+type the cards take, float32 activations, a name with "weight" in it),
+and runs in the same three steps, with `host_rows_id` building the
+host's share as a leaf alias of the expert tensor (`alias3`, which keeps
+`ne[2]` and `nb[2]` so every expert's rows are where ggml expects them)
+and the ids passed through untouched.

@@ -402,7 +402,11 @@ fn check_one(w: &Window, threads: u32, t: u32, m: u64, k: u64, n: u64, id: u64, 
         nb_b,
         b_off: OFF_B,
         d_off: OFF_D,
-        reserved: [CHUNK.load(Ordering::Relaxed), 0, 0, 0, 0],
+        chunk: CHUNK.load(Ordering::Relaxed),
+        n_used: 0,
+        n_tokens: 0,
+        b_rows: 0,
+        ids_bytes: 0,
     };
     let mut took = Vec::with_capacity(reps.max(1) as usize);
     for _ in 0..reps.max(1) {
@@ -447,6 +451,116 @@ fn check_one(w: &Window, threads: u32, t: u32, m: u64, k: u64, n: u64, id: u64, 
     Ok(took)
 }
 
+/// One mixture-of-experts multiply (`K_MATMUL_ID`): `experts` matrices of
+/// `m` rows kept as one slice, `n_used` of them picked per token, against
+/// the host's own dot products. `b_rows` is 1 when every expert of a
+/// token reads the same activation row (a gate or up projection) and
+/// `n_used` when each has its own (a down projection).
+#[allow(clippy::too_many_arguments)]
+fn check_id(
+    w: &Window,
+    threads: u32,
+    t: u32,
+    m: u64,
+    k: u64,
+    experts: u64,
+    n_used: u64,
+    n_tokens: u64,
+    b_rows: u64,
+    id: u64,
+    rng: &mut Rng,
+) -> Result<Duration> {
+    let nb_a = row_bytes(t, k);
+    let nb_b = k * 4 + 256;
+    let n = n_used * n_tokens;
+    // The experts, one after another, and the same rows as floats.
+    let mut a = Vec::with_capacity((experts * m * nb_a) as usize);
+    let mut rows = Vec::with_capacity((experts * m) as usize);
+    for _ in 0..experts * m {
+        let (bytes, vals) = random_row(rng, t, k);
+        a.extend_from_slice(&bytes);
+        rows.push(vals);
+    }
+    let ids: Vec<i32> = (0..n).map(|_| (rng.next() % experts) as i32).collect();
+    let b: Vec<f32> = (0..b_rows * n_tokens * k).map(|_| rng.unit()).collect();
+    w.put(OFF_A, &a);
+    let up = Matmul {
+        a_id: id,
+        a_off: OFF_A,
+        bytes: round_up(a.len() as u64),
+        ..Matmul::default()
+    };
+    request(w, threads, K_UPLOAD, &up, Duration::from_secs(30))?;
+    // The window: the ids, then the activation rows at the padded stride.
+    let ids_bytes = (n * 4 + 63) & !63;
+    // SAFETY: i32 has no padding; the slice is written as bytes.
+    let id_bytes = unsafe { std::slice::from_raw_parts(ids.as_ptr() as *const u8, ids.len() * 4) };
+    w.put(OFF_B, id_bytes);
+    for c in 0..b_rows * n_tokens {
+        w.put(OFF_B + ids_bytes + c * nb_b, as_bytes(&b[(c * k) as usize..((c + 1) * k) as usize]));
+    }
+    let mm = Matmul {
+        a_id: id,
+        a_off: 0,
+        bytes: 0,
+        a_type: t,
+        reserved0: 0,
+        m,
+        n,
+        k,
+        nb_a,
+        nb_b,
+        b_off: OFF_B,
+        d_off: OFF_D,
+        chunk: CHUNK.load(Ordering::Relaxed),
+        n_used,
+        n_tokens,
+        b_rows,
+        ids_bytes,
+    };
+    let rep = request(w, threads, K_MATMUL_ID, &mm, Duration::from_secs(60))?;
+    let mut d = vec![0u8; (n * m * 4) as usize];
+    w.get(OFF_D, &mut d);
+    request(
+        w,
+        threads,
+        K_FREE,
+        &Matmul {
+            a_id: id,
+            ..Matmul::default()
+        },
+        Duration::from_secs(30),
+    )?;
+    let mut bad = 0;
+    for (p, &idx) in ids.iter().enumerate().take(n as usize) {
+        let e = idx as u64;
+        let col = p as u64 % n_used;
+        let tok = p as u64 / n_used;
+        let brow = ((col % b_rows) + tok * b_rows) as usize;
+        let x = &b[brow * k as usize..(brow + 1) * k as usize];
+        for i in 0..m as usize {
+            let row = &rows[(e * m) as usize + i];
+            let (mut want, mut mag) = (0f64, 0f64);
+            for (wv, xv) in row.iter().zip(x) {
+                want += *wv as f64 * *xv as f64;
+                mag += (*wv as f64 * *xv as f64).abs();
+            }
+            let at = (p * m as usize + i) * 4;
+            let got = f32::from_le_bytes([d[at], d[at + 1], d[at + 2], d[at + 3]]) as f64;
+            if (got - want).abs() > 4e-6 * mag + 1e-6 {
+                bad += 1;
+                if bad <= 3 {
+                    eprintln!("  {} mixture column {p} (expert {e}) row {i}: card {got} host {want}", type_name(t));
+                }
+            }
+        }
+    }
+    if bad > 0 {
+        bail!("{}: {bad} of {} mixture results outside tolerance", type_name(t), n * m);
+    }
+    Ok(Duration::from_nanos(rep.compute_ns))
+}
+
 /// The best and the median of a set of times.
 fn best_median(mut v: Vec<Duration>) -> (f64, f64) {
     v.sort();
@@ -482,8 +596,15 @@ pub fn check(
             check_one(w, threads, t, 61, k, n, id, &mut rng, 1)?;
             id += 1;
         }
+        // A mixture: eight experts of the same rows, three picked per
+        // token, with the activations shared between a token's columns
+        // (a gate projection) and then one row per column (a down one).
+        for &(n_used, n_tokens, b_rows) in &[(3u64, 1u64, 1u64), (3, 5, 1), (3, 5, 3), (8, 2, 8)] {
+            check_id(w, threads, t, 61, 512, 8, n_used, n_tokens, b_rows, id, &mut rng)?;
+            id += 1;
+        }
         println!(
-            "{:7} ok: 61 rows, k 512 (Q8_0 also 544), n 1 4 8 13, {threads} threads",
+            "{:7} ok: 61 rows, k 512 (Q8_0 also 544), n 1 4 8 13, and mixtures of 8 experts, {threads} threads",
             type_name(t)
         );
     }
@@ -531,7 +652,11 @@ pub fn probe(w: &Window, threads: u32) -> Result<()> {
         nb_b: 0,
         b_off: OFF_B,
         d_off: OFF_D,
-        reserved: [0; 5],
+        chunk: 0,
+        n_used: 0,
+        n_tokens: 0,
+        b_rows: 0,
+        ids_bytes: 0,
     };
     let rep = request(w, threads, K_MATMUL, &mm, Duration::from_secs(30))?;
     let mut d = vec![0u8; 512];
@@ -573,6 +698,21 @@ pub fn probe(w: &Window, threads: u32) -> Result<()> {
         threads as f64 * 8e6 * 32.0 / t(13),
         t(13) / 8e6
     );
+    println!("16 KiB across the link, each way, 100 rounds:");
+    println!("  block device, card reads the window:  {:7.1} us", t(14) / 1e3 / 100.0);
+    println!("  block device, card writes the window: {:7.1} us", t(15) / 1e3 / 100.0);
+    if t(16) > 0.0 {
+        println!(
+            "  mapping, card reads the window:       {:7.1} us ({:.0} MB/s)",
+            t(16) / 1e3 / 100.0,
+            100.0 * 16384.0 / t(16) * 1e9 / 1e6
+        );
+        println!(
+            "  mapping, card writes the window:      {:7.1} us ({:.0} MB/s)",
+            t(17) / 1e3 / 100.0,
+            100.0 * 16384.0 / t(17) * 1e9 / 1e6
+        );
+    }
     let names = [
         "float unpack {uint8} at +3 (bytes 3..18)",
         "int32 unpack {uint8} at +3 (as int bits)",
