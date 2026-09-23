@@ -2,8 +2,8 @@
 
 `libggml_phi.so`, loaded by an unmodified llama.cpp through
 `GGML_BACKEND_PATH` (`scripts/phi-ggml.sh` sets it). ggml's scheduler
-gives the backend every `MUL_MAT` whose weight type and shape
-`csrc/ggml-phi.c` accepts; this file shares each one by rows of the
+gives the backend every `MUL_MAT` and `MUL_MAT_ID` whose weight type
+and shape `csrc/ggml-phi.c` accepts; this file shares each one by rows of the
 weight matrix between the host and the cards:
 
 | who | rows | how |
@@ -22,13 +22,13 @@ as the host's part is longer, which for a 27B model it is
 (`docs/results/2026-09-23-quantized-kernels.md`); for a 0.5B model it
 is not, and the split is slower than the CPU alone there.
 
-Shares: `PHI_GGML_FRACTION` (0.2) of every weight matrix's rows per
+Shares: `PHI_GGML_FRACTION` of every weight matrix's rows per
 card, its rows a multiple of 64 so the host's remainder keeps ggml's
 fast paths (measured 0.43 against 7.7 ms for an odd count), until a card
-has `PHI_GGML_CARD_BYTES` (3.4 GB) resident or refuses an upload, after
+has `PHI_GGML_CARD_BYTES` (4.4 GB) resident or refuses an upload, after
 which the card keeps nothing more of later tensors. At eight activation
 rows or more (a prompt) each card computes only `PHI_GGML_PP_SHARE`
-(0.5) of its slice and the host the rest of it as another range: the
+(0.75) of its slice and the host the rest of it as another range: the
 cards are slower per flop than the host is, and faster per weight byte,
 so the two cases want different shares. Only tensors ggml names
 `*.weight` are shared; anything else the host does whole.
