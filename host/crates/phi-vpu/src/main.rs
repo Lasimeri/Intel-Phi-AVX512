@@ -85,7 +85,16 @@ enum Cmd {
         /// Diagnostic: print what the kernels' instructions produce on the card.
         #[arg(long)]
         probe: bool,
-        /// Rows the card takes per chunk (0: its own default, 16).
+        /// Bytes added to the activation row stride (L1 set conflicts).
+        #[arg(long, default_value_t = 0)]
+        pad: u64,
+        /// The rate shape: rows of the weight matrix.
+        #[arg(long, default_value_t = 4096)]
+        m: u64,
+        /// The rate shape: weights per row.
+        #[arg(long, default_value_t = 5120)]
+        k: u64,
+        /// Rows the card takes per chunk (0: its own default, 32).
         #[arg(long, default_value_t = 0)]
         chunk: u64,
         /// Times each rate shape this often and reports the best (the
@@ -246,13 +255,16 @@ fn main() -> Result<()> {
             probe,
             repeat,
             chunk,
+            m,
+            k,
+            pad,
         } => {
             let w = Window::open(&window, phi_vpu::matmul::WINDOW_LEN as usize)?;
             wait_ready(&w, Duration::from_secs(5))?;
             if probe {
                 return phi_vpu::matmul::probe(&w, threads);
             }
-            phi_vpu::matmul::check(&w, threads, only.as_deref(), pattern, repeat, chunk)
+            phi_vpu::matmul::check(&w, threads, only.as_deref(), pattern, repeat, chunk, (m, k), pad)
         }
     }
 }

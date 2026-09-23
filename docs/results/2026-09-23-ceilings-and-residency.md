@@ -163,16 +163,68 @@ pp64 9.96, 0.75 gives 9.23, 1.0 gives 7.54. The host's Q4_K kernels work
 in int8 against the cards' float32, so per row of arithmetic the host is
 about twice the two cards together; half is the balance.
 
+## The eight activation rows were all in one L1 set
+
+At n 1 the real loop costs 384 ns per superblock against the kernel's
+277 in L1: close. At n 8 it costs 2.0 us against 518 ns: four times.
+Nothing about the weights explains it (a shape small enough to hold
+every thread's weights in cache is no faster), and the card's aggregate
+issue is within 8 percent of one thread's, so the cores are not
+interfering.
+
+The activation rows are. The kernels take them as memory operands, `k`
+floats apart: at k 5120 that is 20480 bytes, 5 x 4096, so the eight rows
+of a group land in the same 64 sets of a 64-set, 8-way, 32 KiB L1, and
+every vector position evicts the one before it. At k 512 the stride is
+2048 and the rows fall into two set groups, which is why the same total
+work was faster at k 512 than at k 5120 (171 against 128 GFLOP/s)
+despite eight times the rows.
+
+The fix is the stride, not the kernel: the host writes the activation
+rows into the card's window a quarter of a page further apart
+(`B_PAD` 256, which keeps the 64-byte alignment the operands need), and
+the card is told that stride. `matmul-check --pad` measured it:
+
+| Q4_K 4096 x 5120, bytes added to the stride | 0 | 64 | 128 | 256 | 512 | 1024 |
+| --- | --- | --- | --- | --- | --- | --- |
+| n 8 | 2.747 ms | 2.663 | 1.805 | **1.389** | 1.400 | 1.401 |
+| n 64 | 21.105 | 17.173 | 12.984 | **11.159** | 11.177 | 11.084 |
+
+n 1 does not move (one row cannot conflict with itself), and 256 bytes
+is where it settles: four sets between rows, so eight rows spread over
+32 of the 64 sets. Every quantized format about doubles at n 8 and n 64:
+
+| 4096 x 5120, 57 threads | n 1 | n 8 | n 64 |
+| --- | --- | --- | --- |
+| q4_K | 0.62 ms | 239 GFLOP/s | 240 GFLOP/s |
+| q5_K | 0.74 | 214 | 214 |
+| q6_K | 0.72 | 172 | 210 |
+| q8_0 | 0.53 | 233 | 239 |
+| iq4_xs | 0.64 | 228 | 185 |
+
+240 GFLOP/s is 30 percent of the card's 810 GFLOP/s issue ceiling, which
+is what a kernel spending 8 of every 15 instructions on fused
+multiply-adds can reach. The float kernels (`phi_dot4_*`, a different
+loop) did not move: f16 is still 33 GFLOP/s at n 64.
+
+With the cards twice as fast at prompt sizes, their share there was
+re-measured: `PHI_GGML_PP_SHARE` 0.5 gives pp64 10.40, **0.75 gives
+11.72**, 1.0 gives 11.58. 0.75 is the default now.
+
 ## Where this leaves the 27B
 
-| Qwen3.8-27B UD-Q4_K_XL | pp64 | tg16 |
-| --- | --- | --- |
-| host alone, 16 threads | 9.33 | 1.07 |
-| host and both cards, as of yesterday | 9.05 | 1.45 |
-| host and both cards, now | 9.96 | 1.52 |
+| Qwen3.8-27B UD-Q4_K_XL | pp64 | pp512 | tg16 |
+| --- | --- | --- | --- |
+| host alone, 16 threads | 9.33 | 9.24 | 1.07 |
+| host and both cards, as of yesterday | 9.05 | - | 1.45 |
+| host and both cards, now | 11.56 | 11.79 | 1.51 |
 
-The gain since yesterday is residency (20 to 25 percent per card), the
-row chunk, and the host window; generation is now within a few percent
-of what two 6 GB cards can do for a 17.6 GB model, because half of it
-has to live on the host. A model that fits on the cards is the shape
-where the kernels' instruction count, not residency, is what bounds it.
+Prompt processing is 24 to 28 percent above the host alone, where
+yesterday it was 3 percent below it: that is the activation stride and
+the share that followed from it. Generation is 41 percent above the host
+alone and will not move further on this model: the host is the long pole
+in every multiply, it is the long pole because it holds half the
+weights, and it holds half of them because two 6 GB cards cannot hold
+more of 17.6 GB. Faster kernels do not help a card that is already
+waiting. A model that fits on the cards is the shape where the kernels'
+instruction count, not residency, is what bounds it.

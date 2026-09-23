@@ -57,3 +57,13 @@ the 27B this is the binding constraint on generation: the host is the
 long pole in every multiply and the cards wait, so what they hold is
 what they contribute
 (`docs/results/2026-09-23-ceilings-and-residency.md`).
+
+The activation rows go into the window a quarter of a page further apart
+than the tensor's own rows (`B_PAD` 256 bytes, and the card is told that
+stride). The card's kernels take those rows as memory operands, and at
+k 5120 the tensor's stride is 5 x 4096: eight rows then take the same
+sets of a 64-set L1 and the eight-row kernels run at a quarter of their
+instruction count. This is worth about twice the card's prompt-size
+arithmetic (127 to 240 GFLOP/s at n 64) and nothing at n 1, where one
+row cannot conflict with itself. `PHI_GGML_PP_SHARE` followed it from
+0.5 to 0.75.

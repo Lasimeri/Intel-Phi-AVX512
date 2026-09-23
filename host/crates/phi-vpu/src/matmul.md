@@ -65,3 +65,7 @@ A multiply cannot beat either ceiling, and which one it is under says
 what to work on: at n 1 the quantized kernels are at 30 GB/s of the 76.9
 because they are issue bound (the instruction counts are in the results
 note), not because the weights are slow to fetch.
+
+`--pad N` adds N bytes to the activation row stride, which is how the
+L1 set conflict above was found and sized; the backend's own padding
+(`phi-ggml`, `B_PAD`) is 256.

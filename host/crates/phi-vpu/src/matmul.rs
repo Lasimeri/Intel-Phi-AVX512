@@ -169,6 +169,8 @@ static PATTERN: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new
 /// The rows per chunk the card is asked to use (0: its own default),
 /// carried in the descriptor as reserved[0].
 static CHUNK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Bytes added to the activation row stride (`--pad`).
+static PAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 struct Rng(u64);
 
@@ -359,7 +361,13 @@ fn as_bytes(v: &[f32]) -> &[u8] {
 #[allow(clippy::too_many_arguments)]
 fn check_one(w: &Window, threads: u32, t: u32, m: u64, k: u64, n: u64, id: u64, rng: &mut Rng, reps: u32) -> Result<Vec<Duration>> {
     let nb_a = row_bytes(t, k);
-    let nb_b = k * 4;
+    // The activation rows are memory operands of the kernels, so their
+    // stride decides which L1 sets they land in: at k 5120 the stride is
+    // 5 x 4096 and eight rows all take the same 64 sets of a 64-set,
+    // 8-way L1, which is what made the eight-row kernels four times their
+    // instruction count. `--pad` adds to the stride (64 bytes is one
+    // line, and keeps the 64-byte alignment the operands need).
+    let nb_b = k * 4 + PAD.load(Ordering::Relaxed);
     let mut a = Vec::with_capacity((m * nb_a) as usize);
     let mut rows = Vec::with_capacity(m as usize);
     for _ in 0..m {
@@ -369,7 +377,11 @@ fn check_one(w: &Window, threads: u32, t: u32, m: u64, k: u64, n: u64, id: u64, 
     }
     let b: Vec<f32> = (0..n * k).map(|_| rng.unit()).collect();
     w.put(OFF_A, &a);
-    w.put(OFF_B, as_bytes(&b));
+    // Row by row: the card's rows are nb_b apart, which is more than the
+    // k floats when the stride is padded.
+    for c in 0..n {
+        w.put(OFF_B + c * nb_b, as_bytes(&b[(c * k) as usize..((c + 1) * k) as usize]));
+    }
     let up = Matmul {
         a_id: id,
         a_off: OFF_A,
@@ -443,9 +455,20 @@ fn best_median(mut v: Vec<Duration>) -> (f64, f64) {
 
 /// Every type at small odd shapes and each activation-row count the
 /// kernels distinguish, then the weight rate at a model-sized shape.
-pub fn check(w: &Window, threads: u32, only: Option<&str>, pattern: Option<u8>, reps: u32, chunk: u64) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+pub fn check(
+    w: &Window,
+    threads: u32,
+    only: Option<&str>,
+    pattern: Option<u8>,
+    reps: u32,
+    chunk: u64,
+    shape: (u64, u64),
+    pad: u64,
+) -> Result<()> {
     PATTERN.store(pattern.map_or(-1, |p| p as i32), Ordering::Relaxed);
     CHUNK.store(chunk, Ordering::Relaxed);
+    PAD.store(pad, Ordering::Relaxed);
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     let all = [MM_F32, MM_F16, MM_Q4_K, MM_Q5_K, MM_Q6_K, MM_Q8_0, MM_IQ4_XS];
     let types: Vec<u32> = all.iter().copied().filter(|&t| only.is_none_or(|o| o == type_name(t))).collect();
@@ -465,9 +488,12 @@ pub fn check(w: &Window, threads: u32, only: Option<&str>, pattern: Option<u8>, 
         );
     }
     println!();
-    println!("weight rate, 4096 x 5120 rows on {threads} threads, best of {reps} (the card's compute time only):");
+    println!(
+        "weight rate, {} x {} rows on {threads} threads, best of {reps} (the card's compute time only):",
+        shape.0, shape.1
+    );
     for &t in &types {
-        let (m, k) = (4096u64, 5120u64);
+        let (m, k) = shape;
         let bytes = m * row_bytes(t, k);
         for &n in &[1u64, 8, 64] {
             let (s, med) = best_median(check_one(w, threads, t, m, k, n, id, &mut rng, reps)?);

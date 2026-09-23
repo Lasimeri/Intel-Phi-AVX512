@@ -115,7 +115,7 @@ pub extern "C" fn phi_ggml_open() -> i32 {
     let threads = env_or("PHI_GGML_THREADS", 57u32);
     let budget = env_or("PHI_GGML_CARD_BYTES", 4_400_000_000u64);
     let fraction = env_or("PHI_GGML_FRACTION", 0.2f64).clamp(0.0, 1.0);
-    let pp_share = env_or("PHI_GGML_PP_SHARE", 0.5f64).clamp(0.0, 1.0);
+    let pp_share = env_or("PHI_GGML_PP_SHARE", 0.75f64).clamp(0.0, 1.0);
     let verbose = std::env::var_os("PHI_GGML_VERBOSE").is_some();
     let want: Vec<usize> = match std::env::var("PHI_GGML_CARDS") {
         Ok(s) => s.split(',').filter_map(|x| x.trim().parse().ok()).collect(),
@@ -154,6 +154,16 @@ pub extern "C" fn phi_ggml_open() -> i32 {
     n
 }
 
+/// Bytes added to the activation row stride in the card's window. The
+/// rows are memory operands of the card's kernels, and its L1 has 64
+/// sets: at k 5120 the stride is 5 x 4096, so eight rows take the same
+/// sets and the eight-row kernels run at a quarter of their instruction
+/// count. A quarter of a page apart, they do not
+/// (`docs/results/2026-09-23-ceilings-and-residency.md`: 240 GFLOP/s
+/// against 127 at n 64). It keeps the 64-byte alignment the operands
+/// need.
+const B_PAD: u64 = 256;
+
 /// Can the cards take a multiply of this weight type and shape? (The
 /// host can take anything; a refusal here means the whole op stays on
 /// llama.cpp's own CPU backend.)
@@ -162,7 +172,7 @@ pub extern "C" fn phi_ggml_supports(a_type: u32, m: u64, k: u64, nb_a: u64, nb_b
     if !matmul::shape_ok(a_type, k, nb_a, nb_b) {
         return 0;
     }
-    if n * nb_b > B_MAX || n * m * 4 > D_MAX {
+    if n * (nb_b + B_PAD) > B_MAX || n * m * 4 > D_MAX {
         return 0;
     }
     1
@@ -334,7 +344,6 @@ pub unsafe extern "C" fn phi_ggml_begin(
     }
     let split = &ctx.splits[&key];
     let r0 = split.r0;
-    let b_bytes = (n * nb_b) as usize;
     // Prompt sizes: each card takes the first `pp_share` of its slice (its
     // resident rows start there), the host the rest of it as one more range.
     let share = if n >= 8 { ctx.pp_share } else { 1.0 };
@@ -353,8 +362,18 @@ pub unsafe extern "C" fn phi_ggml_begin(
     ranges.retain(|r| r.1 > r.0);
     for &(ci, lo, rows) in &work {
         let card = &mut ctx.cards[ci];
-        // SAFETY: b is n rows of nb_b bytes; the window area is B_MAX (checked by supports).
-        unsafe { std::ptr::copy_nonoverlapping(b, card.w.ptr(OFF_B, b_bytes), b_bytes) };
+        // Row by row, a quarter of a page further apart than the tensor's
+        // own rows: see B_PAD.
+        for c in 0..n {
+            // SAFETY: b is n rows of nb_b bytes; the window area is B_MAX (checked by supports).
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    b.add((c * nb_b) as usize),
+                    card.w.ptr(OFF_B + c * (nb_b + B_PAD), nb_b as usize),
+                    nb_b as usize,
+                )
+            };
+        }
         let mm = Matmul {
             a_id: card.ids[&key],
             a_off: 0,
@@ -365,7 +384,7 @@ pub unsafe extern "C" fn phi_ggml_begin(
             n,
             k,
             nb_a,
-            nb_b,
+            nb_b: nb_b + B_PAD,
             b_off: OFF_B,
             d_off: OFF_D,
             reserved: [0; 5],

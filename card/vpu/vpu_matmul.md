@@ -86,3 +86,9 @@ multiply-adds for its aggregate issue rate, and 1000 empty
 `vpu_pool_map` rounds for what a dispatch costs with nothing to do.
 `docs/results/2026-09-23-ceilings-and-residency.md` has the numbers and
 what they settle (one thread per core; the kernels are issue bound).
+
+The activation row stride (`nb_b`) is the caller's to choose, and it
+matters: the kernels take the rows as memory operands, so a stride that
+is a multiple of 4 KiB puts every row of a group in the same L1 sets.
+The host pads it (`phi-ggml`, `B_PAD` 256 bytes), which is twice the
+arithmetic at n 8 and above.
