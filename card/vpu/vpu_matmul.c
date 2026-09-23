@@ -45,11 +45,11 @@ void phi_dot4_f32(const void *a, const float *b, long k16, float *out, uint64_t 
  * passed in `x`: a mixture's columns are grouped by the expert they
  * chose, and their rows are wherever those tokens are, not a stride
  * apart (kernelgen/quant.md). */
-typedef void (*qkern)(const uint8_t *blk, const float *x, const float *const *rows, float *scratch, float *acc, const float *consts, uint64_t next);
+typedef void (*qkern)(const uint8_t *blk, const void *x, const void *const *rows, float *scratch, float *acc, const float *consts, uint64_t next);
+#define QKONE(name) void name(const uint8_t *, const void *, const void *const *, float *, float *, const float *, uint64_t);
 #define QK(fmt) \
-    void phi_##fmt##_1(const uint8_t *, const float *, const float *const *, float *, float *, const float *, uint64_t); \
-    void phi_##fmt##_4(const uint8_t *, const float *, const float *const *, float *, float *, const float *, uint64_t); \
-    void phi_##fmt##_8(const uint8_t *, const float *, const float *const *, float *, float *, const float *, uint64_t);
+    QKONE(phi_##fmt##_1) QKONE(phi_##fmt##_4) QKONE(phi_##fmt##_8) \
+    QKONE(phi_##fmt##_1h) QKONE(phi_##fmt##_4h) QKONE(phi_##fmt##_8h)
 QK(q4k) QK(q5k) QK(q6k) QK(q8_0) QK(iq4xs)
 void phi_probe(const uint8_t *blk, const float *x, const float *consts, float *out);
 void phi_bench(long kind, const void *buf, long count);
@@ -208,29 +208,38 @@ static void consts_init(void)
     put_u32(788, 32);
 }
 
+/* Two sets of kernels per format: one that reads float32 activations and
+ * one that reads float16 and up-converts them in the memory operand
+ * itself, which costs no instruction (kernelgen/quant.md). The host
+ * chooses (`b_type`), and float16 halves both what crosses the link and
+ * the activation bytes a core reads per call. */
 static const struct qfmt {
     unsigned block_bytes;       /* per 256 weights */
-    qkern k1, k4, k8;
+    qkern k[2][3];              /* [b_type][1, 4, 8 rows] */
 } g_fmt[VPU_MM_TYPES] = {
-    [VPU_MM_Q4_K] = { 144, phi_q4k_1, phi_q4k_4, phi_q4k_8 },
-    [VPU_MM_Q5_K] = { 176, phi_q5k_1, phi_q5k_4, phi_q5k_8 },
-    [VPU_MM_Q6_K] = { 210, phi_q6k_1, phi_q6k_4, phi_q6k_8 },
-    [VPU_MM_Q8_0] = { 272, phi_q8_0_1, phi_q8_0_4, phi_q8_0_8 },
-    [VPU_MM_IQ4_XS] = { 136, phi_iq4xs_1, phi_iq4xs_4, phi_iq4xs_8 },
+    [VPU_MM_Q4_K] = { 144, { { phi_q4k_1, phi_q4k_4, phi_q4k_8 }, { phi_q4k_1h, phi_q4k_4h, phi_q4k_8h } } },
+    [VPU_MM_Q5_K] = { 176, { { phi_q5k_1, phi_q5k_4, phi_q5k_8 }, { phi_q5k_1h, phi_q5k_4h, phi_q5k_8h } } },
+    [VPU_MM_Q6_K] = { 210, { { phi_q6k_1, phi_q6k_4, phi_q6k_8 }, { phi_q6k_1h, phi_q6k_4h, phi_q6k_8h } } },
+    [VPU_MM_Q8_0] = { 272, { { phi_q8_0_1, phi_q8_0_4, phi_q8_0_8 }, { phi_q8_0_1h, phi_q8_0_4h, phi_q8_0_8h } } },
+    [VPU_MM_IQ4_XS] = { 136, { { phi_iq4xs_1, phi_iq4xs_4, phi_iq4xs_8 }, { phi_iq4xs_1h, phi_iq4xs_4h, phi_iq4xs_8h } } },
 };
 
-static int quantized(uint32_t t) { return t < VPU_MM_TYPES && g_fmt[t].k1 != NULL; }
+static int quantized(uint32_t t) { return t < VPU_MM_TYPES && g_fmt[t].k[0][0] != NULL; }
 
 /* Q8_0 is the one format whose row may end with fewer than eight blocks
  * (k a multiple of 32, not 256): those blocks are done here. */
-static float q8_0_tail(const uint8_t *blk, const float *x, int nblocks)
+static float q8_0_tail(const uint8_t *blk, const void *x, int nblocks, uint32_t b_type)
 {
     float sum = 0.0f;
     for (int i = 0; i < nblocks; i++) {
         float d = half_at(blk + 34 * i);
         const int8_t *q = (const int8_t *)(blk + 34 * i + 2);
         float s = 0.0f;
-        for (int j = 0; j < 32; j++) s += (float)q[j] * x[32 * i + j];
+        for (int j = 0; j < 32; j++) {
+            int at = 32 * i + j;
+            float xv = b_type ? half_at((const uint8_t *)x + 2 * at) : ((const float *)x)[at];
+            s += (float)q[j] * xv;
+        }
         sum += d * s;
     }
     return sum;
@@ -255,7 +264,7 @@ static float q8_0_tail(const uint8_t *blk, const float *x, int nblocks)
 #define GROUP_MAX 8
 struct group {
     const unsigned char *a;
-    const float *x[GROUP_MAX];
+    const void *x[GROUP_MAX];      /* float32 or float16 rows, by b_type */
     uint32_t dst[GROUP_MAX];
     int n;                          /* 1, 4 or 8: the kernel variants */
 };
@@ -267,6 +276,8 @@ struct job {
     uint64_t m, n, k, nb_a, nb_b;
     uint32_t type;
     uint32_t chunk;
+    uint32_t b_type;               /* 0: float32 activations, 1: float16 */
+    uint32_t xblock;               /* bytes of one superblock of one activation row */
     /* The column groups, built once per request before the pool runs. */
     const struct group *groups;
     uint64_t ngroups;
@@ -355,7 +366,7 @@ static void rows_slice_q(void *arg, int slice, int nslices)
                 r0 = 0;
                 rstep = 1;
             }
-            qkern kern = T == 8 ? f->k8 : T == 4 ? f->k4 : f->k1;
+            qkern kern = f->k[j->b_type][T == 8 ? 2 : T == 4 ? 1 : 0];
             const uint8_t *base = (const uint8_t *)g->a + i * j->nb_a;
             uint64_t mine = 0;
             for (uint64_t r = r0; r < rows; r += rstep) mine++;
@@ -363,9 +374,9 @@ static void rows_slice_q(void *arg, int slice, int nslices)
             /* superblock outermost: its activation block and the accumulators
              * stay in L1 across the rows; the weights stream */
             for (uint64_t s = 0; s < ns; s++) {
-                const float *xs[GROUP_MAX];
+                const void *xs[GROUP_MAX];
                 float *a = acc[0];
-                for (int q = 0; q < T; q++) xs[q] = g->x[c0 + q] + s * 256;
+                for (int q = 0; q < T; q++) xs[q] = (const char *)g->x[c0 + q] + s * j->xblock;
                 for (uint64_t r = r0; r < rows; r += rstep, a += T * 16)
                     kern(base + r * j->nb_a + s * bb, xs[0], xs, scratch, a, cs, rstep * j->nb_a);
             }
@@ -374,7 +385,8 @@ static void rows_slice_q(void *arg, int slice, int nslices)
                 for (int q = 0; q < T; q++) {
                     float sum = sum16(a + q * 16);
                     if (tail)
-                        sum += q8_0_tail(base + r * j->nb_a + ns * bb, g->x[c0 + q] + ns * 256, (int)(tail / 32));
+                        sum += q8_0_tail(base + r * j->nb_a + ns * bb,
+                                         (const char *)g->x[c0 + q] + ns * j->xblock, (int)(tail / 32), j->b_type);
                     j->d[(uint64_t)g->dst[c0 + q] * j->m + i + r] = sum;
                 }
             }
@@ -392,7 +404,7 @@ static uint64_t groups_plain(struct group *gs, const struct job *j)
         gs[ng].a = j->a;
         gs[ng].n = T;
         for (int q = 0; q < T; q++) {
-            gs[ng].x[q] = (const float *)(j->b + (c + q) * j->nb_b);
+            gs[ng].x[q] = j->b + (c + q) * j->nb_b;
             gs[ng].dst[q] = (uint32_t)(c + q);
         }
         ng++;
@@ -403,10 +415,10 @@ static uint64_t groups_plain(struct group *gs, const struct job *j)
 
 /* Where column p's activation row is: its expert slot picks b's row
  * within the token, the token picks the block of rows. */
-static const float *mix_row(const struct job *j, uint64_t p)
+static const void *mix_row(const struct job *j, uint64_t p)
 {
     uint64_t t = p / j->n_used, col = p % j->n_used;
-    return (const float *)(j->b + ((col % j->b_rows) + t * j->b_rows) * j->nb_b);
+    return j->b + ((col % j->b_rows) + t * j->b_rows) * j->nb_b;
 }
 
 /* The column groups of a mixture: the columns that chose each expert,
@@ -532,7 +544,7 @@ static void kernel_slice(void *arg, int slice, int nslices)
     float acc[8][16] __attribute__((aligned(64)));
     float x[8 * 256] __attribute__((aligned(64)));
     unsigned char blk[256] __attribute__((aligned(64)));
-    const float *xs[GROUP_MAX];
+    const void *xs[GROUP_MAX];
     memset(acc, 0, sizeof acc);
     memset(x, 0, sizeof x);
     memset(blk, (unsigned char)(slice + 1), sizeof blk);
@@ -581,6 +593,10 @@ static size_t blocks(uint64_t bytes)
 /* What a MATMUL must satisfy for its type, beyond the window rules. */
 static int shape_ok(const struct vpu_matmul *mm)
 {
+    /* Only the quantized kernels have a float16-activation twin; the
+     * float dot products read float32 rows and say so rather than
+     * reading halves as floats. */
+    if (mm->b_type && !quantized(mm->a_type)) return 0;
     if (mm->a_type == VPU_MM_F32 || mm->a_type == VPU_MM_F16) return 1;
     if (!quantized(mm->a_type)) return 0;
     if (mm->k % 256 != 0 && !(mm->a_type == VPU_MM_Q8_0 && mm->k % 32 == 0)) return 0;
@@ -667,7 +683,7 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
         {
             float tab[TAB_FLOATS] __attribute__((aligned(64))), acc[8][16] __attribute__((aligned(64)));
             const float *x = g_b.m.p, *cs = (const float *)g_consts;
-            const float *xs[GROUP_MAX];
+            const void *xs[GROUP_MAX];
             for (int q = 0; q < GROUP_MAX; q++) xs[q] = x + q * 256;
             memset(acc, 0, sizeof acc);
             b0 = now_ns();
@@ -752,8 +768,9 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
 
     uint32_t chunk = (uint32_t)mm.chunk;
     if (chunk < 1 || chunk > ROW_CHUNK_MAX) chunk = ROW_CHUNK;
+    uint32_t b_type = mm.b_type ? 1 : 0;
     struct job j = { a, (const unsigned char *)g_b.m.p + mm.ids_bytes, g_d.m.p, mm.m, mm.n, mm.k,
-                     mm.nb_a, mm.nb_b, mm.a_type, chunk, NULL, 0, (const int32_t *)g_b.m.p,
+                     mm.nb_a, mm.nb_b, mm.a_type, chunk, b_type, b_type ? 512u : 1024u, NULL, 0, (const int32_t *)g_b.m.p,
                      mixture ? mm.n_used : 0, mixture ? mm.b_rows : 0, mixture ? mm.m * mm.nb_a : 0 };
     int max = vpu_pool_threads() + 1;
     if (max > POOL_SLOTS) max = POOL_SLOTS;

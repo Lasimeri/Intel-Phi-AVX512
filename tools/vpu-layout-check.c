@@ -75,6 +75,7 @@ int main(void)
 	check("matmul.a_off", offsetof(struct vpu_matmul, a_off), 8);
 	check("matmul.bytes", offsetof(struct vpu_matmul, bytes), 16);
 	check("matmul.a_type", offsetof(struct vpu_matmul, a_type), 24);
+	check("matmul.b_type", offsetof(struct vpu_matmul, b_type), 28);
 	check("matmul.m", offsetof(struct vpu_matmul, m), 32);
 	check("matmul.n", offsetof(struct vpu_matmul, n), 40);
 	check("matmul.k", offsetof(struct vpu_matmul, k), 48);

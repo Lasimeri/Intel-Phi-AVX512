@@ -46,3 +46,11 @@ and runs in the same three steps, with `host_rows_id` building the
 host's share as a leaf alias of the expert tensor (`alias3`, which keeps
 `ne[2]` and `nb[2]` so every expert's rows are where ggml expects them)
 and the ids passed through untouched.
+
+The open prints two lines: the thread count this private CPU backend
+runs the host's rows on (`PHI_GGML_HOST_THREADS`, 12), and a reminder to
+give the calling program the same, because everything that is not a
+matrix multiply runs on the program's own threads and those contend with
+the card daemons just as badly. At 16 of this machine's 16 hardware
+threads the 27B generates 0.29 tokens per second against 1.53 at 12
+(`../src/lib.md`).

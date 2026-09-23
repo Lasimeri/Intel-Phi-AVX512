@@ -171,6 +171,37 @@ static PATTERN: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new
 static CHUNK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Bytes added to the activation row stride (`--pad`).
 static PAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The activations the card is sent: 0 float32, 1 float16 (`--act`).
+static ACT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// One activation row as the card will read it, float32 or float16.
+fn act_bytes(v: &[f32]) -> Vec<u8> {
+    if ACT.load(Ordering::Relaxed) == 1 {
+        v.iter().flat_map(|&x| f32_to_f16(x).to_le_bytes()).collect()
+    } else {
+        as_bytes(v).to_vec()
+    }
+}
+
+/// The activations as the card will see them: float16 rounds them, so
+/// the host reference must use the rounded values or the tolerance is
+/// comparing against numbers the card never had.
+fn act_round(v: Vec<f32>) -> Vec<f32> {
+    if ACT.load(Ordering::Relaxed) == 1 {
+        v.into_iter().map(|x| f16_to_f32(f32_to_f16(x))).collect()
+    } else {
+        v
+    }
+}
+
+/// Bytes one activation row occupies for `k` values.
+fn act_row_bytes(k: u64) -> u64 {
+    if ACT.load(Ordering::Relaxed) == 1 {
+        k * 2
+    } else {
+        k * 4
+    }
+}
 
 struct Rng(u64);
 
@@ -367,7 +398,7 @@ fn check_one(w: &Window, threads: u32, t: u32, m: u64, k: u64, n: u64, id: u64, 
     // 8-way L1, which is what made the eight-row kernels four times their
     // instruction count. `--pad` adds to the stride (64 bytes is one
     // line, and keeps the 64-byte alignment the operands need).
-    let nb_b = k * 4 + PAD.load(Ordering::Relaxed);
+    let nb_b = act_row_bytes(k) + PAD.load(Ordering::Relaxed);
     let mut a = Vec::with_capacity((m * nb_a) as usize);
     let mut rows = Vec::with_capacity(m as usize);
     for _ in 0..m {
@@ -375,12 +406,12 @@ fn check_one(w: &Window, threads: u32, t: u32, m: u64, k: u64, n: u64, id: u64, 
         a.extend_from_slice(&bytes);
         rows.push(vals);
     }
-    let b: Vec<f32> = (0..n * k).map(|_| rng.unit()).collect();
+    let b: Vec<f32> = act_round((0..n * k).map(|_| rng.unit()).collect());
     w.put(OFF_A, &a);
     // Row by row: the card's rows are nb_b apart, which is more than the
     // k floats when the stride is padded.
     for c in 0..n {
-        w.put(OFF_B + c * nb_b, as_bytes(&b[(c * k) as usize..((c + 1) * k) as usize]));
+        w.put(OFF_B + c * nb_b, &act_bytes(&b[(c * k) as usize..((c + 1) * k) as usize]));
     }
     let up = Matmul {
         a_id: id,
@@ -394,7 +425,7 @@ fn check_one(w: &Window, threads: u32, t: u32, m: u64, k: u64, n: u64, id: u64, 
         a_off: 0,
         bytes: 0,
         a_type: t,
-        reserved0: 0,
+        b_type: ACT.load(Ordering::Relaxed),
         m,
         n,
         k,
@@ -471,7 +502,7 @@ fn check_id(
     rng: &mut Rng,
 ) -> Result<Duration> {
     let nb_a = row_bytes(t, k);
-    let nb_b = k * 4 + 256;
+    let nb_b = act_row_bytes(k) + 256;
     let n = n_used * n_tokens;
     // The experts, one after another, and the same rows as floats.
     let mut a = Vec::with_capacity((experts * m * nb_a) as usize);
@@ -482,7 +513,7 @@ fn check_id(
         rows.push(vals);
     }
     let ids: Vec<i32> = (0..n).map(|_| (rng.next() % experts) as i32).collect();
-    let b: Vec<f32> = (0..b_rows * n_tokens * k).map(|_| rng.unit()).collect();
+    let b: Vec<f32> = act_round((0..b_rows * n_tokens * k).map(|_| rng.unit()).collect());
     w.put(OFF_A, &a);
     let up = Matmul {
         a_id: id,
@@ -497,14 +528,17 @@ fn check_id(
     let id_bytes = unsafe { std::slice::from_raw_parts(ids.as_ptr() as *const u8, ids.len() * 4) };
     w.put(OFF_B, id_bytes);
     for c in 0..b_rows * n_tokens {
-        w.put(OFF_B + ids_bytes + c * nb_b, as_bytes(&b[(c * k) as usize..((c + 1) * k) as usize]));
+        w.put(
+            OFF_B + ids_bytes + c * nb_b,
+            &act_bytes(&b[(c * k) as usize..((c + 1) * k) as usize]),
+        );
     }
     let mm = Matmul {
         a_id: id,
         a_off: 0,
         bytes: 0,
         a_type: t,
-        reserved0: 0,
+        b_type: ACT.load(Ordering::Relaxed),
         m,
         n,
         k,
@@ -579,8 +613,10 @@ pub fn check(
     chunk: u64,
     shape: (u64, u64),
     pad: u64,
+    act: u32,
 ) -> Result<()> {
     PATTERN.store(pattern.map_or(-1, |p| p as i32), Ordering::Relaxed);
+    ACT.store(act, Ordering::Relaxed);
     CHUNK.store(chunk, Ordering::Relaxed);
     PAD.store(pad, Ordering::Relaxed);
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
@@ -591,6 +627,8 @@ pub fn check(
     }
     let mut id = 100;
     for &t in &types {
+        // Only the quantized kernels have a float16-activation twin.
+        ACT.store(if t == MM_F32 || t == MM_F16 { 0 } else { act }, Ordering::Relaxed);
         for &n in &[1u64, 4, 8, 13] {
             let k = if t == MM_Q8_0 && n == 13 { 544 } else { 512 };
             check_one(w, threads, t, 61, k, n, id, &mut rng, 1)?;
@@ -624,6 +662,7 @@ pub fn check(
         shape.0, shape.1
     );
     for &t in &types {
+        ACT.store(if t == MM_F32 || t == MM_F16 { 0 } else { act }, Ordering::Relaxed);
         let (m, k) = shape;
         let bytes = m * row_bytes(t, k);
         for &n in &[1u64, 8, 64] {
@@ -654,7 +693,7 @@ pub fn probe(w: &Window, threads: u32) -> Result<()> {
         a_off: OFF_A,
         bytes: 0,
         a_type: 99,
-        reserved0: 0,
+        b_type: ACT.load(Ordering::Relaxed),
         m: 1,
         n: 1,
         k: 1,

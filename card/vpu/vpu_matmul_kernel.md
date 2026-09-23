@@ -26,3 +26,9 @@ argument is the iteration count (0 means its default of a million) so
 the same kernel serves one thread and the whole pool at once. Its
 prologue uses a branch rather than a `cmov`, which Knights Corner does
 not have.
+
+Each quantized kernel appears twice: `phi_q4k_8` reads float32
+activation rows and `phi_q4k_8h` float16 ones, the same instructions
+with `{float16}` on the product's memory operand and a 32-byte row
+stride. 30 kernels in all, and the card picks the pair by the request's
+`b_type` (`vpu_matmul.md`).

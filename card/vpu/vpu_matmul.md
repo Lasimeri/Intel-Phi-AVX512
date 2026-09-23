@@ -153,3 +153,21 @@ from L2, and a second thread doubles that traffic. Shrinking the
 footprint does not help either: at one thread per core, chunks of 64,
 32, 16 and 8 give 206, 208, 197 and 161 GFLOP/s, because what matters is
 amortizing each 8 KiB block load over more rows, not fitting in L1.
+
+## Float16 activations
+
+`b_type` in the descriptor (0 float32, 1 float16) says which of two
+kernel tables the service uses: `struct qfmt` now holds `k[2][3]`, the
+float32 kernels and their `h` twins, indexed by the request's `b_type`
+and by the group's row count. A row's stride is then `k * 2` instead of
+`k * 4`, and `q8_0_tail`, which finishes the weights past the last whole
+superblock on the scalar unit, reads halves or floats by the same flag.
+
+The card refuses `b_type` for a float weight type (`shape_ok`), because
+only the generated quantized kernels have float16 twins; the float
+formats go through `phi_dot4_*`, which reads float32 rows. The host
+sends float32 for them (`host/crates/phi-ggml/src/lib.md`).
+
+Nothing about this costs the card anything: the up-conversion is a field
+of the memory operand, so the same 128 fused multiply-adds per eight-row
+call read half the bytes (`kernelgen/quant.md` has the rates).

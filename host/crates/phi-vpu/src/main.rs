@@ -85,6 +85,10 @@ enum Cmd {
         /// Diagnostic: print what the kernels' instructions produce on the card.
         #[arg(long)]
         probe: bool,
+        /// The activations the cards are sent: 0 float32, 1 float16,
+        /// which their memory operands up-convert for nothing.
+        #[arg(long, default_value_t = 0)]
+        act: u32,
         /// Bytes added to the activation row stride (L1 set conflicts).
         #[arg(long, default_value_t = 0)]
         pad: u64,
@@ -258,13 +262,14 @@ fn main() -> Result<()> {
             m,
             k,
             pad,
+            act,
         } => {
             let w = Window::open(&window, phi_vpu::matmul::WINDOW_LEN as usize)?;
             wait_ready(&w, Duration::from_secs(5))?;
             if probe {
                 return phi_vpu::matmul::probe(&w, threads);
             }
-            phi_vpu::matmul::check(&w, threads, only.as_deref(), pattern, repeat, chunk, (m, k), pad)
+            phi_vpu::matmul::check(&w, threads, only.as_deref(), pattern, repeat, chunk, (m, k), pad, act)
         }
     }
 }

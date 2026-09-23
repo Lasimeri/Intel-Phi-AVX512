@@ -49,6 +49,26 @@ pull, compute and push. The host side's thread count is the glue's
 host, and a host thread sharing their CPU stalls ggml's barrier for a
 timeslice (7 ms per multiply at 15 threads, measured 2026-09-23).
 
+**The program's own thread count has to come down too**, and by more
+than that number suggests. Everything a model does that is not a matrix
+multiply stays with the calling program's threads, and those contend
+with the card daemons the same way. On the 27B at one token
+(`llama-bench -n 8`, both cards, 2026-09-23):
+
+| threads given to llama.cpp | tokens per second |
+| --- | --- |
+| 12 | **1.53** |
+| 14 | 1.01 |
+| 16 | 0.29 |
+
+against 1.00 for the host alone at 16. Sixteen is a 5x loss, not a few
+percent, because every one of the 419 multiplies a token costs waits on
+a barrier that a descheduled thread holds. `scripts/phi-ggml.sh` does
+not set `-t` for the program it runs, so a benchmark or a server has to:
+give the cards' host 12 of this machine's 16 hardware threads. Any
+measurement that leaves it at the program's default is measuring
+oversubscription.
+
 Window layout per card: the tensor slice being uploaded at 128 MiB (up
 to 512 MiB), the activations at 640 MiB (up to 64 MiB), the result at
 704 MiB (up to 64 MiB), all above the seamless path's areas, so both can
@@ -132,3 +152,29 @@ than from a rule about shapes:
 
 Both are conservative: neither refuses anything a card could have won,
 and everything above them is still judged by measurement.
+
+## The activations cross as float16
+
+For a quantized weight type the rows of `b` are converted to float16
+before they are copied into a card's window (`to_f16`, F16C on this
+host, about one instruction per two elements; `have_f16c` checks the
+CPUID bit and the conversion falls back to float32 without it). The card
+reads them with `{float16}` on the memory operand, which costs it
+nothing (`card/vpu/vpu_matmul.md`), so the link carries half the bytes
+and the card's L2 holds half the activation block. The float weight
+types keep float32, because only the generated quantized kernels have
+float16 twins.
+
+`PHI_GGML_ACT=0` sends float32 instead, which is what the comparison in
+`docs/results/2026-09-23-float16-activations.md` needs. Interleaved on
+the 27B, two rounds each:
+
+| Qwen3.8-27B UD-Q4_K_XL | pp512 | tg32 |
+| --- | --- | --- |
+| host alone, 16 threads | 8.97 | 0.98 |
+| both cards, float32 activations | 12.05, 12.02 | 1.45, 1.47 |
+| both cards, float16 activations | **12.40, 12.35** | **1.61, 1.54** |
+
+The card's row stride is `k * 2 + B_PAD` rather than `nb_b + B_PAD`; the
+padding is unchanged and for the same reason (`B_PAD`, the L1 set
+conflict).

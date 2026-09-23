@@ -74,3 +74,12 @@ L1 set conflict above was found and sized; the backend's own padding
 the same rows, columns picking experts at random, with the activations
 shared between a token's columns and then one per column, against the
 host's own dot products. `matmul-check` runs it for every type.
+
+`--act 1` sends the activation rows as float16 (`act_bytes`,
+`act_row_bytes`, `act_round`), which is what the backend does by default
+for quantized weights. Both the conformance cases and the rate loop
+force float32 for the `f32` and `f16` weight types, because only the
+generated quantized kernels have float16 twins and the card rejects the
+combination. The reference the conformance compares against is the
+host's own dot product over the float32 rows the float16 ones were
+rounded from, so the tolerance covers the rounding and nothing else.

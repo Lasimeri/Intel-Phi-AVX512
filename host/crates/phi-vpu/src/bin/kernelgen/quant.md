@@ -91,3 +91,38 @@ the columns that chose the same expert, and those columns belong to
 whichever tokens chose it, so their rows are not a fixed distance apart
 (`card/vpu/vpu_matmul.md`). The prologue loads T - 1 pointers where it
 used to compute T - 1 addresses, which is the same instruction count.
+
+## The float16 twin of every kernel
+
+Every quantized kernel is emitted twice, once reading float32 activation
+rows and once float16 (`Act::F32` and `Act::F16`, names `phi_q4k_8` and
+`phi_q4k_8h`), so the generator writes 30 kernels where it wrote 15. The
+two differ in one field of one operand: the product's memory operand
+becomes `{float16}`, which the vector unit up-converts on the way in,
+and the distance between an activation row's vectors falls from 64 bytes
+to 32. Nothing else changes, and neither does the instruction count: a
+T = 8 call still issues 128 fused multiply-adds.
+
+What it buys is not arithmetic but bytes. The activations cross the link
+and then sit in the core's L2 while a chunk of rows is multiplied
+against them, so halving them halves both. Measured on the card alone
+(`matmul-check --pad 256 --repeat 4`, 4096 x 5120, 57 threads, the
+card's compute time only, GFLOP/s):
+
+| format | n 1 | n 8 | n 64 |
+| --- | --- | --- | --- |
+| Q4_K float32 / float16 | 75.1 / 76.7 | 240.1 / **277.9** | 239.8 / **286.2** |
+| Q5_K | 53.1 / 53.2 | 211.5 / **238.9** | 213.8 / **248.1** |
+| Q6_K | 54.4 / 55.8 | 197.2 / **231.6** | 207.8 / **242.2** |
+| Q8_0 | 72.2 / 70.7 | 234.5 / **262.7** | 239.2 / **279.9** |
+| IQ4_XS | 60.6 / 68.0 | 191.5 / **252.9** | 230.1 / **267.7** |
+
+At one activation row there is nothing to win: the row is a single
+vector per superblock and the kernel is against the weight bytes. From
+eight rows up it is 12 to 19 percent, which is the L2 traffic the
+smaller rows do not cause.
+
+The float weight formats have no twin, because their kernels are the
+`phi_dot4_*` family and not generated here; the card refuses a float16
+activation request for them rather than reading the rows wrongly
+(`card/vpu/vpu_matmul.md`).

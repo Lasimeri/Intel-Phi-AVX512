@@ -43,3 +43,9 @@ their offsets, as for the request and reply.
 `matmul.rs` has the window layout the service uses, the conformance
 check behind `phi-vpu matmul-check`, and what each field means in
 practice.
+
+`b_type` (the word after `a_type`) says how the activation rows are
+stored: 0 float32, 1 float16. The card's quantized kernels up-convert a
+float16 memory operand for nothing, so this halves what crosses the link
+and what sits in the card's L2; the float weight types have no such
+kernel and the card rejects the request rather than misreading the rows.

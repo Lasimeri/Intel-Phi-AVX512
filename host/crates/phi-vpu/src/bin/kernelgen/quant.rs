@@ -216,10 +216,45 @@ fn finish(a: &mut Asm, batch: &[(Zmm, i32)], minuend: bool) {
 /// `acc += w * x[i][16 v .. 16 v + 16]` for each activation row and each
 /// vector of the batch, ordered so the same accumulator is not written
 /// twice in a row.
-fn fmas(a: &mut Asm, t: usize, batch: &[(Zmm, i32)]) {
+/// The activations a kernel multiplies by: float32, or float16 that the
+/// memory operand itself up-converts. The second halves what crosses the
+/// link and halves the activation bytes the core reads per call, for the
+/// same instruction: the conversion is a field of the operand, not work
+/// (`knc-mvex/src/conv.md`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Act {
+    F32,
+    F16,
+}
+
+impl Act {
+    /// The suffix its kernels carry, and the bytes one vector of
+    /// activations occupies.
+    fn suffix(self) -> &'static str {
+        match self {
+            Act::F32 => "",
+            Act::F16 => "h",
+        }
+    }
+    fn stride(self) -> i32 {
+        match self {
+            Act::F32 => 64,
+            Act::F16 => 32,
+        }
+    }
+    fn src(self, row: Gpr, v: i32) -> Src {
+        let m = Mem::new(row, self.stride() * v);
+        match self {
+            Act::F32 => Src::Mem(m),
+            Act::F16 => Src::MemConv(m, Conv::F16),
+        }
+    }
+}
+
+fn fmas(a: &mut Asm, t: usize, batch: &[(Zmm, i32)], x: Act) {
     for &(w, v) in batch {
         for (i, &row) in ROWS.iter().enumerate().take(t) {
-            a.i(&vfmadd231ps(acc(t, i, v), w, Src::Mem(Mem::new(row, 64 * v)), K(0)));
+            a.i(&vfmadd231ps(acc(t, i, v), w, x.src(row, v), K(0)));
         }
     }
 }
@@ -390,8 +425,8 @@ fn prep_iq4xs(a: &mut Asm) {
 /// of bytes 32g..32g+32 are sub-block 2g, the high ones sub-block 2g+1
 /// (ggml-quants.c, dequantize_row_q4_K). The block is 144 bytes, so `qs`
 /// is 16-byte aligned when the row is. Two groups (eight vectors) per batch.
-fn q4k(a: &mut Asm, t: usize) {
-    let name = format!("phi_q4k_{t}");
+fn q4k(a: &mut Asm, t: usize, x: Act) {
+    let name = format!("phi_q4k_{t}{}", x.suffix());
     prologue(a, &name, t, "one Q4_K superblock", 144, prep_k4);
     for pair in 0..2 {
         let b = [Zmm(8), Zmm(9), Zmm(10), Zmm(11)];
@@ -412,7 +447,7 @@ fn q4k(a: &mut Asm, t: usize) {
             (h[3], 4 * g0 + 7),
         ];
         finish(a, &batch, true);
-        fmas(a, t, &batch);
+        fmas(a, t, &batch, x);
     }
     epilogue(a, &name, t);
 }
@@ -455,8 +490,8 @@ fn bits_of(a: &mut Asm, hs: &[(Zmm, u8)]) -> Vec<[Zmm; 8]> {
 /// nibbles take bit 2g of `qh`, its high nibbles bit 2g+1
 /// (dequantize_row_q5_K: `u1 = 1, u2 = 2`, both shifted by 2 per group).
 /// The block is 176 bytes: 16-byte aligned rows keep both arrays aligned.
-fn q5k(a: &mut Asm, t: usize) {
-    let name = format!("phi_q5k_{t}");
+fn q5k(a: &mut Asm, t: usize, x: Act) {
+    let name = format!("phi_q5k_{t}{}", x.suffix());
     prologue(a, &name, t, "one Q5_K superblock", 176, prep_k4);
     let (qh0, qh1) = (Zmm(12), Zmm(13));
     bytes_aligned(a, qh0, Mem::new(BLK, 16), Conv::U8);
@@ -494,7 +529,7 @@ fn q5k(a: &mut Asm, t: usize) {
             (h[3], 4 * g1 as i32 + 3),
         ];
         finish(a, &batch, true);
-        fmas(a, t, &batch);
+        fmas(a, t, &batch, x);
     }
     epilogue(a, &name, t);
 }
@@ -531,8 +566,8 @@ fn fields_of(a: &mut Asm, hs: &[(Zmm, u8)]) -> Vec<[Zmm; 4]> {
 /// field 1, 64..96 the high nibbles of ql[0..32) with field 2, 96..128 the
 /// high nibbles of ql[32..64) with field 3; the value is `q - 32`, which
 /// the caller folds into the minuend (`32 * d * scale`).
-fn q6k(a: &mut Asm, t: usize) {
-    let name = format!("phi_q6k_{t}");
+fn q6k(a: &mut Asm, t: usize, x: Act) {
+    let name = format!("phi_q6k_{t}{}", x.suffix());
     prologue(a, &name, t, "one Q6_K superblock", 210, prep_q6k);
     for h in 0..2i32 {
         let lq = [Zmm(8), Zmm(9), Zmm(10), Zmm(11)];
@@ -560,7 +595,7 @@ fn q6k(a: &mut Asm, t: usize) {
         add_high_bits(a, &pairs);
         let batch: Vec<(Zmm, i32)> = order.iter().map(|&(w, _, i)| (w, 8 * h + i)).collect();
         finish(a, &batch, true);
-        fmas(a, t, &batch);
+        fmas(a, t, &batch, x);
     }
     epilogue(a, &name, t);
 }
@@ -568,8 +603,8 @@ fn q6k(a: &mut Asm, t: usize) {
 /// Q8_0: eight blocks of 34 bytes (`d` then 32 signed bytes) make the 256
 /// weights; block i's bytes are at 34 i + 2, any alignment. No minuend.
 /// Four blocks (eight vectors) per batch.
-fn q8_0(a: &mut Asm, t: usize) {
-    let name = format!("phi_q8_0_{t}");
+fn q8_0(a: &mut Asm, t: usize, x: Act) {
+    let name = format!("phi_q8_0_{t}{}", x.suffix());
     prologue(a, &name, t, "eight Q8_0 blocks", 272, prep_q8_0);
     for half in 0..2i32 {
         let mut batch = Vec::new();
@@ -582,7 +617,7 @@ fn q8_0(a: &mut Asm, t: usize) {
             batch.push((w1, 2 * blk + 1));
         }
         finish(a, &batch, false);
-        fmas(a, t, &batch);
+        fmas(a, t, &batch, x);
     }
     epilogue(a, &name, t);
 }
@@ -594,8 +629,8 @@ fn q8_0(a: &mut Asm, t: usize) {
 /// are weights 32 ib..32 ib+16, the high ones the next sixteen
 /// (dequantize_row_iq4_xs). No minuend. Four sub-blocks (eight vectors)
 /// per batch.
-fn iq4xs(a: &mut Asm, t: usize) {
-    let name = format!("phi_iq4xs_{t}");
+fn iq4xs(a: &mut Asm, t: usize, x: Act) {
+    let name = format!("phi_iq4xs_{t}{}", x.suffix());
     prologue(a, &name, t, "one IQ4_XS superblock", 136, prep_iq4xs);
     for half in 0..2i32 {
         let b = [Zmm(8), Zmm(9), Zmm(10), Zmm(11)];
@@ -620,7 +655,7 @@ fn iq4xs(a: &mut Asm, t: usize) {
             batch.push((w[2 * i as usize + 1], 2 * ib + 1));
         }
         finish(a, &batch, false);
-        fmas(a, t, &batch);
+        fmas(a, t, &batch, x);
     }
     epilogue(a, &name, t);
 }
@@ -628,12 +663,14 @@ fn iq4xs(a: &mut Asm, t: usize) {
 pub fn kernels() -> String {
     let mut a = Asm(String::new());
     a.0.push_str(&format!("# quantized kernels: rcx = the superblock's table ({TAB_BYTES} bytes: scales {TAB_SC}, minuends {TAB_MN}), r9 = the constants ({C_BYTES} bytes: 16, 4, 2, 2^-1..2^-8, the IQ4_XS values at {C_LUT})\n"));
-    for t in [1, 4, 8] {
-        q4k(&mut a, t);
-        q5k(&mut a, t);
-        q6k(&mut a, t);
-        q8_0(&mut a, t);
-        iq4xs(&mut a, t);
+    for x in [Act::F32, Act::F16] {
+        for t in [1, 4, 8] {
+            q4k(&mut a, t, x);
+            q5k(&mut a, t, x);
+            q6k(&mut a, t, x);
+            q8_0(&mut a, t, x);
+            iq4xs(&mut a, t, x);
+        }
     }
     a.0
 }

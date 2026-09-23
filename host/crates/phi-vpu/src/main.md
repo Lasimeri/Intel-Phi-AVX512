@@ -80,6 +80,7 @@ eight experts (`K_MATMUL_ID`). The rate part times a model-sized shape.
 | `--repeat N` | time each rate shape N times and report the best (7): one timed request is not a measurement, since the first after an idle gap pays the pool's wake |
 | `--chunk N` | rows per chunk the card works in, so the loop shape is measured rather than argued |
 | `--pad N` | bytes added to the activation row stride, which is how the L1 set conflict was found |
+| `--act 0|1` | the activations the card is sent: float32, or float16, which its quantized kernels up-convert for nothing |
 | `--pattern B` | every quantized byte takes the value B: a wrong field mapping then shows as a fixed ratio |
 | `--probe` | print what each kernel instruction produces on the card, the rates one thread reaches, and the card's aggregate ceilings (read bandwidth, vector issue, the cost of one dispatch) |
 

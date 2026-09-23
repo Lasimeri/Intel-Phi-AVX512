@@ -84,6 +84,11 @@ struct Ctx {
     /// its resident rows (the host takes the rest): the cards are slower
     /// per flop than the host is, and faster per weight byte.
     pp_share: f64,
+    /// Send the activations as float16, which the quantized kernels'
+    /// memory operands up-convert for nothing (`PHI_GGML_ACT`, 1 by
+    /// default; 0 sends float32, which is what the comparison in
+    /// `docs/results/2026-09-23-float16-activations.md` needs).
+    half_act: bool,
     /// The host's row ranges of the multiply begun last: (from, to) pairs.
     host_ranges: Vec<(u64, u64)>,
     verbose: bool,
@@ -175,6 +180,7 @@ pub extern "C" fn phi_ggml_open() -> i32 {
         too_small: 0,
         judged: None,
         pp_share,
+        half_act: env_or("PHI_GGML_ACT", 1u32) != 0,
         host_ranges: Vec::new(),
         verbose,
         calls: 0,
@@ -193,6 +199,41 @@ pub extern "C" fn phi_ggml_open() -> i32 {
 /// against 127 at n 64). It keeps the 64-byte alignment the operands
 /// need.
 const B_PAD: u64 = 256;
+
+/// Write `n` floats as float16 into the card's window. The card's
+/// memory operands up-convert `{float16}` for no instruction
+/// (`kernelgen/quant.md`), so this halves what crosses the link and
+/// halves the activation bytes a core reads per call, which is worth 11
+/// percent at eight columns and 16 at sixty-four
+/// (`docs/results/2026-09-23-mixture-of-experts.md`). It is also more
+/// precision than ggml's own CPU kernels keep: they quantize the same
+/// activations to Q8_K for these multiplies.
+///
+/// # Safety
+/// `src` must be `n` readable floats and `dst` `n` writable halves.
+#[target_feature(enable = "f16c,avx")]
+unsafe fn to_f16(src: *const f32, dst: *mut u16, n: usize) {
+    use std::arch::x86_64::*;
+    let mut i = 0;
+    // SAFETY: the caller's contract; eight at a time, then the tail.
+    unsafe {
+        while i + 8 <= n {
+            let v = _mm256_loadu_ps(src.add(i));
+            _mm_storeu_si128(dst.add(i) as *mut __m128i, _mm256_cvtps_ph::<0>(v));
+            i += 8;
+        }
+        for j in i..n {
+            let one = _mm_set_ss(*src.add(j));
+            *dst.add(j) = _mm_extract_epi16::<0>(_mm_cvtps_ph::<0>(one)) as u16;
+        }
+    }
+}
+
+/// Whether this host can convert to float16 in hardware; without it the
+/// activations cross the link as float32, which is only slower.
+fn have_f16c() -> bool {
+    std::is_x86_feature_detected!("f16c") && std::is_x86_feature_detected!("avx")
+}
 
 /// Can the cards take a multiply of this weight type and shape? (The
 /// host can take anything; a refusal here means the whole op stays on
@@ -466,10 +507,12 @@ unsafe fn begin(a: *const u8, a_type: u32, m: u64, k: u64, nb_a: u64, keep: i32,
     // A mixture's activation area holds the ids and then its rows.
     let ids_bytes = if mixture { (n * 4 + 63) & !63 } else { 0 };
     let b_rows = if mixture { mix.b_rows * mix.n_tokens } else { n };
-    if keep == 0
-        || phi_ggml_supports(a_type, m, k, nb_a, nb_b, b_rows) == 0
-        || ids_bytes + b_rows * (nb_b + B_PAD) > B_MAX
-        || n * m * 4 > D_MAX
+    // The quantized kernels read the rows as float16, which the card's
+    // memory operands up-convert for nothing; the float ones have no
+    // such twin and take float32 (`to_f16`).
+    let half = ctx.half_act && a_type != MM_F32 && a_type != MM_F16 && have_f16c();
+    let card_nb_b = if half { k * 2 + B_PAD } else { nb_b + B_PAD };
+    if keep == 0 || phi_ggml_supports(a_type, m, k, nb_a, nb_b, b_rows) == 0 || ids_bytes + b_rows * card_nb_b > B_MAX || n * m * 4 > D_MAX
     {
         ctx.host_only += 1;
         ctx.host_ranges = vec![(0, m)];
@@ -565,20 +608,26 @@ unsafe fn begin(a: *const u8, a_type: u32, m: u64, k: u64, nb_a: u64, keep: i32,
             }
         }
         // Row by row, a quarter of a page further apart than the tensor's
-        // own rows: see B_PAD. A mixture's rows run token by token.
+        // own rows: see B_PAD. A mixture's rows run token by token, and
+        // the quantized kernels take the rows as float16 (`to_f16`).
         for c in 0..b_rows {
             let src = if mixture {
                 (c % mix.b_rows) * nb_b + (c / mix.b_rows) * mix.nb_b2
             } else {
                 c * nb_b
             };
+            let at = OFF_B + ids_bytes + c * card_nb_b;
             // SAFETY: b is b_rows rows of nb_b bytes at those strides; the area is B_MAX.
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    b.add(src as usize),
-                    card.w.ptr(OFF_B + ids_bytes + c * (nb_b + B_PAD), nb_b as usize),
-                    nb_b as usize,
-                )
+                if half {
+                    to_f16(
+                        b.add(src as usize) as *const f32,
+                        card.w.ptr(at, (k * 2) as usize) as *mut u16,
+                        k as usize,
+                    );
+                } else {
+                    std::ptr::copy_nonoverlapping(b.add(src as usize), card.w.ptr(at, nb_b as usize), nb_b as usize);
+                }
             };
         }
         let mm = Matmul {
@@ -586,12 +635,12 @@ unsafe fn begin(a: *const u8, a_type: u32, m: u64, k: u64, nb_a: u64, keep: i32,
             a_off: 0,
             bytes: 0,
             a_type,
-            reserved0: 0,
+            b_type: half as u32,
             m: rows,
             n,
             k,
             nb_a,
-            nb_b: nb_b + B_PAD,
+            nb_b: card_nb_b,
             b_off: OFF_B,
             d_off: OFF_D,
             chunk: 0,

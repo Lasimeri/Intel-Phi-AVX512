@@ -90,6 +90,8 @@ static int host_backend(void)
     ggml_backend_set_n_threads_t set = (ggml_backend_set_n_threads_t)p_reg_get_proc_address(p_dev_backend_reg(dev), "ggml_backend_set_n_threads");
     if (set) set(g_cpu, threads);
     fprintf(stderr, "ggml-phi: the host's rows run on ggml's CPU backend with %d threads\n", threads);
+    fprintf(stderr, "ggml-phi: give the calling program %d threads as well (its own -t): more of them"
+                    " contend with the card daemons and cost 5x at one token\n", threads);
     return 0;
 }
 

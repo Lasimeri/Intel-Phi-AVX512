@@ -34,7 +34,7 @@ struct vpu_matmul {
     uint64_t a_off;     /* window offset: UPLOAD the bytes; MATMUL (a_id 0) m rows of k elements, stride nb_a */
     uint64_t bytes;     /* UPLOAD: how many (the card reads whole 4 KiB blocks) */
     uint32_t a_type;    /* VPU_MM_*: the element type of a */
-    uint32_t reserved0;
+    uint32_t b_type;    /* the activations: 0 float32, 1 float16 (the operand up-converts) */
     uint64_t m, n, k;   /* a: m rows of k; b: n rows of k float32; d: n rows of m float32 */
     uint64_t nb_a;      /* row stride of a in bytes (32-byte aligned rows for float16) */
     uint64_t nb_b;      /* row stride of b in bytes */
