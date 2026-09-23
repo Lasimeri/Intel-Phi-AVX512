@@ -60,3 +60,8 @@ The cards' host windows (`~/.config/phi/cards`, the sibling stack's
 by default, and two of those on a 31 GiB host leave less page cache than
 a 17.6 GB model needs: the host then reads weights from the NVMe while
 it works (pp64 6.22 against 9.33). 2G each is the setting here.
+
+`PHI_GGML_MIN_BYTES` (4 MB) is the least a multiply must take off the
+host before a card is asked at all; below it a card cannot beat its own
+round trip, and asking anyway costs a measurement
+(`host/crates/phi-ggml/src/lib.md`).

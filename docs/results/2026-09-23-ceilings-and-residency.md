@@ -244,3 +244,21 @@ weights, and it holds half of them because two 6 GB cards cannot hold
 more of 17.6 GB. Faster kernels do not help a card that is already
 waiting. A model that fits on the cards is the shape where the kernels'
 instruction count, not residency, is what bounds it.
+
+## Addendum: the same model after the day's refinements
+
+Two rules added later (a multiply too small to be worth a card's round
+trip is never offered to one, and float weights are shared at generation
+but left whole at a batch: `2026-09-23-mixture-of-experts.md`) moved
+this model too, and the comparison was redone properly, with the model
+resident and the two configurations interleaved, because this host's
+own throughput drifts by as much as a quarter over tens of minutes:
+
+| Qwen3.8-27B UD-Q4_K_XL, interleaved, two rounds | pp512 | tg16 |
+| --- | --- | --- |
+| host alone, 12 threads | 8.98, 8.94 | 1.12, 1.13 |
+| host (12 threads) and both cards | 12.33, 12.25 | 1.64, 1.62 |
+| | **+37%** | **+45%** |
+
+Against the best the host does at any thread count (pp512 9.24 at 16
+threads) that is +33 percent, and generation is unchanged at +45.

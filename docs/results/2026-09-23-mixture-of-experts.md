@@ -65,28 +65,47 @@ are active per token and the extra threads cost more in ggml's barrier
 than they add. Against the wrong baseline the cards looked worth 15
 percent at generation. Against the right one they are worth 3 to 5.
 
-Every number below is `--mmap 0` (the model resident in this host's
-memory: with it mmapped, a 20.2 GiB model on a 31 GiB host with 4 GiB of
-card windows swings 40 percent run to run on what happens to be cached),
-three repeats, and the host column is the best the host alone does at
-any thread count:
+Every number below has the model resident (`--load-mode none`: mmapped,
+a 20.2 GiB model on a 31 GiB host with 4 GiB of card windows swings 40
+percent run to run on what happens to be cached), and the two
+configurations are **interleaved**, host and cards alternating in one
+sequence. That last part is not fussiness: this host drifts. The same
+resident host-alone measurement read 85.66, 87.41 and 66.69 tokens per
+second of pp512 within two hours, so a split measured now against a
+baseline measured an hour ago says nothing.
 
-| Qwen3.8-35B-A3B Q4_K_M | pp64 | pp512 | tg16 | tg32 |
-| --- | --- | --- | --- | --- |
-| host alone, best of 12 and 16 threads | 68.85 | 87.41 | 7.91 | 7.99 |
-| host (12 threads) and both cards | 67.25 | 77.57 | 8.13 | 8.39 |
-| | parity | -11% | +2.8% | +5% |
+Interleaved, two rounds each, after the refinements below:
+
+| Qwen3.8-35B-A3B Q4_K_M | pp512 | tg32 |
+| --- | --- | --- |
+| host alone, 12 threads | 86.21, 85.99 | 8.19, 8.33 |
+| host (12 threads) and both cards | 88.89, 89.62 | 8.68, 8.58 |
+| | **+3.7%** | **+4.5%** |
+
+The cards win both metrics in both rounds. The first version of this
+lost 11 percent at pp512; two refinements to *when* a card is asked,
+neither of them about the card's speed, account for the difference:
+
+- A multiply whose weights would take less than `PHI_GGML_MIN_BYTES`
+  (4 MB) off the host is never offered to a card. A round trip is 0.45
+  ms and the host reads weights far faster than 10 GB/s, so there is
+  nothing to win, and asking costs the two calls the judgement needs to
+  learn it.
+- Float weights are shared at generation and left whole at a batch. At
+  one token the card's float path is its best case (52.5 GB/s of
+  weights, nothing to decode); at n 64 it is 34 GFLOP/s against 240 for
+  the quantized kernels, because `phi_dot4_*` was never restructured the
+  way they were.
 
 The cards keep 20 percent of every weight matrix's rows (4.4 GB each of
 the 21.7 GB file) and the text is identical to the host's own, token for
-token, at temperature 0. But the gain is small, and prompt processing
-loses: on this model the cards take only the ordinary multiplies (the
-attention projections and the 248320-row output matrix), because the
-mixture multiplies are the ones they cannot yet do well, and those are
-most of the work. The same split on the dense 27B is worth 36 percent at
-generation against its own best baseline (1.51 against 1.11 at 12
-threads), which is what this machinery does when the cards can take
-every multiply.
+token, at temperature 0. The gain is still modest, and for the reason
+below: on this model the cards take the ordinary multiplies (the
+attention projections and the 248320-row output matrix) while the
+mixture multiplies, which are most of the work, stay with the host. The
+same split on the dense 27B is worth about 37 percent at prompt
+processing and 46 at generation, interleaved the same way, which is what
+this machinery does when the cards can take every multiply.
 
 Two other things the fair baseline showed, both worth keeping:
 

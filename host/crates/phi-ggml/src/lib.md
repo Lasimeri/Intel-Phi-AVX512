@@ -23,8 +23,11 @@ work), and `phi_ggml_end` (wait for each card's reply, copy its rows
 into the result with the result's row stride). The card's per-call floor
 (two DMA round trips, about 0.5 ms) hides under the host's part as long
 as the host's part is longer, which for a 27B model it is
-(`docs/results/2026-09-23-quantized-kernels.md`); for a 0.5B model it
-is not, and the split is slower than the CPU alone there.
+(`docs/results/2026-09-23-quantized-kernels.md`); for a 0.5B model it is
+not, and the backend now keeps out of the way there rather than being
+slower than the CPU alone ("Two things decided before any measurement"
+below: 798 tokens per second of prompt processing against the CPU's
+768, where the first version of this managed 11.3 against 19.4).
 
 Shares: `PHI_GGML_FRACTION` of every weight matrix's rows per
 card, its rows a multiple of 64 so the host's remainder keeps ggml's
@@ -102,3 +105,30 @@ faster on 12 host threads than on 16 (7.91 against 6.39 tokens per
 second on the 35B-A3B), so a split measured at 12 against a host at 16
 flatters itself by 24 percent. `--mmap 0` matters too, on a host whose
 memory the model and the card windows together fill.
+
+## Two things decided before any measurement
+
+The judgement above costs one or two bad multiplies per tensor to
+learn, which is nothing on a model whose tensors are visited thousands
+of times and the whole cost on a model visited three times. Two cases
+are settled without it, both from measurements already in hand rather
+than from a rule about shapes:
+
+- **`PHI_GGML_MIN_BYTES` (4 MB).** The weights a multiply would take off
+  the host, its rows once or once per column for a mixture. Below this
+  there is nothing for a card to win: a round trip is 0.45 ms and the
+  host reads weights far faster than 10 GB/s. Measured on the 27B, this
+  is worth 2 to 4 percent by itself, because the marginal small
+  multiplies it keeps at home were ones the judgement would have taken
+  two calls to refuse.
+- **Float weights at a batch.** At one token the card's float path is
+  its best case (52.5 GB/s of weights against 21 for Q4_K: nothing is
+  decoded), but at n 64 it reaches 34 GFLOP/s against 240 for the
+  quantized kernels, because `phi_dot4_*` was never restructured the way
+  they were. So float weights are shared at generation and left whole at
+  prompt sizes. On a 0.5B float16 model this is the difference between
+  768 and 798 tokens per second of prompt processing, against 460 with a
+  variance of 330 while the judgement learned it one run at a time.
+
+Both are conservative: neither refuses anything a card could have won,
+and everything above them is still judged by measurement.

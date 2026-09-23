@@ -69,8 +69,14 @@ struct Ctx {
     cards: Vec<Card>,
     splits: HashMap<usize, Split>,
     fraction: f64,
-    /// Multiplies left with the host because the cards did not pay for
-    /// themselves on that tensor at that batch size.
+    /// The weights a multiply must take off the host before a card is
+    /// worth its round trip: 0.45 ms at a host rate no worse than 10
+    /// GB/s is 4.5 MB, and this is the conservative end of that, so
+    /// nothing that could have helped is refused by it
+    /// (`PHI_GGML_MIN_BYTES`).
+    min_bytes: u64,
+    /// Multiplies left with the host: too small by that measure, or
+    /// found not to pay for themselves on that tensor at that batch size.
     too_small: u64,
     /// The tensor and batch class of the multiply in flight.
     judged: Option<Judged>,
@@ -165,6 +171,7 @@ pub extern "C" fn phi_ggml_open() -> i32 {
         cards,
         splits: HashMap::new(),
         fraction,
+        min_bytes: env_or("PHI_GGML_MIN_BYTES", 4_000_000u64),
         too_small: 0,
         judged: None,
         pp_share,
@@ -489,6 +496,19 @@ unsafe fn begin(a: *const u8, a_type: u32, m: u64, k: u64, nb_a: u64, keep: i32,
     // worth a card's latency at a batch is often not worth it at one
     // token (`Split::avoid`).
     let class = if (if mixture { mix.n_tokens } else { n }) >= 8 { 1 } else { 0 };
+    // Float weights at a batch are the card's worst case and the host's
+    // ordinary one. At one token the card's float path is its best
+    // (52.5 GB/s of weights against 21 for Q4_K, since nothing is
+    // decoded), but at n 64 it reaches 34 GFLOP/s against 240 for the
+    // quantized kernels: `phi_dot4_*` was never restructured the way
+    // they were. A model whose weights are float is therefore shared at
+    // generation and left whole at prompt sizes, without waiting to
+    // learn it on a model that may be visited only a few times.
+    if class == 1 && (a_type == MM_F16 || a_type == MM_F32) {
+        ctx.too_small += 1;
+        ctx.host_ranges = vec![(0, m)];
+        return 1;
+    }
     if ctx.splits[&key].avoid[class] {
         ctx.too_small += 1;
         ctx.host_ranges = vec![(0, m)];
@@ -515,7 +535,16 @@ unsafe fn begin(a: *const u8, a_type: u32, m: u64, k: u64, nb_a: u64, keep: i32,
     }
     ranges.retain(|r| r.1 > r.0);
     let on_cards: u64 = work.iter().map(|&(_, _, rows)| rows).sum();
-    if on_cards == 0 {
+    // The weights the cards would take off the host: their rows once, or
+    // once per column for a mixture. Below `min_bytes` no card can pay
+    // for itself and there is nothing to learn: the most it can save is
+    // those bytes at the host's own rate, and the host reads weights far
+    // faster than 10 GB/s, so anything under a few megabytes is finished
+    // before a card's round trip (0.45 ms) has even returned. Judging
+    // that by measurement instead would cost two bad multiplies per
+    // tensor, which on a small model is the whole of it.
+    let cols = if mixture { n } else { 1 };
+    if on_cards == 0 || on_cards * nb_a * cols < ctx.min_bytes {
         ctx.too_small += 1;
         ctx.host_ranges = vec![(0, m)];
         return 1;
