@@ -3,5 +3,6 @@
 //! The `phi-vpu` binary drives the explicit path; `libphi512` uses the
 //! same two modules for the seamless one. See lib.md.
 pub mod cards;
+pub mod matmul;
 pub mod proto;
 pub mod window;

@@ -344,6 +344,12 @@ pub const K_FREE: u32 = 5;
 pub const OFF_MATMUL: usize = 13312;
 pub const MM_F32: u32 = 0;
 pub const MM_F16: u32 = 1;
+/// llama.cpp quantized formats (`VPU_MM_*`, vpu_matmul.h): 256-weight superblocks.
+pub const MM_Q4_K: u32 = 2;
+pub const MM_Q5_K: u32 = 3;
+pub const MM_Q6_K: u32 = 4;
+pub const MM_Q8_0: u32 = 5;
+pub const MM_IQ4_XS: u32 = 6;
 
 /// `struct vpu_matmul`: one upload, multiply or free.
 #[repr(C)]

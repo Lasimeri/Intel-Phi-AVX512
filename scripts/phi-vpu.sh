@@ -92,7 +92,8 @@ case "$cmd" in
                 wait
                 knc-cc -static -o "$work/phi-vpu-worker" "$work/vpu_worker.o" "$work/vpu_exec.o" "$work/avx512_poly.o" "$work/vpu_matmul.o" "$work/vpu_matmul_kernel.o" -lpthread
             ) 2>"$work/build.log"; then
-                scp_ "$work/phi-vpu-worker" "root@127.0.0.1:$dir/phi-vpu-worker"
+                scp_ "$work/phi-vpu-worker" "root@127.0.0.1:$dir/phi-vpu-worker.new"
+                ssh_ "mv -f '$dir/phi-vpu-worker.new' '$dir/phi-vpu-worker'"
                 echo "built on the host ($(nproc) cores), pushed to card $PHI_CARD"
                 built=host
             else
@@ -113,7 +114,8 @@ case "$cmd" in
                 scp -O -q -P "$PHI_PORT_OTHER" -o IdentitiesOnly=yes -i "$HOME/.ssh/phi_ed25519" \
                     -o UserKnownHostsFile="$HOME/.ssh/known_hosts_phi" -o HostKeyAlias=phi -o StrictHostKeyChecking=accept-new \
                     "root@127.0.0.1:$dir/phi-vpu-worker" "$work/phi-vpu-worker"
-                scp_ "$work/phi-vpu-worker" "root@127.0.0.1:$dir/phi-vpu-worker"
+                scp_ "$work/phi-vpu-worker" "root@127.0.0.1:$dir/phi-vpu-worker.new"
+                ssh_ "mv -f '$dir/phi-vpu-worker.new' '$dir/phi-vpu-worker'"
                 rm -rf "$work"
                 echo "built on card $other, pushed to card $PHI_CARD"
                 built=card$other
@@ -132,6 +134,7 @@ case "$cmd" in
         ssh_ "mkdir -p '$d'"
         scp_ "$root/card/vpu/vpu_proto.h" "$root/card/vpu/vpu_exec.h" "$root/card/vpu/vpu_exec_regs.h" \
             "$root/card/vpu/vpu_worker.c" "$root/card/vpu/vpu_exec.c" "$root/card/vpu/build.sh" \
+            "$root/card/vpu/vpu_matmul.h" "$root/card/vpu/vpu_matmul.c" "$root/card/vpu/vpu_matmul_kernel.S" \
             "$root/card/examples/avx512_poly.S" "root@127.0.0.1:$d/"
         ssh_ "cd '$d' && PATH=/opt/phi/bin:\$PATH sh build.sh"
         ;;

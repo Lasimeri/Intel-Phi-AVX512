@@ -9,6 +9,7 @@
 //! ```text
 //! phi-vpu status                      is a worker polling?
 //! phi-vpu poly --n 1048576 --threads 57 --repeat 5
+//! phi-vpu matmul-check              every weight format against the host, and rates
 //! ```
 //!
 //! `poly` checks every returned lane against this host's own fused
@@ -68,6 +69,22 @@ enum Cmd {
         /// Submit the same request this many times and report each.
         #[arg(long, default_value_t = 1)]
         repeat: u32,
+    },
+    /// Check the matrix-multiply service: every weight format against a
+    /// host reference, then the weight rate at a model-sized shape.
+    MatmulCheck {
+        /// Card threads (1 to 57).
+        #[arg(long, default_value_t = 57)]
+        threads: u32,
+        /// One type only (f32, f16, q4_K, q5_K, q6_K, q8_0, iq4_xs).
+        #[arg(long)]
+        only: Option<String>,
+        /// Diagnostic: every quant byte takes this value instead of random.
+        #[arg(long)]
+        pattern: Option<u8>,
+        /// Diagnostic: print what the kernels' instructions produce on the card.
+        #[arg(long)]
+        probe: bool,
     },
 }
 
@@ -213,6 +230,19 @@ fn main() -> Result<()> {
             let len = round_up(OFF_DATA + 2 * round_up(n * 4) + BLOCK + ((DEG + 1) * LANES * 4) as u64) + BLOCK;
             let w = Window::open(&window, len as usize)?;
             poly(&w, n, threads, repeat)
+        }
+        Cmd::MatmulCheck {
+            threads,
+            only,
+            pattern,
+            probe,
+        } => {
+            let w = Window::open(&window, phi_vpu::matmul::WINDOW_LEN as usize)?;
+            wait_ready(&w, Duration::from_secs(5))?;
+            if probe {
+                return phi_vpu::matmul::probe(&w, threads);
+            }
+            phi_vpu::matmul::check(&w, threads, only.as_deref(), pattern)
         }
     }
 }

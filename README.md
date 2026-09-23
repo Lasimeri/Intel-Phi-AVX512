@@ -69,24 +69,42 @@ The explicit path is still there for a program written for the card:
 The software emulator that preceded the card path stays as the fallback
 behind `--emulate`.
 
-## The card as a GPU for AVX-512: the ggml backend
+## The cards as GPUs for AVX-512, beside the CPU: the ggml backend
 
 The instruction-level path above is exact but pays a fixed cost per
 region, and a program like llama.cpp has millions of tiny regions per
-token (`docs/results/2026-09-22-full-avx512.md`). For it the card is
-used the way a GPU is: whole operators at a time. `host/crates/phi-ggml`
+token (`docs/results/2026-09-22-full-avx512.md`). For it the cards are
+used the way GPUs are: whole operators at a time. `host/crates/phi-ggml`
 builds `libggml_phi.so`, a ggml backend that an unmodified llama.cpp
 loads through `GGML_BACKEND_PATH`; its scheduler hands the backend
-every matrix multiply it accepts, the model's weights are uploaded to
-the card once and stay resident, the activations cross the window per
-multiply, and each multiply runs across the card's 57 threads with
-16-lane fused multiply-add kernels (`card/vpu/vpu_matmul.md`). The
-program itself is an ordinary build for this host.
+every matrix multiply it accepts (float16, float32 and llama.cpp's
+Q4_K, Q5_K, Q6_K, Q8_0 and IQ4_XS weights), and the backend shares each
+one by rows: every card keeps a share of the weight matrix resident and
+multiplies it on its 57 threads with the kernels of
+`card/vpu/vpu_matmul_kernel.S` (the quantized formats decoded on the
+vector unit, `host/crates/phi-vpu/src/bin/kernelgen/quant.md`), while
+the host computes the rest with ggml's own CPU kernels; the results are
+gathered per multiply. The program itself is an ordinary build for this
+host.
 
 ```
-scripts/phi-ggml.sh ./llama-completion -m model.gguf -p "..."     # the multiplies on the card
-scripts/phi-ggml.sh --verbose ...                                  # each multiply and its times
+scripts/phi-ggml.sh ./llama-cli -m model.gguf -p "..." -t 12   # the host and every card that is up
+scripts/phi-ggml.sh --verbose ...                              # each multiply, the host part and each card's times
 ```
+
+Qwen3.8-27B (UD-Q4_K_XL, 17.6 GB) on the 5800X alone and with both
+cards, each keeping a fifth of every weight matrix, llama-bench,
+2026-09-23 (`docs/results/2026-09-23-quantized-kernels.md`):
+
+| | pp64 tok/s | tg16 tok/s |
+| --- | --- | --- |
+| host alone, 16 threads | 9.34 | 1.07 |
+| host (12 threads) and both cards | 9.05 | 1.45 |
+
+Token generation is bound by weight bandwidth, and the cards add
+theirs to the host's; the per-multiply floor of the cards hides under
+the host's part of the work, which is why a 0.5B model gains nothing
+from the split while a 27B does.
 
 ## Layout
 

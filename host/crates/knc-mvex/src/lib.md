@@ -36,6 +36,7 @@ Instructions covered:
 | float64 | `vaddpd`, `vsubpd`, `vmulpd`, `vfmadd213pd`, `vfmadd231pd`, `vcmppd` (its write mask acts as an AND on the result: a clear mask bit clears the result bit, table 6.3 and the note under it) |
 | int32 | `vpaddd`, `vpsubd`, `vpandd`, `vpandnd` (note the order: `(!zmm2) & src`), `vpord`, `vpxord`, `vpslld`, `vpsrld`, `vpsrad`, `vpsllvd`, `vpsrlvd` |
 | mask | `kmov` in all three directions, `kortest` |
+| conversions and more (`conv.rs`, `conv.md`) | memory operands through the up-conversions and broadcasts (`Src::MemConv`), the int32 and float32 unpack pairs with conversions, `vcvtfxpntdq2ps`, `vcvtfxpntps2dq`, `vrndfxpntps`, `vfnmadd231ps`, `vfmsub213ps`, `vfmsub231ps`, `vpermd`, `vprefetch0/1` |
 
 Every integer vector instruction on this machine operates on 32-bit or
 64-bit lanes; there are no byte or word forms in the ISA at all, so the

@@ -19,12 +19,20 @@
 
 #define VPU_MM_F32 0
 #define VPU_MM_F16 1
+/* llama.cpp quantized formats (ggml-common.h), 256-weight superblocks; the kernels are phi_<fmt>_<rows> of vpu_matmul_kernel.S */
+#define VPU_MM_Q4_K 2
+#define VPU_MM_Q5_K 3
+#define VPU_MM_Q6_K 4
+#define VPU_MM_Q8_0 5
+#define VPU_MM_IQ4_XS 6
+#define VPU_MM_TYPES 7
+#define VPU_MM_PROBE 99   /* diagnostic: phi_probe writes 8 vectors to d (kernelgen/quant.md) */
 
 struct vpu_matmul {
     uint64_t a_id;      /* UPLOAD: the id (nonzero); MATMUL: the cached tensor, or 0 for a in the window at a_off */
     uint64_t a_off;     /* window offset: UPLOAD the bytes; MATMUL (a_id 0) m rows of k elements, stride nb_a */
     uint64_t bytes;     /* UPLOAD: how many (the card reads whole 4 KiB blocks) */
-    uint32_t a_type;    /* VPU_MM_F32 or VPU_MM_F16: the element type of a */
+    uint32_t a_type;    /* VPU_MM_*: the element type of a */
     uint32_t reserved0;
     uint64_t m, n, k;   /* a: m rows of k; b: n rows of k float32; d: n rows of m float32 */
     uint64_t nb_a;      /* row stride of a in bytes (32-byte aligned rows for float16) */

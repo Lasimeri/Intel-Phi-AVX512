@@ -1,49 +1,68 @@
-//! `libggml_phi.so`: a ggml backend that runs a program's matrix
-//! multiplies on the card. llama.cpp loads it unmodified through
-//! `GGML_BACKEND_PATH`; its scheduler then hands every `MUL_MAT` the
-//! backend accepts (`csrc/ggml-phi.c`, `supports_op`) to this library,
-//! which keeps the model's weight tensors resident on the card (uploaded
-//! once, by identity), ships the activations through the host-memory
-//! window, and reads the result back. On the card each multiply runs
-//! across the pool's 57 threads with the kernels of
-//! `card/vpu/vpu_matmul_kernel.S`. This is the card as a GPU for
-//! AVX-512: one operator per request, not one region per instruction
-//! (`docs/results/2026-09-22-full-avx512.md` works out why the
-//! instruction-level path cannot serve llama.cpp).
+//! `libggml_phi.so`: a ggml backend that shares a program's matrix
+//! multiplies between this host and the cards. llama.cpp loads it
+//! unmodified through `GGML_BACKEND_PATH`; its scheduler hands the
+//! backend every `MUL_MAT` it accepts (`csrc/ggml-phi.c`, `supports_op`),
+//! and each one is split by rows of the weight matrix: the host keeps the
+//! first rows and computes them with ggml's own CPU kernels (the C glue,
+//! on a private CPU backend), each card keeps a share of the rows resident
+//! in its memory (uploaded once, by identity) and computes them with the
+//! kernels of `card/vpu/vpu_matmul_kernel.S` while the host works, then
+//! the results are gathered. This is the card as a GPU for AVX-512 that
+//! pulls weight bandwidth and arithmetic beside the CPU instead of after
+//! it (`docs/results/2026-09-23-quantized-kernels.md` has the rates that
+//! set the shares). See lib.md.
 //!
 //! The C side is only the glue ggml's C interface requires; everything
-//! that talks to the card is here. See lib.md.
+//! that talks to the cards is here.
 
 use std::collections::HashMap;
 use std::sync::atomic::{fence, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use phi_vpu::matmul::{self, A_MAX, B_MAX, D_MAX, OFF_A, OFF_B, OFF_D, WINDOW_LEN};
 use phi_vpu::proto::*;
 use phi_vpu::window::{wait_ready, Window};
 
-/// Window layout for this service, above the seamless path's areas
-/// (which end at 42 MiB): the tensor being uploaded or streamed, the
-/// activations, the result.
-const OFF_A: u64 = 128 << 20;
-const A_MAX: u64 = 512 << 20;
-const OFF_B: u64 = 640 << 20;
-const B_MAX: u64 = 64 << 20;
-const OFF_D: u64 = 704 << 20;
-const D_MAX: u64 = 64 << 20;
-
-struct Ctx {
+/// One card: its window, what it keeps, and the multiply in flight.
+struct Card {
     w: Window,
     index: usize,
-    /// Tensors resident on the card, by (address, bytes).
-    ids: HashMap<(usize, u64), u64>,
-    next_id: u64,
     threads: u32,
-    verbose: bool,
-    /// Bytes uploaded, multiplies run, and the time in them.
+    /// Resident row slices, by the weight tensor's address: the id.
+    ids: HashMap<usize, u64>,
+    next_id: u64,
     uploaded: u64,
-    calls: u64,
+    budget: u64,
+    /// No more uploads: the budget is spent or the card refused one.
+    full: bool,
+    /// The request in flight: its sequence number, the first row and the
+    /// number of rows it computes, n.
+    pending: Option<(u64, u64, u64, u64)>,
     busy: Duration,
+}
+
+/// How a weight tensor's rows are shared: the host takes `0..r0`, card
+/// `c` takes `lo..hi`.
+struct Split {
+    r0: u64,
+    cards: Vec<(usize, u64, u64)>,
+}
+
+struct Ctx {
+    cards: Vec<Card>,
+    splits: HashMap<usize, Split>,
+    fraction: f64,
+    /// At eight activation rows or more each card computes this share of
+    /// its resident rows (the host takes the rest): the cards are slower
+    /// per flop than the host is, and faster per weight byte.
+    pp_share: f64,
+    /// The host's row ranges of the multiply begun last: (from, to) pairs.
+    host_ranges: Vec<(u64, u64)>,
+    verbose: bool,
+    calls: u64,
+    t_begin: Instant,
+    host_only: u64,
 }
 
 static CTX: Mutex<Option<Ctx>> = Mutex::new(None);
@@ -52,87 +71,107 @@ fn say(s: &str) {
     eprintln!("ggml-phi: {s}");
 }
 
-/// Open the card's window and check for its worker. 0 on success; a
-/// message and -1 otherwise (the backend then refuses to initialise and
-/// llama.cpp runs without it).
-#[no_mangle]
-pub extern "C" fn phi_ggml_open() -> i32 {
-    let index = match phi_vpu::cards::index_from_env() {
-        Ok(i) => i.unwrap_or(0),
-        Err(e) => {
-            say(&format!("{e:#}"));
-            return -1;
-        }
-    };
+fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
+    std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+}
+
+fn open_card(index: usize, threads: u32, budget: u64) -> Result<Card, String> {
     let path = phi_vpu::cards::hostmem_path(index);
-    let len = match std::fs::metadata(&path) {
-        Ok(m) => m.len() as usize,
-        Err(e) => {
-            say(&format!(
-                "no host-memory window for card {index} at {}: {e} (is the card up?)",
-                path.display()
-            ));
-            return -1;
-        }
-    };
-    if (len as u64) < OFF_D + D_MAX {
-        say(&format!(
-            "the window of card {index} is {len} bytes; this backend needs {}",
-            OFF_D + D_MAX
+    let len = std::fs::metadata(&path)
+        .map_err(|e| format!("no window for card {index} at {}: {e}", path.display()))?
+        .len();
+    if len < WINDOW_LEN {
+        return Err(format!(
+            "the window of card {index} is {len} bytes; this backend needs {WINDOW_LEN}"
         ));
-        return -1;
     }
-    let w = match Window::open(path.to_str().unwrap_or(""), len) {
-        Ok(w) => w,
-        Err(e) => {
-            say(&format!("{e:#}"));
-            return -1;
-        }
-    };
-    if let Err(e) = wait_ready(&w, Duration::from_secs(2)) {
-        say(&format!("card {index}: {e:#} (phi -c {index} vpu start)"));
-        return -1;
-    }
-    let threads = std::env::var("PHI_GGML_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(57);
-    let verbose = std::env::var_os("PHI_GGML_VERBOSE").is_some();
-    *CTX.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ctx {
+    let w = Window::open(path.to_str().unwrap_or(""), len as usize).map_err(|e| format!("{e:#}"))?;
+    wait_ready(&w, Duration::from_secs(2)).map_err(|e| format!("card {index}: {e:#} (scripts/phi-vpu.sh -c {index} start)"))?;
+    Ok(Card {
         w,
         index,
+        threads,
         ids: HashMap::new(),
         next_id: 1,
-        threads,
-        verbose,
         uploaded: 0,
-        calls: 0,
+        budget,
+        full: false,
+        pending: None,
         busy: Duration::ZERO,
-    });
+    })
+}
+
+/// Open the cards (`PHI_GGML_CARDS`, a comma list of indices; default
+/// every card whose worker answers) and settle the shares. Returns the
+/// number of cards, or -1 after a message (the backend then refuses to
+/// initialise and llama.cpp runs without it).
+#[no_mangle]
+pub extern "C" fn phi_ggml_open() -> i32 {
+    let threads = env_or("PHI_GGML_THREADS", 57u32);
+    let budget = env_or("PHI_GGML_CARD_BYTES", 3_400_000_000u64);
+    let fraction = env_or("PHI_GGML_FRACTION", 0.2f64).clamp(0.0, 1.0);
+    let pp_share = env_or("PHI_GGML_PP_SHARE", 0.5f64).clamp(0.0, 1.0);
+    let verbose = std::env::var_os("PHI_GGML_VERBOSE").is_some();
+    let want: Vec<usize> = match std::env::var("PHI_GGML_CARDS") {
+        Ok(s) => s.split(',').filter_map(|x| x.trim().parse().ok()).collect(),
+        Err(_) => (0..16).filter(|&i| phi_vpu::cards::hostmem_path(i).exists()).collect(),
+    };
+    let mut cards = Vec::new();
+    for i in want {
+        match open_card(i, threads, budget) {
+            Ok(c) => cards.push(c),
+            Err(e) => say(&e),
+        }
+    }
+    if cards.is_empty() {
+        say("no card is up with a worker polling; nothing to share the work with");
+        return -1;
+    }
+    let names: Vec<String> = cards.iter().map(|c| c.index.to_string()).collect();
     say(&format!(
-        "card {index}: matrix multiplies run on the card's vector units, {threads} threads"
+        "cards {}: each keeps {:.0}% of every weight matrix's rows (up to {:.1} GB) and multiplies them on {threads} threads while the host does the rest",
+        names.join(", "),
+        fraction * 100.0,
+        budget as f64 / 1e9
     ));
-    0
+    let n = cards.len() as i32;
+    *CTX.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ctx {
+        cards,
+        splits: HashMap::new(),
+        fraction,
+        pp_share,
+        host_ranges: Vec::new(),
+        verbose,
+        calls: 0,
+        t_begin: Instant::now(),
+        host_only: 0,
+    });
+    n
 }
 
-/// The largest tensor the backend takes (bytes).
+/// Can the cards take a multiply of this weight type and shape? (The
+/// host can take anything; a refusal here means the whole op stays on
+/// llama.cpp's own CPU backend.)
 #[no_mangle]
-pub extern "C" fn phi_ggml_max_tensor() -> u64 {
-    A_MAX
+pub extern "C" fn phi_ggml_supports(a_type: u32, m: u64, k: u64, nb_a: u64, nb_b: u64, n: u64) -> i32 {
+    if !matmul::shape_ok(a_type, k, nb_a, nb_b) {
+        return 0;
+    }
+    if n * nb_b > B_MAX || n * m * 4 > D_MAX {
+        return 0;
+    }
+    1
 }
 
-#[no_mangle]
-pub extern "C" fn phi_ggml_max_batch() -> u64 {
-    B_MAX
-}
-
-/// One request to the worker: the descriptor at `OFF_MATMUL`, the doorbell,
-/// the reply. The card's status, or an error text.
-fn request(ctx: &Ctx, kernel: u32, mm: &Matmul) -> Result<Reply, String> {
-    let w = &ctx.w;
+/// Ring a card's doorbell for the descriptor `mm` without waiting.
+fn ring(card: &Card, kernel: u32, mm: &Matmul) -> u64 {
+    let w = &card.w;
     w.write(OFF_MATMUL, *mm);
     let seq = w.read::<u64>(OFF_REQ) + 1;
     let req = Request {
         seq: seq - 1,
         kernel,
-        threads: ctx.threads,
+        threads: card.threads,
         n: 1,
         ..Request::default()
     };
@@ -140,51 +179,122 @@ fn request(ctx: &Ctx, kernel: u32, mm: &Matmul) -> Result<Reply, String> {
     fence(Ordering::SeqCst);
     w.write(OFF_REQ, seq);
     fence(Ordering::SeqCst);
+    seq
+}
+
+fn wait(card: &Card, seq: u64, timeout: Duration) -> Result<Reply, String> {
     let start = Instant::now();
     loop {
-        let rep: Reply = w.read(OFF_REPLY);
+        let rep: Reply = card.w.read(OFF_REPLY);
         if rep.seq == seq {
             if rep.status != OK {
-                return Err(format!("card {}: {}", ctx.index, status_name(rep.status)));
+                return Err(format!("card {}: {}", card.index, matmul::status_name(rep.status)));
             }
             return Ok(rep);
         }
-        if start.elapsed().as_secs() > 60 {
-            return Err(format!("card {}: no answer within 60 s (request {seq})", ctx.index));
+        if start.elapsed() > timeout {
+            return Err(format!("card {}: no answer within {timeout:?} (request {seq})", card.index));
         }
         std::hint::spin_loop();
     }
 }
 
-fn status_name(s: i32) -> &'static str {
-    match s {
-        OK => "ok",
-        -1 => "the card could not reserve memory",
-        -2 => "reading from the window failed on the card",
-        -3 => "writing to the window failed on the card",
-        -4 => "the card rejected the request",
-        -5 => "the worker does not know this kernel (an older worker: scripts/phi-vpu.sh deploy)",
-        _ => "unknown status",
-    }
-}
-
-fn round_up(x: u64) -> u64 {
-    (x + BLOCK - 1) & !(BLOCK - 1)
-}
-
-/// d[n][m] (row stride `nb_d`) = a[m][k] (element type `a_type`, row
-/// stride `nb_a`) times b[n][k] (float32, row stride `nb_b`), transposed
-/// as ggml lays `MUL_MAT` out. `keep` marks a tensor that does not change
-/// (a model weight): it is uploaded once and reused by address. Returns 0,
-/// or -1 after a message (the caller aborts the graph: the op was accepted
-/// by `supports_op`, so this is a fault, not a fallback).
+/// Decide and carry out the shares of a weight tensor seen for the first
+/// time: each card that still has budget takes `fraction` of the rows,
+/// uploaded now (rows are contiguous, so a slice is one copy).
 ///
 /// # Safety
-/// `a`, `b` and `d` must be the tensors of the sizes and strides given.
+/// `a` must be `m` rows of `nb_a` bytes.
+unsafe fn plan(ctx: &mut Ctx, a: *const u8, a_type: u32, m: u64, nb_a: u64) -> Split {
+    let mut r0 = m;
+    let mut cards = Vec::new();
+    let mut lo = m;
+    for (ci, card) in ctx.cards.iter_mut().enumerate().rev() {
+        if card.full {
+            continue;
+        }
+        let mut rows = (m as f64 * ctx.fraction).round() as u64;
+        if rows * nb_a > A_MAX {
+            rows = A_MAX / nb_a;
+        }
+        // The host's rows stay a multiple of 64: ggml's fast paths want that
+        // (measured 0.43 ms against 7.7 ms for 2918 rows of a 4864-row f16).
+        if rows > lo {
+            rows = lo;
+        }
+        rows = lo - ((lo - rows) & !63);
+        if rows == 0 {
+            continue;
+        }
+        if card.uploaded + rows * nb_a > card.budget {
+            card.full = true;
+            say(&format!(
+                "card {}: its budget is spent at {:.2} GB resident",
+                card.index,
+                card.uploaded as f64 / 1e9
+            ));
+            continue;
+        }
+        let bytes = rows * nb_a;
+        // SAFETY: rows lo-rows..lo of a; the window area is A_MAX.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                a.add(((lo - rows) * nb_a) as usize),
+                card.w.ptr(OFF_A, bytes as usize),
+                bytes as usize,
+            )
+        };
+        let id = card.next_id;
+        let mm = Matmul {
+            a_id: id,
+            a_off: OFF_A,
+            bytes: matmul::round_up(bytes),
+            ..Matmul::default()
+        };
+        let seq = ring(card, K_UPLOAD, &mm);
+        match wait(card, seq, Duration::from_secs(120)) {
+            Ok(_) => {
+                card.next_id += 1;
+                card.ids.insert(a as usize, id);
+                card.uploaded += bytes;
+                lo -= rows;
+                r0 = lo;
+                cards.push((ci, lo, lo + rows));
+                if ctx.verbose {
+                    say(&format!(
+                        "card {}: keeps rows {}..{} of a {} {}x{} matrix ({:.1} MiB; {:.2} GB resident)",
+                        card.index,
+                        lo,
+                        lo + rows,
+                        matmul::type_name(a_type),
+                        m,
+                        nb_a,
+                        bytes as f64 / 1048576.0,
+                        card.uploaded as f64 / 1e9
+                    ));
+                }
+            }
+            Err(e) => {
+                say(&format!("upload of {bytes} bytes refused, the card keeps no more: {e}"));
+                card.full = true;
+            }
+        }
+    }
+    Split { r0, cards }
+}
+
+/// Start `d[n][m] = a[m][k] . b[n][k]` on the cards: the weight's shares
+/// are planned and uploaded on first sight (`keep` marks a tensor that
+/// does not change), the activations are copied to each card and the
+/// doorbells rung. Returns how many row ranges the host must compute
+/// itself (`phi_ggml_host_range` gives them; one range `0..m` when the
+/// cards take nothing), or -1 after a message.
+///
+/// # Safety
+/// `a` and `b` must be the tensors of the sizes and strides given.
 #[no_mangle]
-pub unsafe extern "C" fn phi_ggml_mul_mat(
+pub unsafe extern "C" fn phi_ggml_begin(
     a: *const u8,
-    a_bytes: u64,
     a_type: u32,
     m: u64,
     k: u64,
@@ -193,118 +303,177 @@ pub unsafe extern "C" fn phi_ggml_mul_mat(
     b: *const u8,
     n: u64,
     nb_b: u64,
-    d: *mut u8,
-    nb_d: u64,
-) -> i32 {
+) -> i64 {
     let mut guard = CTX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(ctx) = guard.as_mut() else {
         say("not open");
         return -1;
     };
-    let keep = keep != 0;
-    let t0 = Instant::now();
-    let b_bytes = n * nb_b;
-    let d_bytes = n * m * 4;
-    if a_bytes > A_MAX || b_bytes > B_MAX || d_bytes > D_MAX {
-        say(&format!(
-            "a multiply too large for the window areas: a {a_bytes} b {b_bytes} d {d_bytes}"
-        ));
-        return -1;
-    }
-    // The weights: resident by identity, or streamed for this call.
-    let key = (a as usize, a_bytes);
-    let (a_id, a_off) = if keep && ctx.ids.contains_key(&key) {
-        (ctx.ids[&key], 0)
-    } else {
-        // SAFETY: the caller's tensor is a_bytes long; the window area is A_MAX.
-        unsafe { std::ptr::copy_nonoverlapping(a, ctx.w.ptr(OFF_A, a_bytes as usize), a_bytes as usize) };
-        if keep {
-            let id = ctx.next_id;
-            ctx.next_id += 1;
-            let mm = Matmul {
-                a_id: id,
-                a_off: OFF_A,
-                bytes: round_up(a_bytes),
-                ..Matmul::default()
-            };
-            if let Err(e) = request(ctx, K_UPLOAD, &mm) {
-                say(&format!("upload of {a_bytes} bytes: {e}"));
-                return -1;
-            }
-            ctx.ids.insert(key, id);
-            ctx.uploaded += a_bytes;
-            if ctx.verbose {
-                say(&format!(
-                    "kept tensor {id}: {a_bytes} bytes ({} resident, {:.1} MiB)",
-                    ctx.ids.len(),
-                    ctx.uploaded as f64 / 1048576.0
-                ));
-            }
-            (id, 0)
-        } else {
-            (0, OFF_A)
-        }
-    };
-    // SAFETY: b is n rows of nb_b bytes; the window area is B_MAX.
-    unsafe { std::ptr::copy_nonoverlapping(b, ctx.w.ptr(OFF_B, b_bytes as usize), b_bytes as usize) };
-    let mm = Matmul {
-        a_id,
-        a_off,
-        bytes: 0,
-        a_type,
-        reserved0: 0,
-        m,
-        n,
-        k,
-        nb_a,
-        nb_b,
-        b_off: OFF_B,
-        d_off: OFF_D,
-        reserved: [0; 5],
-    };
-    let rep = match request(ctx, K_MATMUL, &mm) {
-        Ok(r) => r,
-        Err(e) => {
-            say(&format!("{m}x{k} by {n}x{k}: {e}"));
-            return -1;
-        }
-    };
-    // The result: n rows of m floats, into d with its own stride.
-    for j in 0..n {
-        // SAFETY: the card wrote n*m floats at OFF_D; d has n rows of nb_d bytes.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                ctx.w.ptr(OFF_D + j * m * 4, (m * 4) as usize) as *const u8,
-                d.add((j * nb_d) as usize),
-                (m * 4) as usize,
-            )
-        };
-    }
     ctx.calls += 1;
-    ctx.busy += t0.elapsed();
-    if ctx.verbose {
-        say(&format!(
-            "{m}x{k} . {n}x{k} ({}{}) {} threads: card {:.3} ms (pull {:.3}, compute {:.3}, push {:.3}), wall {:.3} ms",
-            if a_type == MM_F16 { "f16" } else { "f32" },
-            if a_id != 0 { ", resident" } else { ", streamed" },
-            rep.threads,
-            rep.total_ns as f64 / 1e6,
-            rep.pull_ns as f64 / 1e6,
-            rep.compute_ns as f64 / 1e6,
-            rep.push_ns as f64 / 1e6,
-            t0.elapsed().as_secs_f64() * 1e3
-        ));
+    ctx.t_begin = Instant::now();
+    if keep == 0 || phi_ggml_supports(a_type, m, k, nb_a, nb_b, n) == 0 {
+        ctx.host_only += 1;
+        ctx.host_ranges = vec![(0, m)];
+        return 1;
     }
-    0
+    let key = a as usize;
+    if !ctx.splits.contains_key(&key) {
+        // SAFETY: the caller's contract.
+        let split = unsafe { plan(ctx, a, a_type, m, nb_a) };
+        ctx.splits.insert(key, split);
+    }
+    let split = &ctx.splits[&key];
+    let r0 = split.r0;
+    let b_bytes = (n * nb_b) as usize;
+    // Prompt sizes: each card takes the first `pp_share` of its slice (its
+    // resident rows start there), the host the rest of it as one more range.
+    let share = if n >= 8 { ctx.pp_share } else { 1.0 };
+    let mut ranges = vec![(0u64, r0)];
+    let mut work = Vec::new();
+    for &(ci, lo, hi) in &split.cards {
+        let mut rows = ((hi - lo) as f64 * share).round() as u64;
+        rows = (hi - lo) - (((hi - lo) - rows) & !63);
+        if lo + rows < hi {
+            ranges.push((lo + rows, hi));
+        }
+        if rows > 0 {
+            work.push((ci, lo, rows));
+        }
+    }
+    ranges.retain(|r| r.1 > r.0);
+    for &(ci, lo, rows) in &work {
+        let card = &mut ctx.cards[ci];
+        // SAFETY: b is n rows of nb_b bytes; the window area is B_MAX (checked by supports).
+        unsafe { std::ptr::copy_nonoverlapping(b, card.w.ptr(OFF_B, b_bytes), b_bytes) };
+        let mm = Matmul {
+            a_id: card.ids[&key],
+            a_off: 0,
+            bytes: 0,
+            a_type,
+            reserved0: 0,
+            m: rows,
+            n,
+            k,
+            nb_a,
+            nb_b,
+            b_off: OFF_B,
+            d_off: OFF_D,
+            reserved: [0; 5],
+        };
+        let seq = ring(card, K_MATMUL, &mm);
+        card.pending = Some((seq, lo, rows, n));
+    }
+    ctx.host_ranges = ranges;
+    ctx.host_ranges.len() as i64
 }
 
-/// Drop every tensor kept on the card.
+/// The host's row range `i` of the multiply begun last. Returns 0 when there
+/// is none.
+///
+/// # Safety
+/// `from` and `to` must point to writable u64s.
+#[no_mangle]
+pub unsafe extern "C" fn phi_ggml_host_range(i: u64, from: *mut u64, to: *mut u64) -> i32 {
+    let guard = CTX.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(ctx) = guard.as_ref() else {
+        return 0;
+    };
+    match ctx.host_ranges.get(i as usize) {
+        Some(&(a, b)) => {
+            // SAFETY: the caller passes two writable u64s.
+            unsafe {
+                *from = a;
+                *to = b;
+            }
+            1
+        }
+        None => 0,
+    }
+}
+
+/// Wait for the cards' rows and put them into `d` (n rows of `nb_d`
+/// bytes, m floats each). Returns 0, or -1 after a message.
+///
+/// # Safety
+/// `d` must be the result tensor of the multiply begun last.
+#[no_mangle]
+pub unsafe extern "C" fn phi_ggml_end(d: *mut u8, nb_d: u64) -> i32 {
+    let mut guard = CTX.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(ctx) = guard.as_mut() else {
+        return -1;
+    };
+    let t_host = ctx.t_begin.elapsed();
+    let mut lines = Vec::new();
+    let mut ok = true;
+    let t0 = Instant::now();
+    for card in ctx.cards.iter_mut() {
+        let Some((seq, lo, rows, n)) = card.pending.take() else {
+            continue;
+        };
+        let rep = match wait(card, seq, Duration::from_secs(60)) {
+            Ok(r) => r,
+            Err(e) => {
+                say(&format!("{e} (rows {lo}..{}, n {n})", lo + rows));
+                ok = false;
+                continue;
+            }
+        };
+        for j in 0..n {
+            // SAFETY: the card wrote n rows of `rows` floats at OFF_D; d has n rows of nb_d bytes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    card.w.ptr(OFF_D + j * rows * 4, (rows * 4) as usize) as *const u8,
+                    d.add((j * nb_d + lo * 4) as usize),
+                    (rows * 4) as usize,
+                )
+            };
+        }
+        card.busy += rep_time(&rep);
+        if ctx.verbose {
+            lines.push(format!(
+                "card {} rows {}: {:.3} ms (pull {:.3}, compute {:.3}, push {:.3})",
+                card.index,
+                rows,
+                rep.total_ns as f64 / 1e6,
+                rep.pull_ns as f64 / 1e6,
+                rep.compute_ns as f64 / 1e6,
+                rep.push_ns as f64 / 1e6
+            ));
+        }
+    }
+    if ctx.verbose {
+        say(&format!(
+            "multiply {}: host part {:.3} ms, waited {:.3} ms more; {}",
+            ctx.calls,
+            t_host.as_secs_f64() * 1e3,
+            t0.elapsed().as_secs_f64() * 1e3,
+            lines.join("; ")
+        ));
+    }
+    if ok {
+        0
+    } else {
+        -1
+    }
+}
+
+fn rep_time(rep: &Reply) -> Duration {
+    Duration::from_nanos(rep.total_ns)
+}
+
+/// Drop every row slice kept on the cards.
 #[no_mangle]
 pub extern "C" fn phi_ggml_free_all() {
     let mut guard = CTX.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(ctx) = guard.as_mut() {
-        let _ = request(ctx, K_FREE, &Matmul::default());
-        ctx.ids.clear();
+        for card in ctx.cards.iter_mut() {
+            let seq = ring(card, K_FREE, &Matmul::default());
+            let _ = wait(card, seq, Duration::from_secs(30));
+            card.ids.clear();
+            card.uploaded = 0;
+            card.full = false;
+        }
+        ctx.splits.clear();
     }
 }
 
