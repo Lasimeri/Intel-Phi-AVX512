@@ -70,6 +70,7 @@ int main(void)
 	check("VPU_K_UPLOAD", VPU_K_UPLOAD, 3);
 	check("VPU_K_MATMUL", VPU_K_MATMUL, 4);
 	check("VPU_K_FREE", VPU_K_FREE, 5);
+	check("VPU_K_MATMUL_ID", VPU_K_MATMUL_ID, 6);
 	check("matmul.a_id", offsetof(struct vpu_matmul, a_id), 0);
 	check("matmul.a_off", offsetof(struct vpu_matmul, a_off), 8);
 	check("matmul.bytes", offsetof(struct vpu_matmul, bytes), 16);
@@ -81,6 +82,11 @@ int main(void)
 	check("matmul.nb_b", offsetof(struct vpu_matmul, nb_b), 64);
 	check("matmul.b_off", offsetof(struct vpu_matmul, b_off), 72);
 	check("matmul.d_off", offsetof(struct vpu_matmul, d_off), 80);
+	check("matmul.chunk", offsetof(struct vpu_matmul, chunk), 88);
+	check("matmul.n_used", offsetof(struct vpu_matmul, n_used), 96);
+	check("matmul.n_tokens", offsetof(struct vpu_matmul, n_tokens), 104);
+	check("matmul.b_rows", offsetof(struct vpu_matmul, b_rows), 112);
+	check("matmul.ids_bytes", offsetof(struct vpu_matmul, ids_bytes), 120);
 	check("sizeof matmul", sizeof(struct vpu_matmul), 128);
 	check("VPU_OFF_SCRATCH", VPU_OFF_SCRATCH, 8);
 	check("VPU_OFF_REQ", VPU_OFF_REQ, 64);

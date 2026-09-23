@@ -28,11 +28,15 @@ kernel to the card, gets the answer back, and checks every lane against
 its own FMA hardware.
 
 `PHI_VPU_ARGS="-s 500 -i 1000" scripts/phi-vpu.sh start` passes worker
-options (spin window, idle poll interval) through.
+options (spin window, idle poll interval, and `-e N` for the seamless
+path's huge-page pool) through. A worker that will only serve matrix
+multiplies wants `-e 0`, which leaves that pool's 512 MiB of the card to
+the model; `scripts/phi-ggml.sh` starts workers that way.
 
 `start` reserves 2 MiB huge pages on the card first (`PHI_VPU_HUGEPAGES`,
-512 by default: 1 GiB, enough for 128 M elements in and out), and
-`stop` releases them. The worker takes its buffers from them, which
+768 by default: 1.5 GiB, enough for 128 M elements in and out; a ggml
+run wants most of the card in them, and `scripts/phi-ggml.sh` asks for
+2400), and `stop` releases them. The worker takes its buffers from them, which
 turns a request's transport from one block record per scattered 4 KiB
 page into one per 512 KiB (`card/vpu/vpu_worker.md`, "Moving the
 data"). A card that cannot give the whole reservation says so; the

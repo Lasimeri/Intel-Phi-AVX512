@@ -57,3 +57,32 @@ Every region starts on a 4096-byte block and is followed by its own
 slack, because the card moves whole blocks with `O_DIRECT`. Input, then
 the coefficients (one copy per lane, as the kernel loads them), then the
 output. `proto.rs` has the rules and the reasons.
+
+## `matmul-check`: the card's matrix multiplies, checked and timed
+
+```
+phi-vpu -c 0 matmul-check                    # every weight type, then the rates
+phi-vpu -c 0 matmul-check --only q4_K --m 4096 --k 5120
+phi-vpu -c 0 matmul-check --probe            # what the kernels produce, and the card's ceilings
+```
+
+The conformance part builds random weights in every type the card takes
+(f32, f16, Q4_K, Q5_K, Q6_K, Q8_0, IQ4_XS), dequantizes them on the host
+exactly as ggml does, and compares the card's results per element; it
+covers plain multiplies at several activation-row counts and mixtures of
+eight experts (`K_MATMUL_ID`). The rate part times a model-sized shape.
+
+| flag | what it is for |
+| --- | --- |
+| `--threads N` | card threads (57, one per core, is the setting) |
+| `--only TYPE` | one weight type |
+| `--m`, `--k` | the rate shape (4096 x 5120) |
+| `--repeat N` | time each rate shape N times and report the best (7): one timed request is not a measurement, since the first after an idle gap pays the pool's wake |
+| `--chunk N` | rows per chunk the card works in, so the loop shape is measured rather than argued |
+| `--pad N` | bytes added to the activation row stride, which is how the L1 set conflict was found |
+| `--pattern B` | every quantized byte takes the value B: a wrong field mapping then shows as a fixed ratio |
+| `--probe` | print what each kernel instruction produces on the card, the rates one thread reaches, and the card's aggregate ceilings (read bandwidth, vector issue, the cost of one dispatch) |
+
+`docs/results/2026-09-23-quantized-kernels.md` and
+`docs/results/2026-09-23-ceilings-and-residency.md` are what this
+command measured.

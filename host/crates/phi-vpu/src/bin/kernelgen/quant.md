@@ -78,6 +78,9 @@ prints; the rates and what they showed are in
 `phi_bench` takes a third argument, the iteration count in `rdx` (0
 means its default 1 M), so the same kernel serves one thread and the
 whole pool at once. Its prologue picks the count with a branch, not a
-`cmov`: the card's scalar core is a P54C and has no CMOV, and one there
-killed the worker with `trap invalid opcode` (2026-09-23; the cross
-compiler never emits one, so only hand-written scalar code can hit it).
+`cmov`: Knights Corner deletes CMOV (ISA reference 327364-001, appendix
+B; the stack's LLVM is patched not to emit it, `Intel-Phi-3120A`,
+`docs/research/abi-and-toolchain.md`), and one here killed the worker
+with `trap invalid opcode` (2026-09-23). Compiled code cannot reach it;
+the scalar scaffolding this generator writes by hand can, so it is
+written as if for a P54C.

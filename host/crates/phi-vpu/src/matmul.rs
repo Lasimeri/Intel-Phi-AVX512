@@ -1,6 +1,6 @@
 //! The matrix-multiply service of the card worker, from the host side:
-//! the window areas it uses, the three requests (`K_UPLOAD`, `K_MATMUL`,
-//! `K_FREE`), and a check of every weight format against a host
+//! the window areas it uses, the four requests (`K_UPLOAD`, `K_MATMUL`,
+//! `K_MATMUL_ID`, `K_FREE`), and a check of every weight format against a host
 //! reference, `check`, which `phi-vpu matmul-check` runs and the ggml
 //! backend (`phi-ggml`) builds on. See matmul.md.
 

@@ -393,6 +393,11 @@ mod matmul_layout {
         assert_eq!(offset_of!(Matmul, nb_a), 56);
         assert_eq!(offset_of!(Matmul, b_off), 72);
         assert_eq!(offset_of!(Matmul, d_off), 80);
+        assert_eq!(offset_of!(Matmul, chunk), 88);
+        assert_eq!(offset_of!(Matmul, n_used), 96);
+        assert_eq!(offset_of!(Matmul, n_tokens), 104);
+        assert_eq!(offset_of!(Matmul, b_rows), 112);
+        assert_eq!(offset_of!(Matmul, ids_bytes), 120);
         assert!(OFF_MATMUL >= OFF_EXEC + 4560 && OFF_MATMUL + 128 <= 16384);
     }
 }

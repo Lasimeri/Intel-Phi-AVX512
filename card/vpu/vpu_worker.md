@@ -6,12 +6,13 @@ set ahead of time by `host/crates/avx512-xlate`, across the vector units,
 and writes the result back where the host can read it.
 
 ```
-phi-vpu-worker [-v] [-s MS] [-i US] [threads]
+phi-vpu-worker [-v] [-s MS] [-i US] [-e N] [threads]
 ```
 
 `threads` is the most the worker will spread one request across (1 to
 228, default 57). `-v` logs one line per request. `-s` is the spin window
 and `-i` the idle poll interval, both described below.
+`-e` is the seamless path's page pool, below.
 `scripts/phi-vpu.sh` deploys, builds, starts and stops it from the host
 (`PHI_VPU_ARGS` passes these options through `start`).
 
@@ -103,8 +104,24 @@ thread's results are visible before its acknowledgement.
 ## Moving the data
 
 Bulk data goes through `/dev/phiblk1`, the DMA path, not through the
-`/dev/phihost` mapping, which is uncached and streams at 50 MB/s. Two
-rules follow from opening the block device with `O_DIRECT`, which is
+`/dev/phihost` mapping, and that holds at every size. The worker maps
+the whole window as well (`WIN_BYTES`, `vpu_window(off, len)`, which
+returns NULL when the mapping failed and the block device then serves
+everything), and the two were measured against each other at the size a
+token's activations and results are, 16 KiB, 100 rounds each, on card 0
+on 2026-09-23 (`phi-vpu matmul-check --probe`):
+
+| 16 KiB across the link | card reads the window | card writes it |
+| --- | --- | --- |
+| block device | 109 us | 95 us |
+| the mapping, `memcpy` | 1488 us (11 MB/s) | 225 us (73 MB/s) |
+
+The mapping has no per-request cost but every access is a link round
+trip, and even at 16 KiB that loses by an order of magnitude reading and
+by half writing. It is kept for the measurement and for anything that
+wants a word or two of the window without a request.
+
+Two rules follow from opening the block device with `O_DIRECT`, which is
 required because the host changes this memory behind the card's back and
 the page cache would serve whatever the last reader saw:
 

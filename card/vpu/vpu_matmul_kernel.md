@@ -13,3 +13,16 @@ alignment: ggml's tensors have it) or 16 floats at any alignment;
 `b` is 16 floats at any alignment (the unpack pair). The MVEX
 instructions are bytes from `knc-mvex`; the rest is x86-64 the card
 runs as is.
+
+## The quantized kernels and the diagnostics
+
+The file also holds `phi_<fmt>_<1|4|8>` for llama.cpp's Q4_K, Q5_K,
+Q6_K, Q8_0 and IQ4_XS (one 256-weight superblock against one, four or
+eight activation rows; `host/crates/phi-vpu/src/bin/kernelgen/quant.md`
+has the decoding and the calling convention) and two diagnostics:
+`phi_probe`, which stores what a handful of instructions produce so the
+host can print them, and `phi_bench(kind, buf, count)`, whose third
+argument is the iteration count (0 means its default of a million) so
+the same kernel serves one thread and the whole pool at once. Its
+prologue uses a branch rather than a `cmov`, which Knights Corner does
+not have.

@@ -1,6 +1,6 @@
 # matmul.rs: the matrix-multiply service, host side
 
-The window areas and the three requests of the card's matrix-multiply
+The window areas and the four requests of the card's matrix-multiply
 service (`card/vpu/vpu_matmul.md`), shared by the ggml backend
 (`host/crates/phi-ggml`) and the driver's `matmul-check`:
 

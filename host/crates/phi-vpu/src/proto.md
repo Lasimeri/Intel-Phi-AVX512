@@ -20,3 +20,26 @@ went wrong rather than printing a small negative number.
 (v2: modes, phases, ranges, the split, two fetch and two write-back
 slots, the bundle at `OFF_EXEC_CODE`); `tools/vpu-layout-check.c` checks
 the offsets. `K_EXEC` is the request kind.
+
+## The matrix-multiply service (2026-09-23)
+
+`Matmul` mirrors `struct vpu_matmul` in `card/vpu/vpu_matmul.h`, 128
+bytes at `OFF_MATMUL` in the control area, and four request kinds use
+it:
+
+| kind | number | what it does |
+| --- | --- | --- |
+| `K_UPLOAD` | 3 | keep `bytes` from the window under `a_id` (replacing an earlier one) |
+| `K_MATMUL` | 4 | `d = a . b^T`, `a` cached by id or streamed from the window |
+| `K_FREE` | 5 | drop `a_id`, or everything when it is 0 |
+| `K_MATMUL_ID` | 6 | the same with one expert per column, ggml's MUL_MAT_ID |
+
+The descriptor's last five words are `chunk` (rows per chunk the card
+works in, 0 for its own default) and the four a mixture needs (`n_used`,
+`n_tokens`, `b_rows`, `ids_bytes`), all zero for an ordinary multiply.
+`tools/vpu-layout-check.c` and the unit tests here pin every one of
+their offsets, as for the request and reply.
+
+`matmul.rs` has the window layout the service uses, the conformance
+check behind `phi-vpu matmul-check`, and what each field means in
+practice.

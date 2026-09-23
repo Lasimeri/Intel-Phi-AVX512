@@ -77,8 +77,9 @@ token (`docs/results/2026-09-22-full-avx512.md`). For it the cards are
 used the way GPUs are: whole operators at a time. `host/crates/phi-ggml`
 builds `libggml_phi.so`, a ggml backend that an unmodified llama.cpp
 loads through `GGML_BACKEND_PATH`; its scheduler hands the backend
-every matrix multiply it accepts (float16, float32 and llama.cpp's
-Q4_K, Q5_K, Q6_K, Q8_0 and IQ4_XS weights), and the backend shares each
+every matrix multiply it accepts (`MUL_MAT` and `MUL_MAT_ID`, the
+mixture-of-experts one, with float16, float32 and llama.cpp's Q4_K,
+Q5_K, Q6_K, Q8_0 and IQ4_XS weights), and the backend shares each
 one by rows: every card keeps a share of the weight matrix resident and
 multiplies it on its 57 threads with the kernels of
 `card/vpu/vpu_matmul_kernel.S` (the quantized formats decoded on the

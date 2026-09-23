@@ -1,5 +1,16 @@
 # 2026-09-23: quantized weights on the card, and the cards beside the host
 
+> Later the same day, two notes revised parts of this one. The settings
+> here (a fifth of the rows per card, a 3.4 GB budget, half the rows at
+> prompt sizes, 16 rows per chunk) and the end-to-end numbers were
+> superseded by `2026-09-23-ceilings-and-residency.md`, which also found
+> that the host window was starving this host's page cache while these
+> were measured. `2026-09-23-mixture-of-experts.md` then showed that a
+> split must be compared against the host at *its* own best thread
+> count, which for these tables is 16 for prompt processing and 12 for
+> generation. What stands here unchanged: how each quantized format is
+> decoded on the card, the conformance method, and the per-format rates.
+
 What this records: the card's kernels for llama.cpp's quantized weight
 formats, what the card's in-order cores need to run them at speed, and
 the first end-to-end numbers of a 27B model shared by rows between the

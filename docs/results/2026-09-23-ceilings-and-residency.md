@@ -98,9 +98,16 @@ slice of the model can sit in. `scripts/phi-ggml.sh` starts workers with
 
 A `cmovne` added to the bench kernel's prologue killed the worker with
 `trap invalid opcode` (the card's `dmesg`, three times, once per probe).
-The scalar side of a Knights Corner core is a P54C, which predates CMOV;
-the cross compiler never emits one, so nothing had found this before.
-Hand-written scalar code in `kernelgen` uses a branch.
+Knights Corner deletes CMOV, which the ISA reference lists among the
+removed instructions (327364-001, appendix B) and the stack repository
+has carried from the start (`Intel-Phi-3120A`, `README.md` and
+`docs/research/abi-and-toolchain.md`: its LLVM is patched so that
+`FeatureX86_64` does not imply `FeatureCMOV`, and `phi-isa-audit` flags
+any that survive). So no compiled code here can hit it, and nothing had:
+only hand-written scalar code in `kernelgen` can, and it uses a branch
+now. The lesson for this repository is that the generator's scalar
+scaffolding is not covered by the toolchain's guarantees and should be
+audited the same way.
 
 ## The host window was starving the page cache
 
@@ -216,12 +223,21 @@ re-measured: `PHI_GGML_PP_SHARE` 0.5 gives pp64 10.40, **0.75 gives
 | Qwen3.8-27B UD-Q4_K_XL | pp64 | pp512 | tg16 |
 | --- | --- | --- | --- |
 | host alone, 16 threads | 9.33 | 9.24 | 1.07 |
+| host alone, 12 threads (measured later, `--mmap 0`) | 8.89 | 8.88 | 1.11 |
 | host and both cards, as of yesterday | 9.05 | - | 1.45 |
 | host and both cards, now | 11.56 | 11.79 | 1.51 |
 
-Prompt processing is 24 to 28 percent above the host alone, where
+The 12-thread row was added after the mixture work
+(`2026-09-23-mixture-of-experts.md`) showed that the host's best thread
+count is not the same for every model and that a split measured at 12
+threads must be compared against the host at its own best, not at 16.
+For this dense model the host is better at 16 for prompt processing and
+slightly better at 12 for generation, so the honest comparison is 11.79
+against 9.33 (+26 percent) and 1.51 against 1.11 (+36 percent).
+
+Prompt processing is 24 to 26 percent above the host alone, where
 yesterday it was 3 percent below it: that is the activation stride and
-the share that followed from it. Generation is 41 percent above the host
+the share that followed from it. Generation is 36 percent above the host
 alone and will not move further on this model: the host is the long pole
 in every multiply, it is the long pole because it holds half the
 weights, and it holds half of them because two 6 GB cards cannot hold
