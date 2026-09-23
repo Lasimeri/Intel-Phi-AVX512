@@ -102,8 +102,8 @@ cards, each keeping a quarter of every weight matrix, llama-bench,
 | host alone, 12 threads | 8.96 | 1.13 |
 | host alone, 16 threads | 9.24 | 1.07 |
 | host (12 threads) and both cards | **12.29** | **1.63** |
-| llama-server with the MTP draft: host alone | | 2.26 |
-| llama-server with the MTP draft: host and both cards | | 2.77 |
+| llama-server with the MTP draft: host alone | 6.93 | 2.31 |
+| llama-server with the MTP draft: host and both cards | **9.56** | **2.72** |
 
 The first three rows are the model resident (`--load-mode none`) with
 the host and the split **interleaved**, two rounds each, because this

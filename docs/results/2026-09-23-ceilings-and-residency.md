@@ -262,3 +262,20 @@ own throughput drifts by as much as a quarter over tens of minutes:
 
 Against the best the host does at any thread count (pp512 9.24 at 16
 threads) that is +33 percent, and generation is unchanged at +45.
+
+Speculative decoding was remeasured on the same day and the same way
+(`llama-server` with the model's own MTP draft, `--spec-type draft-mtp`,
+one greedy 128-token completion, the model resident, the draft split
+across the cards as well):
+
+| Qwen3.8-27B with the MTP draft | prompt tok/s | generation tok/s | accepted |
+| --- | --- | --- | --- |
+| host alone, 16 threads | 6.93 | 2.31 | 83 of 129 |
+| host (12 threads) and both cards | **9.56** | **2.72** | 81 of 138 |
+
+Yesterday the same comparison had prompt processing 23 percent *below*
+the host with the cards; it is 38 percent above it now, and generation
+18 percent. The acceptance counts differ between the two rows because
+the draft model is split too and its arithmetic differs in the last
+bits, so it proposes slightly different tokens; what the target model
+verifies, and therefore the text, does not depend on that.
