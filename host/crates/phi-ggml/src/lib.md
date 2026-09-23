@@ -91,3 +91,10 @@ small multiplies on the host at generation and its batched ones there
 too, for now: the card computes a mixture one column at a time where
 ggml groups the tokens that chose the same expert
 (`docs/results/2026-09-23-mixture-of-experts.md`).
+
+Note when measuring: the host's own best thread count is not the same
+for every model, and the comparison must use it. An MoE at one token is
+faster on 12 host threads than on 16 (7.91 against 6.39 tokens per
+second on the 35B-A3B), so a split measured at 12 against a host at 16
+flatters itself by 24 percent. `--mmap 0` matters too, on a host whose
+memory the model and the card windows together fill.

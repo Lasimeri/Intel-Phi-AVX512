@@ -105,13 +105,15 @@ cards, each keeping a quarter of every weight matrix, llama-bench,
 
 A mixture-of-experts model works the same way: ggml runs its expert
 weights through MUL_MAT_ID, which the cards take as well, each keeping
-the same rows of every expert. Qwen3.8-35B-A3B-Distill (Q4_K_M, 20.2
-GiB, 256 experts with 8 used per token), llama-bench, against the host
-alone at 16 threads: tg16 8.55 against 7.41, pp512 83.99 against 78.18
-(`docs/results/2026-09-23-mixture-of-experts.md`). Because a card costs
-about 0.45 ms to involve and an MoE layer's multiply at one token is a
-few megabytes, the backend times both sides on each weight tensor and
-leaves with the host what the cards would not finish sooner.
+the same rows of every expert, and the answers match the host's token
+for token. It is worth much less so far: Qwen3.8-35B-A3B-Distill
+(Q4_K_M, 20.2 GiB, 256 experts with 8 used per token) gains 3 to 5
+percent at generation and loses 11 percent at pp512 against the best
+the host does alone. A card costs about 0.45 ms to involve and an MoE
+layer's multiply at one token is a few megabytes, so the backend times
+both sides on each weight tensor and leaves with the host what the
+cards would not finish sooner, which on that model is most of the
+expert work (`docs/results/2026-09-23-mixture-of-experts.md`).
 
 Token generation is bound by weight bandwidth, and the cards add theirs
 to the host's; what bounds it now is how much of the model they hold,

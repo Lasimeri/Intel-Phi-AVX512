@@ -474,6 +474,17 @@ unsafe fn begin(a: *const u8, a_type: u32, m: u64, k: u64, nb_a: u64, keep: i32,
         let split = unsafe { plan(ctx, a, a_type, m, nb_a, mix.experts, mix.nb_a2) };
         ctx.splits.insert(key, split);
     }
+    // More columns than experts means several of them want the same
+    // expert, and ggml's own kernel reads that expert's rows once for
+    // the group where the card reads them once per column (at 512 tokens
+    // and 8 experts used that is 4096 columns against 256 groups). Until
+    // the card groups them too, those multiplies belong to the host,
+    // whatever their size: it is not a matter of latency.
+    if mixture && n > mix.experts {
+        ctx.too_small += 1;
+        ctx.host_ranges = vec![(0, m)];
+        return 1;
+    }
     // One token or a batch: the two are judged apart, because a multiply
     // worth a card's latency at a batch is often not worth it at one
     // token (`Split::avoid`).

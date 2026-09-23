@@ -54,17 +54,49 @@ that, plainly longer once or barely longer twice, that tensor stops
 going to the cards at that batch size. No rule about shapes, no rates to
 tune: the two sides are timed against each other on the real model.
 
-## What that leaves
+## What that leaves, against a baseline that took two tries to get right
 
-| Qwen3.8-35B-A3B Q4_K_M, llama-bench, two repeats | pp64 | pp512 | tg16 |
-| --- | --- | --- | --- |
-| host alone, 16 threads | 61.25 | 78.18 | 7.41 |
-| host (12 threads) and both cards | **62.61** | **83.99** | **8.55** |
+The first numbers here compared the split at 12 host threads against the
+host alone at 16, which is how the dense 27B had been measured. That is
+not a fair baseline for this model: **an MoE at one token is faster on
+12 threads than on 16** (tg16 7.91 against 6.39, a 24 percent
+difference, measured twice), because only about 3 B of its parameters
+are active per token and the extra threads cost more in ggml's barrier
+than they add. Against the wrong baseline the cards looked worth 15
+percent at generation. Against the right one they are worth 3 to 5.
 
-Generation is 15 percent above the host alone and prompt processing 2 to
-7 percent. The cards keep 20 percent of every weight matrix's rows (4.4
-GB each of the 21.7 GB file), and the text they produce is identical to
-the host's own, token for token, at temperature 0.
+Every number below is `--mmap 0` (the model resident in this host's
+memory: with it mmapped, a 20.2 GiB model on a 31 GiB host with 4 GiB of
+card windows swings 40 percent run to run on what happens to be cached),
+three repeats, and the host column is the best the host alone does at
+any thread count:
+
+| Qwen3.8-35B-A3B Q4_K_M | pp64 | pp512 | tg16 | tg32 |
+| --- | --- | --- | --- | --- |
+| host alone, best of 12 and 16 threads | 68.85 | 87.41 | 7.91 | 7.99 |
+| host (12 threads) and both cards | 67.25 | 77.57 | 8.13 | 8.39 |
+| | parity | -11% | +2.8% | +5% |
+
+The cards keep 20 percent of every weight matrix's rows (4.4 GB each of
+the 21.7 GB file) and the text is identical to the host's own, token for
+token, at temperature 0. But the gain is small, and prompt processing
+loses: on this model the cards take only the ordinary multiplies (the
+attention projections and the 248320-row output matrix), because the
+mixture multiplies are the ones they cannot yet do well, and those are
+most of the work. The same split on the dense 27B is worth 36 percent at
+generation against its own best baseline (1.51 against 1.11 at 12
+threads), which is what this machinery does when the cards can take
+every multiply.
+
+Two other things the fair baseline showed, both worth keeping:
+
+- The backend's own cost, with the cards taking nothing
+  (`PHI_GGML_FRACTION` at zero), is pp512 80.09 against 85.66 for plain
+  llama.cpp at the same 12 threads: about 6 percent for running every
+  accepted multiply on a private CPU backend, one graph per node,
+  alongside llama.cpp's own pool.
+- At one token this model is faster on 12 threads than 16 whatever the
+  cards do, so a user running it on the CPU alone should use 12.
 
 ## Why prompt processing gains so little
 
