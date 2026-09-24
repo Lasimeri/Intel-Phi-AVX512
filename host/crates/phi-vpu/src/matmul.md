@@ -118,3 +118,10 @@ numbers are in `card/vpu/vpu_matmul.md`.
 
 `request_ffn` writes the descriptor at `OFF_FFN` and rings the same
 doorbell `request` does (`ring_and_wait`).
+
+The probe's transport section also times the two things the card now
+moves data with (`kernelgen/copy.md`): 64-byte vector stores and loads
+through the mapping on one thread at 4, 16 and 64 KiB, and the same
+split across the pool against the block device at 16 KiB, 64 KiB, 1 MiB
+and 4 MiB, each way. Those crossovers are the thresholds in
+`card/vpu/vpu_matmul.c` (`pull_data`, `push_data`).

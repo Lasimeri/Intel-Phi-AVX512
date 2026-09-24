@@ -1152,6 +1152,41 @@ pub fn probe(w: &Window, threads: u32) -> Result<()> {
             t(17) / 1e3 / 100.0,
             100.0 * 16384.0 / t(17) * 1e9 / 1e6
         );
+        // The same transfers as whole 64-byte vectors (kernelgen/copy.rs).
+        for (i, kib, what) in [
+            (19, 4.0, "stores"),
+            (20, 16.0, "stores"),
+            (21, 64.0, "stores"),
+            (22, 4.0, "loads"),
+            (23, 16.0, "loads"),
+            (24, 64.0, "loads"),
+        ] {
+            println!(
+                "  mapping, 64-byte {what:6}, {kib:2.0} KiB:  {:7.1} us ({:.0} MB/s)",
+                t(i) / 1e3 / 100.0,
+                100.0 * kib * 1024.0 / t(i) * 1e9 / 1e6
+            );
+        }
+        // Split across the pool, against the block device, up to what a
+        // prompt moves (each a transfer's time).
+        if t(25) > 0.0 {
+            println!("  split across the pool (reads, writes) against the block device (reads, writes), per transfer:");
+            for (s, kib) in [(0usize, 16.0f64), (1, 64.0), (2, 1024.0), (3, 4096.0)] {
+                let us = |i: usize| t(i + s) / 1e3 / 100.0;
+                let rate = |i: usize| kib * 1024.0 / (us(i) * 1e-6) / 1e6;
+                println!(
+                    "    {kib:5.0} KiB: pool {:8.1} us ({:5.0} MB/s), {:8.1} us ({:5.0} MB/s); block {:8.1} us ({:5.0} MB/s), {:8.1} us ({:5.0} MB/s)",
+                    us(25),
+                    rate(25),
+                    us(29),
+                    rate(29),
+                    us(33),
+                    rate(33),
+                    us(37),
+                    rate(37)
+                );
+            }
+        }
     }
     let names = [
         "float unpack {uint8} at +3 (bytes 3..18)",

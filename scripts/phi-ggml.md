@@ -27,7 +27,8 @@ than instead of it.
 Settings, all environment variables (`host/crates/phi-ggml/src/lib.md`):
 `PHI_GGML_CARDS` (which cards; default every card whose window exists;
 `--card N` sets it to one), `PHI_GGML_FRACTION` (rows per card; unset,
-this script works it out from the model's size and the budget, below),
+the backend sizes it to fill the budget, below; either way at most an
+equal split with the host, a third on two cards),
 `PHI_GGML_CARD_BYTES` (resident bytes per card, 4.4 GB),
 `PHI_GGML_PP_SHARE` (where the cards' share at prompt sizes starts,
 0.75; it then follows what the two sides measure, and
@@ -38,6 +39,11 @@ link, and never written on the host either, so not with a program that
 reads intermediates through an eval callback, such as llama-imatrix),
 `PHI_GGML_FFN_H16` (0: the card keeps the intermediate as float32; 1:
 float16, faster and overflowing past 65504),
+`PHI_GGML_HOST_POOL` (1: the host's rows run on a threadpool of their
+own; 0: ggml's disposable one per graph) and `PHI_GGML_HOST_POLL` (0: that
+pool's threads do not spin between graphs),
+`PHI_GGML_LIB` (another build of `libggml_phi.so` to load instead of this
+repository's, so two builds can be compared interleaved),
 `PHI_GGML_HOST_THREADS` (the host's threads for its rows, 12: leave the
 card daemons a CPU each, and give the program the same `-t`),
 `PHI_GGML_THREADS` (card threads, 57). `--verbose`
@@ -46,16 +52,22 @@ and each card's timings, and every slice kept resident. The workers
 must know the matmul service and its formats (deploy from this tree:
 `scripts/phi-vpu.sh -c N deploy`, then `start`).
 
-## The share is taken from the model's size
+## The share fills the budget
 
-Each card keeps `PHI_GGML_FRACTION` of every weight matrix's rows, and
-what that should be is the card's budget over the model's bytes: too
-small and the card's memory sits empty, too large and the budget runs
-out partway through the model, leaving the last layers entirely to the
-host. With no `PHI_GGML_FRACTION` set and a `-m FILE` in the command,
-this script computes it (`budget / bytes`, capped at one card's worth of
-rows) and says so. For the 27B and two cards that is 0.251, half the
-model resident.
+Each card keeps the same fraction of every weight matrix's rows, and what
+that should be is the card's budget over the weights it could be given:
+too small and the card's memory sits empty, too large and the budget
+runs out partway through the model, leaving the last layers entirely to
+the host. This script used to compute it from the model file's size,
+which on the 27B left the cards at 3.48 GB of 4.4, because a fifth of the
+file never reaches the backend (types the cards take no kernel for, and
+Q4_K that llama.cpp repacks for its own CPU kernels). The backend now
+counts the weights it is offered and sizes the share itself at the first
+multiply (`host/crates/phi-ggml/src/lib.md`): 31.2 percent and 4.23 GB
+per card on the 27B. The host always keeps a part of every matrix at
+least the size of a card's, or the backend could not time the cards
+against it.
+Because every process starts by freeing the cards, run one at a time.
 
 Workers this script starts are given `-e 0` (the seamless path's 512 MiB
 page pool left to the multiplies) and `PHI_VPU_HUGEPAGES=2400`, both for

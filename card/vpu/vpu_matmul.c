@@ -58,6 +58,8 @@ void phi_swiglu(const float *g, const float *u, float *h, long count, const floa
 void phi_swiglu16(const float *g, const float *u, uint16_t *h, long count, const float *consts);
 void phi_swiglu16_edge(const float *g, const float *u, uint16_t *h, unsigned mask, const float *consts);
 void phi_swiglu_edge(const float *g, const float *u, float *h, unsigned mask, const float *consts);
+/* count 64-byte vectors from src to dst, whole-vector stores (kernelgen/copy.md) */
+void phi_copy64(void *dst, const void *src, long count);
 void phi_bench(long kind, const void *buf, long count);
 
 /* A mapping: huge pages when the card had some left, else 4 KiB pages;
@@ -79,6 +81,78 @@ static struct { struct mapping m; size_t cap; } g_groups, g_order;
 /* Every buffer carries this much past its data: the unaligned load pairs
  * of the quantized kernels read up to 63 bytes beyond a block. */
 #define SLACK 64
+
+/* Transfers up to MAP_POOL_MAX go through the worker's mapping of the window in whole
+ * 64-byte vectors instead of the block device (kernelgen/copy.md). The
+ * mapping is uncached, so a 64-byte store is one transaction across the
+ * link: 550 MB/s against 73 for memcpy, and a 16 KiB result in 29 us
+ * against the block device's 94 us back to back, which is its best case
+ * and not the one generation sees (a request after an idle gap costs
+ * about 85 us more; the stack's docs/results/2026-09-22-block-pipeline.md).
+ * One core's loads are round trips it waits for, 87 MB/s, but the pool
+ * issues 57 at once (copy_pool): 2.6 GB/s at 1 MiB on card 0. Uncached
+ * stores are strongly ordered, and the pool's done count is a locked add,
+ * so the reply the worker writes after this cannot be seen before the data.
+ * `-m 0` on the worker sends everything through the block device. */
+static int g_map_small = 1;
+void vpu_matmul_map_small(int on) { g_map_small = on; }
+
+/* A copy split across the pool, each thread its own run of 64-byte
+ * vectors. Through the uncached mapping a load is a round trip the core
+ * waits for, so one core copying is one load in flight; 57 cores are 57. */
+struct copy_job { unsigned char *dst; const unsigned char *src; size_t n64; };
+
+static void copy_slice(void *arg, int slice, int nslices)
+{
+    const struct copy_job *c = arg;
+    size_t a = c->n64 * (size_t)slice / (size_t)nslices, b = c->n64 * (size_t)(slice + 1) / (size_t)nslices;
+    if (b > a) phi_copy64(c->dst + a * 64, c->src + a * 64, (long)(b - a));
+}
+
+static void copy_pool(void *dst, const void *src, size_t n64, int threads)
+{
+    struct copy_job c = { dst, src, n64 };
+    vpu_pool_map(copy_slice, &c, threads);
+}
+
+/* How the data of a request crosses, by size (`matmul-check --probe`,
+ * both cards, 2026-09-23): through the mapping split across the pool up to
+ * MAP_POOL_MAX, where the block device's DMA catches up (card 0 at 4 MiB:
+ * 1515 us against 1425; at 1 MiB 404 against 441, and the block device's
+ * figures are its best case, back to back, with no poller to wake); the
+ * smallest on one thread, below what a dispatch of the pool costs (a
+ * 16 KiB push in 29 us on one thread, 46 on the pool). */
+#define MAP_POOL_MAX (2u << 20)
+#define PULL_ONE_MAX (4u << 10)
+#define PUSH_ONE_MAX (16u << 10)
+static int map_threads(int threads)
+{
+    int max = vpu_pool_threads() + 1;
+    if (max > 58) max = 58;
+    return threads < 1 ? 1 : threads > max ? max : threads;
+}
+
+/* `len` bytes (not rounded) of the window at `off` into `dst`, which has
+ * room for them rounded up to a block. */
+static int pull_data(void *dst, size_t len, uint64_t off, int threads)
+{
+    size_t n64 = (len + 63) / 64;
+    void *win = (g_map_small && len <= MAP_POOL_MAX) ? vpu_window(off, n64 * 64) : NULL;
+    if (!win) return vpu_pull(dst, len, off);
+    if (len <= PULL_ONE_MAX) phi_copy64(dst, win, (long)n64);
+    else copy_pool(dst, win, n64, map_threads(threads));
+    return 0;
+}
+
+static int push_data(const void *src, size_t len, uint64_t off, int threads)
+{
+    size_t n64 = (len + 63) / 64;
+    void *win = (g_map_small && len <= MAP_POOL_MAX) ? vpu_window(off, n64 * 64) : NULL;
+    if (!win) return vpu_push(src, len, off);
+    if (len <= PUSH_ONE_MAX) phi_copy64(win, src, (long)n64);
+    else copy_pool(win, src, n64, map_threads(threads));
+    return 0;
+}
 
 static uint64_t now_ns(void)
 {
@@ -741,7 +815,7 @@ static int ffn_run(volatile unsigned char *ctrl, int threads, int verbose,
     if (grow(&g_b, blen) != 0 || grow(&g_d, dlen) != 0 || grow(&g_fg, glen) != 0 || grow(&g_fu, glen) != 0 ||
         grow(&g_fh, hlen) != 0 || grow(&g_groups, 3 * ff.n * sizeof(struct group)) != 0)
         return VPU_E_ALLOC;
-    if (vpu_pull(g_b.m.p, blen, ff.b_off) != 0) return VPU_E_PULL;
+    if (pull_data(g_b.m.p, ff.n * ff.nb_b, ff.b_off, threads) != 0) return VPU_E_PULL;
     *pull_ns = now_ns() - t0;
 
     uint32_t chunk = (uint32_t)ff.chunk;
@@ -805,7 +879,7 @@ static int ffn_run(volatile unsigned char *ctrl, int threads, int verbose,
     *compute_ns = c2 - c0;
 
     uint64_t p0 = now_ns();
-    if (vpu_push(g_d.m.p, dlen, ff.d_off) != 0) return VPU_E_PUSH;
+    if (push_data(g_d.m.p, ff.n * ff.m_out * 4, ff.d_off, threads) != 0) return VPU_E_PUSH;
     *push_ns = now_ns() - p0;
     if (verbose) {
         printf("ffn: %llu rows of gate (%s) and up (%s) against %llu, then down %llux%llu (%s), n %llu, %d threads: "
@@ -978,6 +1052,40 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
                 b0 = now_ns();
                 for (uint64_t r = 0; r < n; r++) memcpy(win, g_d.m.p, bytes);
                 times[17] = now_ns() - b0;
+                /* the same writes as whole 64-byte vector stores: on an
+                 * uncached mapping each store is one transaction, and
+                 * memcpy on this core stores 8 bytes at a time (copy.md) */
+                static const uint64_t sizes[3] = { 4096, 16384, 65536 };
+                for (int s = 0; s < 3; s++) {
+                    b0 = now_ns();
+                    for (uint64_t r = 0; r < n; r++) phi_copy64(win, g_a.m.p, (long)(sizes[s] / 64));
+                    times[19 + s] = now_ns() - b0;
+                }
+                /* and the reads, as 64-byte loads from the mapping */
+                for (int s = 0; s < 3; s++) {
+                    b0 = now_ns();
+                    for (uint64_t r = 0; r < n; r++) phi_copy64(g_a.m.p, win, (long)(sizes[s] / 64));
+                    times[22 + s] = now_ns() - b0;
+                }
+                /* split across the pool, and the block device, at the sizes a
+                 * prompt moves as well (per transfer, scaled to 100 rounds) */
+                void *big = vpu_window(mm.b_off, 4u << 20);
+                static const uint64_t psz[4] = { 16384, 65536, 1u << 20, 4u << 20 };
+                for (int s = 0; big && s < 4; s++) {
+                    uint64_t rounds = psz[s] <= 65536 ? 100 : 10;
+                    b0 = now_ns();
+                    for (uint64_t r = 0; r < rounds; r++) copy_pool(g_a.m.p, big, psz[s] / 64, threads);
+                    times[25 + s] = (now_ns() - b0) * 100 / rounds;
+                    b0 = now_ns();
+                    for (uint64_t r = 0; r < rounds; r++) copy_pool(big, g_a.m.p, psz[s] / 64, threads);
+                    times[29 + s] = (now_ns() - b0) * 100 / rounds;
+                    b0 = now_ns();
+                    for (uint64_t r = 0; r < rounds; r++) vpu_pull(g_a.m.p, psz[s], mm.b_off);
+                    times[33 + s] = (now_ns() - b0) * 100 / rounds;
+                    b0 = now_ns();
+                    for (uint64_t r = 0; r < rounds; r++) vpu_push(g_a.m.p, psz[s], mm.b_off);
+                    times[37 + s] = (now_ns() - b0) * 100 / rounds;
+                }
             }
         }
         /* What one dispatch across `threads` threads costs with nothing to
@@ -1011,7 +1119,7 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
     size_t brows = mixture ? mm.b_rows * mm.n_tokens : mm.n;
     size_t blen = blocks(mm.ids_bytes + brows * mm.nb_b), dlen = blocks(mm.n * mm.m * 4);
     if (grow(&g_b, blen) != 0 || grow(&g_d, dlen) != 0) return VPU_E_ALLOC;
-    if (vpu_pull(g_b.m.p, blen, mm.b_off) != 0) return VPU_E_PULL;
+    if (pull_data(g_b.m.p, mm.ids_bytes + brows * mm.nb_b, mm.b_off, threads) != 0) return VPU_E_PULL;
     *pull_ns = now_ns() - t0;
 
     uint32_t chunk = (uint32_t)mm.chunk;
@@ -1052,7 +1160,7 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
     *compute_ns = now_ns() - c0;
 
     uint64_t p0 = now_ns();
-    if (vpu_push(g_d.m.p, dlen, mm.d_off) != 0) return VPU_E_PUSH;
+    if (push_data(g_d.m.p, mm.n * mm.m * 4, mm.d_off, threads) != 0) return VPU_E_PUSH;
     *push_ns = now_ns() - p0;
     if (verbose) {
         static const char *names[VPU_MM_TYPES] = { "f32", "f16", "q4_K", "q5_K", "q6_K", "q8_0", "iq4_xs" };

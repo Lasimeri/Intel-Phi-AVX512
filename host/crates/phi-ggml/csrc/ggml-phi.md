@@ -110,3 +110,29 @@ intermediates have no other reader, and the fused path is correct there
 (token for token on both models); it also measured neutral on both, so
 the default gives nothing up. Set `PHI_GGML_FFN=1` to use it, and not
 with such a program.
+
+## The host's rows have a threadpool of their own
+
+Without one, ggml's CPU backend builds a disposable pool inside every
+`graph_compute` and joins it at the end (`ggml/src/ggml-cpu/ggml-cpu.c`,
+`ggml_graph_compute`), and this backend computes about 419 small graphs
+a token. `host_backend` now attaches a persistent one
+(`ggml_threadpool_new` and `ggml_backend_cpu_set_threadpool`, through the
+CPU backend's proc addresses) whose workers do not spin between graphs
+(`PHI_GGML_HOST_POLL`, 0), since the program's own threads run between
+them. Measured neutral at every poll level on the 27B (1.66 to 1.67 at
+generation, `PHI_GGML_HOST_POOL=0` included): thread creation on this
+host is cheap, so this is waste removed rather than time gained.
+
+## What the cards are offered, and what they cannot read
+
+`phi_supports_mul_mat` and `phi_supports_mul_mat_id` decline a weight in
+a buffer that is not a host buffer (`weight_readable`): llama.cpp's CPU
+backend repacks some quantized types into its own interleaved layout
+(on this AVX2 host every Q4_K matrix whose rows are a multiple of 8), and
+this backend reads ggml's standard layout only. The scheduler checks
+buffers before placing a node too; declining here is what keeps such a
+weight out of the count the share is sized by. Every weight a multiply
+is accepted for is noted (`phi_ggml_note_weight`) with its whole size,
+and the Rust side sizes the cards' share from the total at the first
+multiply (`../src/lib.md`).

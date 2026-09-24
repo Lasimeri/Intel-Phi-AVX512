@@ -17,7 +17,10 @@ use std::time::{Duration, Instant};
 use phi_vpu::matmul::{self, A_MAX, B_MAX, D_MAX, OFF_A, OFF_B, OFF_D};
 use phi_vpu::proto::*;
 
-use super::{doorbell, have_f16c, pp_feed, put_rows, rep_time, ring, say, wait, Card, Ctx, Judged, Mixture, B_PAD, CTX, F16_MAX};
+use super::{
+    copy_window, doorbell, have_f16c, pp_feed, put_rows, rep_time, ring, say, settle_fraction, wait, Card, Ctx, Judged, Mixture, B_PAD,
+    CTX, F16_MAX,
+};
 
 /// The block as the C glue describes it: ggml's shapes, gate and up
 /// `inter` rows of `k`, down `m_out` rows of `inter`, the activations `n`
@@ -271,6 +274,7 @@ pub unsafe extern "C" fn phi_ggml_ffn_begin(args: *const FfnArgs) -> i64 {
         return -1;
     };
     ctx.calls += 1;
+    settle_fraction(ctx);
     ctx.t_begin = Instant::now();
     if a.n == 0 {
         return DECLINE;
@@ -342,12 +346,16 @@ pub unsafe extern "C" fn phi_ggml_ffn_begin(args: *const FfnArgs) -> i64 {
         share: on_cards as f64 / a.inter as f64,
     });
     let h_type = u32::from(ctx.ffn_h16);
+    let first = work[0].0;
     for (w_i, (ci, run, rows, [g, u, d])) in work.into_iter().enumerate() {
-        let card = &mut ctx.cards[ci];
-        if !(half && w_i == 0) {
+        // Prepared once, in the first card's window; the others copy it.
+        if w_i > 0 {
+            copy_window(&ctx.cards, first, ci, OFF_B, a.n * card_nb_b);
+        } else if !half {
             // SAFETY: as above.
-            unsafe { put_rows(card, a.x, a.n, a.k, a.nb_x, &plain, OFF_B, card_nb_b, half) };
+            unsafe { put_rows(&ctx.cards[ci], a.x, a.n, a.k, a.nb_x, &plain, OFF_B, card_nb_b, false) };
         }
+        let card = &mut ctx.cards[ci];
         let ff = Ffn {
             gate_id: g,
             up_id: u,

@@ -8,13 +8,17 @@
  *
  * Data moves through the block device rather than the mapping, because
  * the mapping is uncached and streams at 50 MB/s while the DMA engine
- * behind the block device does 1.2 GB/s. See vpu_proto.md.
+ * behind the block device does 1.2 GB/s. See vpu_proto.md. The exception
+ * is the matrix multiplies' small transfers, which go through the mapping
+ * in whole 64-byte vectors, one transaction each (vpu_matmul.c, -m).
  *
- *   phi-vpu-worker [-v] [-s MS] [-i US] [threads]
+ *   phi-vpu-worker [-v] [-s MS] [-i US] [-e N] [-m 0|1] [threads]
  *     threads 1 to 228 (57); spin MS after a job before parking (200);
  *     -e N huge pages the seamless path pools (256; 0 leaves them all to
  *     the matrix multiplies, which is what a ggml backend run wants);
- *     once parked, poll the doorbell every US microseconds (500)
+ *     once parked, poll the doorbell every US microseconds (500);
+ *     -m 0 sends the matrix multiplies' small transfers through the
+ *     block device too (1, the default: through the mapping)
  *
  * The threads are created once. Creating one costs about 0.58 ms on
  * this card, and the first version of this worker created and joined
@@ -338,6 +342,7 @@ int main(int argc, char **argv)
         else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) spin_ns = (uint64_t)atol(argv[++i]) * 1000000ULL;
         else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) idle_us = atol(argv[++i]);
         else if (strcmp(argv[i], "-e") == 0 && i + 1 < argc) vpu_exec_pool(atoi(argv[++i]));
+        else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) vpu_matmul_map_small(atoi(argv[++i]));
         else max_threads = atoi(argv[i]);
     }
     if (max_threads < 1) max_threads = 1;

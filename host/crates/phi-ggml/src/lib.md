@@ -29,8 +29,10 @@ slower than the CPU alone ("Two things decided before any measurement"
 below: 798 tokens per second of prompt processing against the CPU's
 768, where the first version of this managed 11.3 against 19.4).
 
-Shares: `PHI_GGML_FRACTION` of every weight matrix's rows per
-card, its rows a multiple of 64 so the host's remainder keeps ggml's
+Shares: a fraction of every weight matrix's rows per card, sized here to
+fill the cards' budget (below, "The share is sized from what is offered";
+`PHI_GGML_FRACTION` fixes it instead), the card's rows a multiple of 64
+so the host's remainder keeps ggml's
 fast paths (measured 0.43 against 7.7 ms for an odd count), until a card
 has `PHI_GGML_CARD_BYTES` (4.4 GB) resident or refuses an upload, after
 which the card keeps nothing more of later tensors. At eight activation
@@ -233,3 +235,65 @@ input; `csrc/ggml-phi.md`). Unset, SwiGLU is not taken and the graph
 splits as it did before. `PHI_GGML_FFN_H16=1` keeps the intermediate as
 float16 on the card (faster down kernels, and it overflows past 65504,
 so only where the activations are known to be bounded).
+
+## Two small savings (2026-09-23 night)
+
+The activations of a multiply are the same for every card, so they are
+prepared once, in the first card's window (converted to float16 there),
+and copied to the others (`copy_window`), rather than converted once per
+card. And a plain multiply whose largest possible card part, every
+card's `fraction` of its rows, cannot reach `min_bytes` is never given
+to the cards, so its rows are no longer uploaded on first sight either:
+the budget goes to tensors that will use it. Both measured neutral on
+the 27B as speed; the second matters for what the cards can hold
+(`docs/results/2026-09-23-redundancy-and-transport.md`).
+
+## The share is sized from what is offered (2026-09-23 night)
+
+Each card keeps the same fraction of every weight matrix, so the
+fraction that fills a card is its budget over the bytes of every weight
+it could be given. `scripts/phi-ggml.sh` used to take that from the model
+file's size, and on Qwen3.8-27B UD-Q4_K_XL the cards filled to 3.48 GB
+of 4.4: a fifth of the file never reaches this backend. Some of it is
+types the cards have no kernel for, and 2.3 GB is Q4_K that llama.cpp's
+CPU backend repacks into its own interleaved layout on this AVX2 host
+(`ggml/src/ggml-cpu/repack.cpp`), in a buffer type that is not a host
+buffer. Nothing outside the process can know which, since it depends on
+the host's CPU and the program's own placement.
+
+So the backend counts. The glue notes every weight whose multiply it
+accepts (`phi_ggml_note_weight`, from `supports_op`, which the scheduler
+calls for every multiply of a graph before computing any of it) and
+declines outright a weight in a buffer it cannot read as ggml lays it
+out (`weight_readable`), so repacked weights are neither taken nor
+counted. At the first multiply `settle_fraction` sets the share to 97
+percent of the smallest budget over that total (3 percent kept back for
+rows rounding up to 64 and for the output matrix, which comes last),
+never more than an equal split between the host and the cards
+(`share_cap`, a third each with two cards). On the 27B that is 13.7 GB
+offered, a share of 31.2 percent and 4.23 GB per card. On the 35B-A3B,
+whose Q4_K experts are repacked, it is 5.1 GB offered and the cap. What
+a full card is worth is in
+`docs/results/2026-09-23-redundancy-and-transport.md`.
+
+The cap was first an equal split between the cards, half each on two,
+which leaves the host no rows at all, and the one-token judgement
+(`Split::avoid`) cannot work without them: it takes the host's time
+alone to be its part's time over its part's share, and with no part
+that is the overhead of an empty multiply, so every tensor looks slower
+with the cards and is taken off them. The 35B-A3B reached the cap and
+generated 8.30 tokens a second against 9.05 at 0.203. `PHI_GGML_FRACTION`
+is held to the same cap, with a message when it is set above it.
+
+## Each process starts with empty cards
+
+A card's uploads outlived the process that made them: nothing freed them
+at exit (`phi_ggml_free_all` existed and nothing called it), and a new
+process replaced them only id by id. Running the 27B and then the
+35B-A3B left 4.2 GB of the first on each card under the second's
+uploads, the workers ran out of huge pages, took ordinary memory for the
+rest, and both cards' kernels killed them for want of memory. `open` now
+frees everything on every card before anything is uploaded, which also
+covers a process that crashed. It follows that one process at a time
+uses the cards: a second one started while the first runs frees the
+first's slices under it.

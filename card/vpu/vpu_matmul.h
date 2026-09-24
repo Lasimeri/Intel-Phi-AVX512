@@ -92,6 +92,10 @@ _Static_assert(sizeof(struct vpu_ffn) == 192, "feed-forward descriptor layout is
 
 /* Run one request of the three kinds; fills the reply's timings and the
  * number of slices run. Returns a VPU_OK / VPU_E_* status. */
+/* Small transfers through the mapped window (1, the default) or all
+ * through the block device (0): the worker's -m. */
+void vpu_matmul_map_small(int on);
+
 int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, int verbose,
                    uint64_t *compute_ns, uint64_t *pull_ns, uint64_t *push_ns, int *live);
 

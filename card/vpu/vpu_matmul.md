@@ -234,3 +234,36 @@ which is the remaining gap at n 1 and 8.
 `phi_swiglu` over whole vectors, 1 and 2 run `swiglu_range` in float16
 and float32 over abutting ranges that start and end inside vectors,
 leaving the lanes outside them as 0xdead, so a mask off by one shows.
+
+## How a request's data crosses (2026-09-23 night)
+
+A multiply at one token moves 5 to 35 KB each way, and a request used to
+move it with one `pread` and one `pwrite` on the block device. Those are
+round trips through the card's block layer and the host's daemon, and at
+generation, where requests come every millisecond or so with gaps
+between them, each cost 0.2 to 0.35 ms (the stack's block-pipeline note:
+an 85 us floor back to back, about 85 more after an idle gap). On the
+27B, per token, the slower card spent about 70 ms pulling and 97 ms
+pushing against 195 ms computing, and the host waited 65 ms for it.
+
+`pull_data` and `push_data` now move the data through the worker's
+mapping of the window instead, in whole 64-byte vectors
+(`kernelgen/copy.md`):
+
+| transfer | how |
+| --- | --- |
+| a pull of 4 KiB or less | one thread's 64-byte loads |
+| a push of 16 KiB or less | one thread's 64-byte stores (29 us for 16 KiB) |
+| either, up to 2 MiB | split across the pool (`copy_pool`): one load in flight per core, 2.6 GB/s at 1 MiB on card 0 |
+| larger | the block device, whose DMA catches up by 4 MiB |
+
+The thresholds are the probe's crossovers, on both cards
+(`matmul-check --probe`: the pool against the block device at 16 KiB,
+64 KiB, 1 MiB and 4 MiB). The worker's `-m 0` sends everything through
+the block device again. Every format, mixture and feed-forward case of
+`matmul-check` passes through it on both cards.
+
+On the 27B at one token: the host's wait for the cards fell from 64 to
+12 ms per token, the slower card's pulls from about 70 ms to 16 and its
+pushes from 97 to 7, and generation went from 1.66 to 1.83 tokens per
+second (`docs/results/2026-09-23-redundancy-and-transport.md`).

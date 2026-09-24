@@ -28,3 +28,7 @@ assembler and shared constant block, whose `Asm::i` and `Asm::t` are
 place only when the generator succeeded: a redirect straight into
 `card/vpu/vpu_matmul_kernel.S` truncates it when the build fails, and the
 card's next build then fails on every kernel symbol (2026-09-23).
+
+`copy.rs` emits `phi_copy64`, a copy in whole 64-byte vectors, which the
+matrix-multiply service moves its data through the card's uncached
+mapping of the window with (copy.md).

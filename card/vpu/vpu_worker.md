@@ -6,7 +6,7 @@ set ahead of time by `host/crates/avx512-xlate`, across the vector units,
 and writes the result back where the host can read it.
 
 ```
-phi-vpu-worker [-v] [-s MS] [-i US] [-e N] [threads]
+phi-vpu-worker [-v] [-s MS] [-i US] [-e N] [-m 0|1] [threads]
 ```
 
 `threads` is the most the worker will spread one request across (1 to
@@ -103,8 +103,9 @@ thread's results are visible before its acknowledgement.
 
 ## Moving the data
 
-Bulk data goes through `/dev/phiblk1`, the DMA path, not through the
-`/dev/phihost` mapping, and that holds at every size. The worker maps
+Bulk data goes through `/dev/phiblk1`, the DMA path. The matrix
+multiplies' transfers up to 2 MiB do not (below, "Corrected the same
+night"). The worker maps
 the whole window as well (`WIN_BYTES`, `vpu_window(off, len)`, which
 returns NULL when the mapping failed and the block device then serves
 everything), and the two were measured against each other at the size a
@@ -120,6 +121,16 @@ The mapping has no per-request cost but every access is a link round
 trip, and even at 16 KiB that loses by an order of magnitude reading and
 by half writing. It is kept for the measurement and for anything that
 wants a word or two of the window without a request.
+
+**Corrected the same night.** Those figures measured `memcpy`, which on
+this core moves 8 bytes at a time, and one thread, which has one load in
+flight. The mapping is uncached, so the width of an access is the width
+of its transaction: 64-byte vector stores write 16 KiB in 29 us (557
+MB/s), and the same copy split across the pool, one load in flight per
+core, reads and writes at 2.6 GB/s by 1 MiB, ahead of the block device
+(`kernelgen/copy.md`, `vpu_matmul.md`). The matrix multiplies now move
+everything up to 2 MiB that way; `-m 0` puts them back on the block
+device.
 
 Two rules follow from opening the block device with `O_DIRECT`, which is
 required because the host changes this memory behind the card's back and

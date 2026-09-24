@@ -74,6 +74,19 @@ struct Ctx {
     cards: Vec<Card>,
     splits: HashMap<usize, Split>,
     fraction: f64,
+    /// Whether `fraction` is to be sized here (`PHI_GGML_FRACTION` unset),
+    /// whether it has been, and the weights the scheduler has offered this
+    /// backend so far, by address: what the cards could hold. The
+    /// scheduler asks about every multiply of a graph before it computes
+    /// any (`supports_op`, csrc/ggml-phi.c), so at the first multiply this
+    /// is the model, less what never comes here: tensors of types the
+    /// cards take no kernel for, and tensors llama.cpp's CPU backend has
+    /// repacked for itself (Q4_K on this host, 2.3 GB of the 27B), which
+    /// nothing outside can see. Sizing the share by the file instead left
+    /// the 27B's cards at 3.48 GB of 4.4.
+    fraction_auto: bool,
+    fraction_settled: bool,
+    offered: HashMap<usize, u64>,
     /// The weights a multiply must take off the host before a card is
     /// worth its round trip: 0.45 ms at a host rate no worse than 10
     /// GB/s is 4.5 MB, and this is the conservative end of that, so
@@ -186,7 +199,9 @@ pub extern "C" fn phi_ggml_open() -> i32 {
     }
     let threads = env_or("PHI_GGML_THREADS", 57u32);
     let budget = env_or("PHI_GGML_CARD_BYTES", 4_400_000_000u64);
-    let fraction = env_or("PHI_GGML_FRACTION", 0.2f64).clamp(0.0, 1.0);
+    // Set, the share is that; unset, it is sized at the first multiply from
+    // the weights the scheduler offered (`settle_fraction`).
+    let fixed = std::env::var("PHI_GGML_FRACTION").ok().and_then(|s| s.parse::<f64>().ok());
     let pp_share = env_or("PHI_GGML_PP_SHARE", 0.75f64).clamp(0.0, 1.0);
     let verbose = std::env::var_os("PHI_GGML_VERBOSE").is_some();
     let want: Vec<usize> = match std::env::var("PHI_GGML_CARDS") {
@@ -204,11 +219,34 @@ pub extern "C" fn phi_ggml_open() -> i32 {
         say("no card is up with a worker polling; nothing to share the work with");
         return -1;
     }
+    // A card starts every process empty. Its uploads outlive the process
+    // that made them (nothing frees them at exit, and a crash could not),
+    // and a new process's replace them only id by id: a 27B run left 4.2 GB
+    // on each card, a 35B-A3B run's uploads went on top, the worker ran out
+    // of huge pages, took ordinary memory for the rest, and the card's
+    // kernel killed it for want of memory (2026-09-23, both cards).
+    for card in cards.iter_mut() {
+        let seq = ring(card, K_FREE, &Matmul::default());
+        if let Err(e) = wait(card, seq, Duration::from_secs(30)) {
+            say(&format!("could not clear card {}: {e}", card.index));
+        }
+    }
+    // A fixed share is held to the same cap as a sized one (`share_cap`).
+    let cap = share_cap(cards.len());
+    if fixed.is_some_and(|f| f > cap) {
+        say(&format!(
+            "PHI_GGML_FRACTION above {cap:.3} would leave the host too few rows to judge the cards by: {cap:.3} it is"
+        ));
+    }
+    let fraction = fixed.unwrap_or(0.2).clamp(0.0, cap);
     let names: Vec<String> = cards.iter().map(|c| c.index.to_string()).collect();
+    let share = match fixed {
+        Some(_) => format!("each keeps {:.0}% of every weight matrix's rows", fraction * 100.0),
+        None => "each keeps a share of every weight matrix's rows sized to fill it".to_string(),
+    };
     say(&format!(
-        "cards {}: each keeps {:.0}% of every weight matrix's rows (up to {:.1} GB) and multiplies them on {threads} threads while the host does the rest",
+        "cards {}: {share} (up to {:.1} GB) and multiplies them on {threads} threads while the host does the rest",
         names.join(", "),
-        fraction * 100.0,
         budget as f64 / 1e9
     ));
     let n = cards.len() as i32;
@@ -216,6 +254,9 @@ pub extern "C" fn phi_ggml_open() -> i32 {
         cards,
         splits: HashMap::new(),
         fraction,
+        fraction_auto: fixed.is_none(),
+        fraction_settled: false,
+        offered: HashMap::new(),
         min_bytes: env_or("PHI_GGML_MIN_BYTES", 4_000_000u64),
         too_small: 0,
         judged: None,
@@ -336,6 +377,16 @@ unsafe fn put_rows(card: &Card, b: *const u8, b_rows: u64, k: u64, nb_b: u64, mi
     most
 }
 
+/// `len` bytes at `off` of card `from`'s window into card `to`'s: the
+/// activations are the same for every card, so they are prepared once.
+fn copy_window(cards: &[Card], from: usize, to: usize, off: u64, len: u64) {
+    let src = cards[from].w.ptr(off, len as usize) as *const u8;
+    let dst = cards[to].w.ptr(off, len as usize);
+    // SAFETY: two cards' windows are separate mappings of separate files,
+    // each at least WINDOW_LEN long, which B_MAX past OFF_B is within.
+    unsafe { std::ptr::copy_nonoverlapping(src, dst, len as usize) };
+}
+
 /// The largest finite half. A value past it converts to infinity, and the
 /// card would multiply by that (found by the fused feed-forward's check,
 /// 2026-09-23: `phi-vpu matmul-check`, `check_ffn`).
@@ -359,6 +410,61 @@ pub extern "C" fn phi_ggml_supports(a_type: u32, m: u64, k: u64, nb_a: u64, nb_b
         return 0;
     }
     1
+}
+
+/// A weight tensor the glue has just accepted a multiply of (`bytes`, the
+/// whole tensor), noted for sizing the share (`Ctx::offered`). Calls
+/// before the backend is open, or after the share is settled, are ignored:
+/// llama.cpp asks about operations while it loads the model too, and a
+/// second model (a draft) arriving later is fitted into what budget is
+/// left, as any tensor past the budget is.
+#[no_mangle]
+pub extern "C" fn phi_ggml_note_weight(data: *const u8, bytes: u64) {
+    if data.is_null() {
+        return;
+    }
+    let mut guard = CTX.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ctx) = guard.as_mut() {
+        if !ctx.fraction_settled {
+            ctx.offered.insert(data as usize, bytes);
+        }
+    }
+}
+
+/// The most of every matrix a card may keep: an equal split between the
+/// host and the cards. The host must keep rows of its own, because the
+/// one-token judgement (`Split::avoid`) knows the host's time alone only
+/// as its part's time over its part's share; with no part, that is the
+/// overhead of an empty multiply, every tensor looks slower with the
+/// cards, and they are taken off them. Capped at an equal split between
+/// the cards (half each on two), the 35B-A3B generated 8.30 tokens a
+/// second against 9.05 at 0.203 (`docs/results/2026-09-23-redundancy-and-transport.md`).
+fn share_cap(ncards: usize) -> f64 {
+    1.0 / (ncards as f64 + 1.0)
+}
+
+/// Size the share at the first multiply, from the weights offered: each
+/// card keeps `fraction` of every one of them, so the share that fills the
+/// smallest budget is that budget over their total, less 3 percent
+/// because a card's rows round up to 64 and the output matrix, which
+/// comes last, must still fit. Never more than an equal split with the
+/// host would leave it (`share_cap`).
+fn settle_fraction(ctx: &mut Ctx) {
+    if ctx.fraction_settled {
+        return;
+    }
+    ctx.fraction_settled = true;
+    let total: u64 = ctx.offered.values().sum();
+    if !ctx.fraction_auto || total == 0 {
+        return;
+    }
+    let budget = ctx.cards.iter().map(|c| c.budget).min().unwrap_or(0);
+    ctx.fraction = (0.97 * budget as f64 / total as f64).min(share_cap(ctx.cards.len()));
+    say(&format!(
+        "{:.1} GB of weights offered to the cards: each keeps {:.1}% of every weight matrix's rows",
+        total as f64 / 1e9,
+        ctx.fraction * 100.0
+    ));
 }
 
 /// Ring a card's doorbell for the descriptor `mm` without waiting.
@@ -622,6 +728,7 @@ unsafe fn begin(a: *const u8, a_type: u32, m: u64, k: u64, nb_a: u64, keep: i32,
         return -1;
     };
     ctx.calls += 1;
+    settle_fraction(ctx);
     ctx.t_begin = Instant::now();
     if n == 0 {
         // llama-server asks for the logits of no tokens sometimes: nothing to compute.
@@ -653,8 +760,23 @@ unsafe fn begin(a: *const u8, a_type: u32, m: u64, k: u64, nb_a: u64, keep: i32,
         return 1;
     }
     if !ctx.splits.contains_key(&key) {
-        // SAFETY: the caller's contract.
-        let split = unsafe { plan(ctx, a, a_type, m, nb_a, mix.experts, mix.nb_a2) };
+        // A plain multiply whose largest possible card part, every card's
+        // `fraction` of the rows, cannot reach `min_bytes` is never given
+        // to the cards (below), so its rows are not uploaded either: the
+        // cards' budget goes to tensors that will use it. A mixture's card
+        // part grows with its columns, so it is planned as always.
+        let most = (((m as f64 * ctx.fraction).round() as u64) * ctx.cards.len() as u64).min(m);
+        let split = if !mixture && most * nb_a < ctx.min_bytes {
+            Split {
+                r0: m,
+                cards: Vec::new(),
+                bad: [0; 2],
+                avoid: [false; 2],
+            }
+        } else {
+            // SAFETY: the caller's contract.
+            unsafe { plan(ctx, a, a_type, m, nb_a, mix.experts, mix.nb_a2) }
+        };
         ctx.splits.insert(key, split);
     }
     // A mixture with more columns than experts used to go to the host
@@ -748,7 +870,14 @@ unsafe fn begin(a: *const u8, a_type: u32, m: u64, k: u64, nb_a: u64, keep: i32,
         class,
         share: on_cards as f64 / m as f64,
     });
+    let first = work[0].0;
     for (w_i, &(ci, lo, rows)) in work.iter().enumerate() {
+        // The rows are the same for every card: the first card's window
+        // gets them from `b` (converted, when float16) and each other card's
+        // is a copy of those bytes, rather than converting them again.
+        if w_i > 0 {
+            copy_window(&ctx.cards, first, ci, OFF_B + ids_bytes, b_rows * card_nb_b);
+        }
         let card = &mut ctx.cards[ci];
         if mixture {
             // The expert each column picks, one token's after another.
@@ -764,7 +893,7 @@ unsafe fn begin(a: *const u8, a_type: u32, m: u64, k: u64, nb_a: u64, keep: i32,
             }
         }
         // The first card has its rows already when they went as float16.
-        if !(half && w_i == 0) {
+        if w_i == 0 && !half {
             // SAFETY: as above.
             unsafe { put_rows(card, b, b_rows, k, nb_b, &mix, OFF_B + ids_bytes, card_nb_b, half) };
         }

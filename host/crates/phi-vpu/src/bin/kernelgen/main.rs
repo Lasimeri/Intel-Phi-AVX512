@@ -17,6 +17,7 @@
 //!
 //! The quantized formats are in quant.rs. See main.md.
 
+mod copy;
 mod glu;
 mod quant;
 
@@ -169,6 +170,7 @@ fn main() {
     out.push_str(&kernel4("phi_dot4_f32", false));
     out.push_str(&quant::kernels());
     out.push_str(&glu::swiglu());
+    out.push_str(&copy::copy64());
     out.push_str(&quant::probe());
     out.push_str(&quant::bench());
     out.push_str("    .section .note.GNU-stack,\"\",@progbits\n");

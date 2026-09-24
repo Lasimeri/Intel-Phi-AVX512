@@ -28,10 +28,14 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ $# -gt 0 ] || { echo "usage: $0 [--card N] [--verbose] <command> [args...]" >&2; exit 2; }
-lib=
-for cand in "$root/host/target/release/libggml_phi.so" "$root/host/target/debug/libggml_phi.so"; do
-    [ -f "$cand" ] && { lib=$cand; break; }
-done
+# PHI_GGML_LIB names another build of the backend (comparing two builds
+# interleaved needs both on disk at once); else this repository's own.
+lib=${PHI_GGML_LIB:-}
+if [ -z "$lib" ]; then
+    for cand in "$root/host/target/release/libggml_phi.so" "$root/host/target/debug/libggml_phi.so"; do
+        [ -f "$cand" ] && { lib=$cand; break; }
+    done
+fi
 [ -n "$lib" ] || { echo "$0: libggml_phi.so not found; build it: (cd host && cargo build --release -p phi-ggml)" >&2; exit 1; }
 # The cards: those named, else every card with a window (card 0's is
 # /dev/shm/phi-hostmem, card N's phi-hostmem-N); each worker started when
@@ -59,27 +63,10 @@ for c in $(echo "$cards" | tr ',' ' '); do
     fi
 done
 export PHI_GGML_CARDS="$cards"
-# The share of every weight matrix each card keeps: what its budget is of
-# the model's bytes, so the cards fill up evenly over the whole model
-# rather than running out partway through it. The model is the -m
-# argument; without one (or with PHI_GGML_FRACTION set) the backend's own
-# default stands.
-if [ -z "${PHI_GGML_FRACTION:-}" ]; then
-    model=
-    prev=
-    for a in "$@"; do
-        case "$prev" in -m|--model) model=$a ;; esac
-        prev=$a
-    done
-    if [ -n "$model" ] && [ -f "$model" ]; then
-        bytes=$(stat -c %s "$model")
-        budget=${PHI_GGML_CARD_BYTES:-4400000000}
-        frac=$(awk -v b="$budget" -v m="$bytes" -v n="$ncards" \
-            'BEGIN { f = b / m; if (f > 1.0 / n) f = 1.0 / n; printf "%.3f", f }')
-        export PHI_GGML_FRACTION="$frac"
-        echo "$0: $ncards card(s), $(( bytes / 1000000000 )) GB of model: each keeps $frac of every weight matrix" >&2
-    fi
-fi
+# The share of every weight matrix each card keeps is the backend's to
+# size: it totals the weights the scheduler offers it and fills the cards'
+# budget with them at the first multiply (lib.md). PHI_GGML_FRACTION set
+# fixes it instead.
 [ -n "$verbose" ] && export PHI_GGML_VERBOSE=1
 export GGML_BACKEND_PATH="$lib"
 exec "$@"

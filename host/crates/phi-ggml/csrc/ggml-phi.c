@@ -24,6 +24,7 @@
 
 int phi_ggml_open(void);
 int phi_ggml_supports(uint32_t a_type, uint64_t m, uint64_t k, uint64_t nb_a, uint64_t nb_b, uint64_t n);
+void phi_ggml_note_weight(const uint8_t *data, uint64_t bytes);
 int64_t phi_ggml_begin(const uint8_t *a, uint32_t a_type, uint64_t m, uint64_t k, uint64_t nb_a, int keep,
                        const uint8_t *b, uint64_t n, uint64_t nb_b);
 int64_t phi_ggml_begin_id(const uint8_t *a, uint32_t a_type, uint64_t m, uint64_t k, uint64_t nb_a, int keep,
@@ -69,7 +70,8 @@ int phi_ggml_ffn_end(uint8_t *y, uint64_t nb_y);
     X(struct ggml_tensor *, add, ggml_add, (struct ggml_context *, struct ggml_tensor *, struct ggml_tensor *)) \
     X(size_t, row_size, ggml_row_size, (enum ggml_type, int64_t)) \
     X(size_t, nbytes, ggml_nbytes, (const struct ggml_tensor *)) \
-    X(bool, is_contiguous_1, ggml_is_contiguous_1, (const struct ggml_tensor *))
+    X(bool, is_contiguous_1, ggml_is_contiguous_1, (const struct ggml_tensor *)) \
+    X(void, threadpool_params_init, ggml_threadpool_params_init, (struct ggml_threadpool_params *, int))
 
 #define DECL(ret, name, sym, args) static ret (*p_##name) args;
 GGML_FNS(DECL)
@@ -103,6 +105,33 @@ static int host_backend(void)
     if (e && atoi(e) > 0) threads = atoi(e);
     ggml_backend_set_n_threads_t set = (ggml_backend_set_n_threads_t)p_reg_get_proc_address(p_dev_backend_reg(dev), "ggml_backend_set_n_threads");
     if (set) set(g_cpu, threads);
+    /* A threadpool of its own, kept. Without one, ggml's CPU backend
+     * builds a disposable pool inside every graph_compute and joins it at
+     * the end (ggml/src/ggml-cpu/ggml-cpu.c, ggml_graph_compute), and this
+     * backend computes about 419 small graphs a token. Its workers do not
+     * spin between graphs (poll 0, PHI_GGML_HOST_POLL): between them run
+     * the program's own threads, which a spinning pool would compete with,
+     * the failure mode of giving the program 16 threads. PHI_GGML_HOST_POOL=0
+     * leaves the backend without one, as it was. */
+    const char *pe = getenv("PHI_GGML_HOST_POOL");
+    if (!(pe && atoi(pe) == 0)) {
+        ggml_backend_reg_t reg = p_dev_backend_reg(dev);
+        struct ggml_threadpool *(*tp_new)(struct ggml_threadpool_params *) =
+            (struct ggml_threadpool *(*)(struct ggml_threadpool_params *))p_reg_get_proc_address(reg, "ggml_threadpool_new");
+        void (*set_tp)(ggml_backend_t, struct ggml_threadpool *) =
+            (void (*)(ggml_backend_t, struct ggml_threadpool *))p_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
+        if (tp_new && set_tp) {
+            struct ggml_threadpool_params tpp;
+            p_threadpool_params_init(&tpp, threads);
+            const char *poll = getenv("PHI_GGML_HOST_POLL");
+            tpp.poll = poll ? (uint32_t)atoi(poll) : 0;
+            struct ggml_threadpool *tp = tp_new(&tpp);
+            if (tp) {
+                set_tp(g_cpu, tp);
+                fprintf(stderr, "ggml-phi: the host's rows have a threadpool of their own (poll %u)\n", tpp.poll);
+            }
+        }
+    }
     fprintf(stderr, "ggml-phi: the host's rows run on ggml's CPU backend with %d threads\n", threads);
     fprintf(stderr, "ggml-phi: give the calling program %d threads as well (its own -t): more of them"
                     " contend with the card daemons and cost 5x at one token\n", threads);
@@ -320,6 +349,21 @@ static int card_type(enum ggml_type t)
     }
 }
 
+/* Is the weight in a buffer this backend reads as ggml lays it out? A
+ * buffer that is not a host buffer is not: llama.cpp's CPU backend repacks
+ * some quantized types into its own interleaved layout for its own kernels
+ * (on this AVX2 host every Q4_K matrix whose rows are a multiple of 8,
+ * ggml-cpu/repack.cpp), in a buffer type of its own that says it is not a
+ * host buffer. The scheduler also checks buffers before placing a node,
+ * but a multiply of such a weight must not be counted as the cards'
+ * (phi_ggml_note_weight), and it is not the cards' to take in any case. A
+ * weight with no buffer yet is being asked about while the model loads. */
+static int weight_readable(const struct ggml_tensor *w)
+{
+    if (!w->buffer) return 1;
+    return resolve() == 0 && p_buft_is_host(w->buffer->buft);
+}
+
 /* A mixture of experts: ggml's MUL_MAT_ID, which is what an MoE model's
  * feed-forward weights go through. src0 is one matrix per expert, src2
  * names the expert each column wants, and the cards keep the same rows
@@ -329,6 +373,7 @@ static bool phi_supports_mul_mat_id(const struct ggml_tensor *op)
 {
     const struct ggml_tensor *src0 = op->src[0], *src1 = op->src[1], *ids = op->src[2];
     if (!src0 || !src1 || !ids) return false;
+    if (!weight_readable(src0)) return false;
     int t = card_type(src0->type);
     if (t < 0) return false;
     if (src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) return false;
@@ -337,14 +382,17 @@ static bool phi_supports_mul_mat_id(const struct ggml_tensor *op)
     if (src0->ne[0] != src1->ne[0]) return false;
     if (!strstr(src0->name, "weight")) return false;
     /* the card holds every expert's rows: the whole tensor is the budget */
-    return phi_ggml_supports((uint32_t)t, (uint64_t)src0->ne[1], (uint64_t)src0->ne[0], src0->nb[1], src1->nb[1],
-                             (uint64_t)(src1->ne[1] * src1->ne[2])) != 0;
+    if (phi_ggml_supports((uint32_t)t, (uint64_t)src0->ne[1], (uint64_t)src0->ne[0], src0->nb[1], src1->nb[1],
+                             (uint64_t)(src1->ne[1] * src1->ne[2])) == 0) return false;
+    phi_ggml_note_weight(src0->data, (uint64_t)src0->nb[2] * (uint64_t)src0->ne[2]);
+    return true;
 }
 
 static bool phi_supports_mul_mat(const struct ggml_tensor *op)
 {
     const struct ggml_tensor *src0 = op->src[0], *src1 = op->src[1];
     if (!src0 || !src1) return false;
+    if (!weight_readable(src0)) return false;
     int t = card_type(src0->type);
     if (t < 0) return false;
     if (src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
@@ -355,7 +403,10 @@ static bool phi_supports_mul_mat(const struct ggml_tensor *op)
     if (ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD) return false;
     /* only a weight is worth splitting: anything else the host does whole */
     if (!strstr(src0->name, "weight")) return false;
-    return phi_ggml_supports((uint32_t)t, (uint64_t)src0->ne[1], (uint64_t)src0->ne[0], src0->nb[1], src1->nb[1], (uint64_t)src1->ne[1]) != 0;
+    if (phi_ggml_supports((uint32_t)t, (uint64_t)src0->ne[1], (uint64_t)src0->ne[0], src0->nb[1], src1->nb[1], (uint64_t)src1->ne[1]) == 0) return false;
+    /* what the cards could hold, for sizing their share (Rust, settle_fraction) */
+    phi_ggml_note_weight(src0->data, (uint64_t)src0->nb[1] * (uint64_t)src0->ne[1]);
+    return true;
 }
 
 /* PHI_GGML_FFN=1: take SwiGLU, so that a feed-forward block's four nodes

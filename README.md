@@ -97,13 +97,14 @@ scripts/phi-ggml.sh --verbose ...                              # each multiply, 
 ```
 
 Qwen3.8-27B (UD-Q4_K_XL, 17.6 GB) on the 5800X alone and with both
-cards, each keeping a quarter of every weight matrix, llama-bench,
-2026-09-23 (`docs/results/2026-09-23-ffn-per-request.md`):
+cards, each keeping 31 percent of every weight matrix it is offered (as
+much as its 4.4 GB holds), llama-bench, 2026-09-23 night
+(`docs/results/2026-09-23-redundancy-and-transport.md`):
 
 | | pp512 tok/s | tg32 tok/s |
 | --- | --- | --- |
-| host alone, 16 threads | 9.19, 9.04 | 1.06, 1.07 |
-| host (12 threads) and both cards | **14.45, 14.46** | **1.64, 1.65** |
+| host alone, 16 threads | 9.20, 9.19 | 1.10, 1.10 |
+| host (12 threads) and both cards | **14.53, 14.44** | **1.94, 1.94** |
 
 The model is resident (`--load-mode none`) and the host and the split
 are **interleaved**, two rounds each, because this host's own
@@ -112,11 +113,17 @@ measured now against a baseline measured an hour ago says nothing. The
 calling program gets 12 threads with the cards and 16 alone: with 16 the
 split loses five times over at generation, its threads fighting the
 card daemons (`docs/results/2026-09-23-float16-activations.md`). That is
-+58 percent at prompt processing and +55 at generation. What got it
++58 percent at prompt processing and +76 at generation. What got it
 there since the first split's 12.29 / 1.63: the activations cross as
 float16, which the card up-converts for nothing, and the share of each
 multiply the cards take at a batch is measured rather than set
-(`docs/results/2026-09-23-share-and-fusion.md`). A feed-forward block
+(`docs/results/2026-09-23-share-and-fusion.md`); then, at generation,
+each request's data crosses through the host window itself in 64-byte
+vector loads and stores split across the card's threads rather than
+through the block device, whose fixed cost per request was most of the
+cards' time (1.64 to 1.85), and the backend sizes the cards' share from
+the weights it is actually offered, which fills them (1.85 to 1.91,
+`docs/results/2026-09-23-redundancy-and-transport.md`). A feed-forward block
 can also go to each card as one request whose intermediate never leaves
 it (`PHI_GGML_FFN=1`, `host/crates/phi-ggml/src/ffn.md`): on this model
 that is neutral (14.68 and 14.59 / 1.63 and 1.61), because here the link
@@ -131,10 +138,11 @@ A mixture-of-experts model works the same way: ggml runs its expert
 weights through MUL_MAT_ID, which the cards take as well, each keeping
 the same rows of every expert, and the answers match the host's token
 for token. It is worth less so far: Qwen3.8-35B-A3B-Distill
-(Q4_K_M, 20.2 GiB, 256 experts with 8 used per token) gains 16 percent
-at generation (8.62 and 8.55 tokens per second against 7.40) and loses
-4 at pp512 (90.8 and 88.5 against 93.6 and 93.1), interleaved against
-the host alone on 2026-09-23. A
+(Q4_K_M, 20.2 GiB, 256 experts with 8 used per token) gains 26 percent
+at generation (9.53 and 9.51 tokens per second against 7.54) and loses
+about 8 at pp512 (87.98 and 88.45 against 93.39 and 97.32), interleaved
+against the host alone on 2026-09-23 night
+(`docs/results/2026-09-23-redundancy-and-transport.md`). A
 card costs about 0.45 ms to involve and an MoE layer's multiply at one
 token is a few megabytes, so the backend times
 both sides on each weight tensor and leaves with the host what the
