@@ -103,7 +103,7 @@ cards, each keeping a quarter of every weight matrix, llama-bench,
 | | pp512 tok/s | tg32 tok/s |
 | --- | --- | --- |
 | host alone, 16 threads | 9.19, 9.04 | 1.06, 1.07 |
-| host (12 threads) and both cards | **14.68, 14.59** | **1.63, 1.61** |
+| host (12 threads) and both cards | **14.45, 14.46** | **1.64, 1.65** |
 
 The model is resident (`--load-mode none`) and the host and the split
 are **interleaved**, two rounds each, because this host's own
@@ -112,14 +112,17 @@ measured now against a baseline measured an hour ago says nothing. The
 calling program gets 12 threads with the cards and 16 alone: with 16 the
 split loses five times over at generation, its threads fighting the
 card daemons (`docs/results/2026-09-23-float16-activations.md`). That is
-+60 percent at prompt processing and +53 at generation. What got it
++58 percent at prompt processing and +55 at generation. What got it
 there since the first split's 12.29 / 1.63: the activations cross as
-float16, which the card up-converts for nothing; the share of each
+float16, which the card up-converts for nothing, and the share of each
 multiply the cards take at a batch is measured rather than set
-(`docs/results/2026-09-23-share-and-fusion.md`); and a feed-forward
-block goes to each card as one request whose intermediate never leaves
-it (`host/crates/phi-ggml/src/ffn.md`), which on this model is neutral,
-because here the link is not what bounds either phase.
+(`docs/results/2026-09-23-share-and-fusion.md`). A feed-forward block
+can also go to each card as one request whose intermediate never leaves
+it (`PHI_GGML_FFN=1`, `host/crates/phi-ggml/src/ffn.md`): on this model
+that is neutral (14.68 and 14.59 / 1.63 and 1.61), because here the link
+is not what bounds either phase, and it is off by default because it
+never writes the intermediates a program's eval callback may read
+(`docs/results/2026-09-23-ffn-per-request.md`).
 
 With llama-server and the MTP draft (the earlier split, same day):
 host alone 6.93 / 2.31, host and both cards **9.56 / 2.72**.

@@ -65,8 +65,9 @@ claim the gated-linear op.
 
 ## Feed-forward blocks
 
-The glue takes `GGML_OP_GLU` when it is SwiGLU in the split form, float32
-with evenly spaced rows (`phi_supports_glu`), unless `PHI_GGML_FFN=0`.
+With `PHI_GGML_FFN=1` (off by default, below) the glue takes
+`GGML_OP_GLU` when it is SwiGLU in the split form, float32 with evenly
+spaced rows (`phi_supports_glu`).
 That is what brings a block's four nodes into one sub-graph; the dumps
 from before and after (`PHI_GGML_GRAPH`) are in the results note.
 
@@ -96,3 +97,16 @@ whose rows are shorter than their stride and start whole blocks in, was
 checked against the whole multiply for Q4_K, Q5_K, Q6_K, Q8_0 and IQ4_XS
 before any of this was written: equal within 1.1e-8 to 5.1e-8 of the
 magnitude, the summation order and nothing else (the results note).
+
+**Why it is off by default.** A fused block never writes its gate, up
+and SwiGLU tensors. `find_quad` checks that nothing else in the
+sub-graph reads them and that none is a graph output, but it sees only
+the sub-graph it is handed, and a program's eval callback can read a
+tensor from outside: llama-imatrix asks for every multiply and reads its
+activations, which for `ffn_down` is the SwiGLU, while the scheduler
+hands this backend a sub-graph ending at that multiply. Nothing visible
+here tells that call apart from inference. In ordinary inference the
+intermediates have no other reader, and the fused path is correct there
+(token for token on both models); it also measured neutral on both, so
+the default gives nothing up. Set `PHI_GGML_FFN=1` to use it, and not
+with such a program.

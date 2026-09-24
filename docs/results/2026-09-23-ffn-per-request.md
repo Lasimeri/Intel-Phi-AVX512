@@ -87,10 +87,11 @@ nodes arrive together, finds blocks by structure, and runs each as one
 request per card plus one ggml graph for the host's runs. On the 27B at
 one token, steady state, per fused block: the host's half 5.1 to 6.1
 ms, each card 3.2 to 3.8 ms (pull 0.13 to 0.24, compute 2.5 to 3.1,
-push 0.4), and the host waits 0.005 ms for them. The same block as
-three multiplies cost the host about 8.7 ms, because each multiply paid
-its own sub-graph and thread-pool wake. The generated text is identical
-to the host alone.
+push 0.4), and the host waits 0.005 ms for them: the host is the long
+pole, as it is unfused. (A comparison with "8.7 ms for the same block
+unfused" was made at this point and is withdrawn: that figure came from
+a log taken at `-t 16`, which is oversubscribed on this machine; see
+"End to end".) The generated text is identical to the host alone.
 
 38 of the 27B's 64 blocks fuse. The other 26 each hold a tensor in
 Q3_K, IQ4_NL or IQ3_S, which the cards have no kernel for; the scheduler
@@ -144,9 +145,23 @@ Where the fusion should pay, untested here because no model on this
 machine fits: a quantized model the cards hold most of, so that they,
 not the host, are the long pole and their round trips are the critical
 path; or batches large enough that the intermediate is the bulk of what
-crosses. The path is on by default because it is correct, measured
-neutral where it is not better, and declines back to the plain path
-exactly (`PHI_GGML_FFN=0` turns it off).
+crosses.
+
+## Off by default, and why
+
+The path is **opt-in** (`PHI_GGML_FFN=1`). A fused block never writes
+its gate, up and SwiGLU tensors, and the check that nothing else reads
+them (`find_quad`) can only see the sub-graph the scheduler hands the
+backend. A program's eval callback reads from outside it: llama-imatrix
+asks for every multiply and reads its activations, which for `ffn_down`
+is the SwiGLU, and would build its importance matrix from memory the
+fused path never filled. Nothing the backend can see distinguishes that
+from inference. This was found in review after the benchmarks, not by a
+failure; ordinary inference has no such reader and the fused path is
+correct there, token for token. With the path measured neutral on both
+models, off by default gives up nothing and removes the one way it can
+be wrong silently. The float16 overflow guard, which came out of the
+same work, is on regardless: it protects the plain path's activations.
 
 ## What this does not do
 

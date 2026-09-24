@@ -358,15 +358,22 @@ static bool phi_supports_mul_mat(const struct ggml_tensor *op)
     return phi_ggml_supports((uint32_t)t, (uint64_t)src0->ne[1], (uint64_t)src0->ne[0], src0->nb[1], src1->nb[1], (uint64_t)src1->ne[1]) != 0;
 }
 
-/* PHI_GGML_FFN (1): take SwiGLU, so that a feed-forward block's four
- * nodes arrive in one sub-graph and run as one request per card; 0 leaves
- * the graph as it was before. */
+/* PHI_GGML_FFN=1: take SwiGLU, so that a feed-forward block's four nodes
+ * arrive in one sub-graph and run as one request per card. Off by
+ * default, for two reasons. It measured neutral on both models here
+ * (docs/results/2026-09-23-ffn-per-request.md). And a fused block never
+ * writes its gate, up and SwiGLU tensors, which nothing in ordinary
+ * inference reads but a program's eval callback can: llama-imatrix asks
+ * for every multiply and reads its activations, which for ffn_down is the
+ * SwiGLU, and the scheduler hands this backend a sub-graph ending there,
+ * so no check here can see the reader. Unset, the graph splits exactly as
+ * it did before the fused path existed. */
 static int ffn_enabled(void)
 {
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("PHI_GGML_FFN");
-        on = !(e && atoi(e) == 0);
+        on = e && atoi(e) != 0;
     }
     return on;
 }

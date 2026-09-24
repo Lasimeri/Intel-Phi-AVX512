@@ -62,6 +62,17 @@ has no known bound (`card/vpu/vpu_matmul.md`).
 
 In `docs/results/2026-09-23-ffn-per-request.md`: the card-level rates,
 the per-block timings at one token (the host's half about 5 to 6 ms and
-each card's about 3.5 ms, against about 8.7 ms of host time for the same
-block as three multiplies), how many of the 27B's blocks fuse and why
-the rest do not, and the interleaved benchmark.
+each card's about 3.5 ms, so the host is the long pole, as it is
+unfused), how many of the 27B's blocks fuse and why the rest do not,
+and the interleaved benchmark: neutral on the 27B, and nothing to fuse
+on the 35B-A3B.
+
+## Opt-in
+
+`PHI_GGML_FFN=1` turns the fused path on; unset, the glue does not take
+SwiGLU and none of this runs. A fused block never writes its gate, up and
+SwiGLU tensors, and a program's eval callback can read them from outside
+the sub-graph the backend is handed (llama-imatrix reads `ffn_down`'s
+input); nothing the backend can see tells that apart from inference, and
+the path measured neutral here, so it waits to be asked for
+(`csrc/ggml-phi.md`).

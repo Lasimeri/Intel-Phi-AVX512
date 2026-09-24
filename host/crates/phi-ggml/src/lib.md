@@ -225,7 +225,11 @@ alone once it has planned them (`Ctx::ffn_members`), because it holds
 `ffn_down` by columns and the plain path would want rows; if the plain
 path had given them to the cards first, those slices are freed.
 
-`PHI_GGML_FFN=0` turns it off (SwiGLU is not taken and the graph splits
-as before), `PHI_GGML_FFN_H16=1` keeps the intermediate as float16 on
-the card (faster down kernels, and it overflows past 65504, so only
-where the activations are known to be bounded).
+It is **off by default**; `PHI_GGML_FFN=1` turns it on. It measured
+neutral on both models here, and a fused block never writes its
+intermediates, which a program's eval callback can read from outside
+the sub-graph this backend sees (llama-imatrix does, for `ffn_down`'s
+input; `csrc/ggml-phi.md`). Unset, SwiGLU is not taken and the graph
+splits as it did before. `PHI_GGML_FFN_H16=1` keeps the intermediate as
+float16 on the card (faster down kernels, and it overflows past 65504,
+so only where the activations are known to be bounded).

@@ -32,8 +32,10 @@ this script works it out from the model's size and the budget, below),
 `PHI_GGML_PP_SHARE` (where the cards' share at prompt sizes starts,
 0.75; it then follows what the two sides measure, and
 `PHI_GGML_PP_ADAPT=0` holds it still),
-`PHI_GGML_FFN` (1: a feed-forward block runs as one request per card,
-its intermediate never crossing the link; 0: three multiplies as before),
+`PHI_GGML_FFN` (unset or 0: three multiplies per feed-forward block, as
+before; 1: one request per card, its intermediate never crossing the
+link, and never written on the host either, so not with a program that
+reads intermediates through an eval callback, such as llama-imatrix),
 `PHI_GGML_FFN_H16` (0: the card keeps the intermediate as float32; 1:
 float16, faster and overflowing past 65504),
 `PHI_GGML_HOST_THREADS` (the host's threads for its rows, 12: leave the
