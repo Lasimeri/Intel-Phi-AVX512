@@ -98,30 +98,40 @@ scripts/phi-ggml.sh --verbose ...                              # each multiply, 
 
 Qwen3.8-27B (UD-Q4_K_XL, 17.6 GB) on the 5800X alone and with both
 cards, each keeping a quarter of every weight matrix, llama-bench,
-2026-09-23 (`docs/results/2026-09-23-ceilings-and-residency.md`):
+2026-09-23 (`docs/results/2026-09-23-ffn-per-request.md`):
 
-| | pp512 tok/s | tg16 tok/s |
+| | pp512 tok/s | tg32 tok/s |
 | --- | --- | --- |
-| host alone, 12 threads | 8.96 | 1.13 |
-| host alone, 16 threads | 9.24 | 1.07 |
-| host (12 threads) and both cards | **12.29** | **1.63** |
-| llama-server with the MTP draft: host alone | 6.93 | 2.31 |
-| llama-server with the MTP draft: host and both cards | **9.56** | **2.72** |
+| host alone, 16 threads | 9.19, 9.04 | 1.06, 1.07 |
+| host (12 threads) and both cards | **14.68, 14.59** | **1.63, 1.61** |
 
-The first three rows are the model resident (`--load-mode none`) with
-the host and the split **interleaved**, two rounds each, because this
-host's own throughput drifts by as much as a quarter over tens of
-minutes: a split measured now against a baseline measured an hour ago
-says nothing. Against the host at the same thread count that is 37
-percent at prompt processing and 45 at generation; against the best the
-host does at any thread count, 33 and 44.
+The model is resident (`--load-mode none`) and the host and the split
+are **interleaved**, two rounds each, because this host's own
+throughput drifts by as much as a quarter over tens of minutes: a split
+measured now against a baseline measured an hour ago says nothing. The
+calling program gets 12 threads with the cards and 16 alone: with 16 the
+split loses five times over at generation, its threads fighting the
+card daemons (`docs/results/2026-09-23-float16-activations.md`). That is
++60 percent at prompt processing and +53 at generation. What got it
+there since the first split's 12.29 / 1.63: the activations cross as
+float16, which the card up-converts for nothing; the share of each
+multiply the cards take at a batch is measured rather than set
+(`docs/results/2026-09-23-share-and-fusion.md`); and a feed-forward
+block goes to each card as one request whose intermediate never leaves
+it (`host/crates/phi-ggml/src/ffn.md`), which on this model is neutral,
+because here the link is not what bounds either phase.
+
+With llama-server and the MTP draft (the earlier split, same day):
+host alone 6.93 / 2.31, host and both cards **9.56 / 2.72**.
 
 A mixture-of-experts model works the same way: ggml runs its expert
 weights through MUL_MAT_ID, which the cards take as well, each keeping
 the same rows of every expert, and the answers match the host's token
 for token. It is worth less so far: Qwen3.8-35B-A3B-Distill
-(Q4_K_M, 20.2 GiB, 256 experts with 8 used per token) gains 3.7 percent
-at pp512 and 4.5 at generation, interleaved against the host alone. A
+(Q4_K_M, 20.2 GiB, 256 experts with 8 used per token) gains 16 percent
+at generation (8.62 and 8.55 tokens per second against 7.40) and loses
+4 at pp512 (90.8 and 88.5 against 93.6 and 93.1), interleaved against
+the host alone on 2026-09-23. A
 card costs about 0.45 ms to involve and an MoE layer's multiply at one
 token is a few megabytes, so the backend times
 both sides on each weight tensor and leaves with the host what the

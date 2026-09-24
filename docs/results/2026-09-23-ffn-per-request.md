@@ -102,7 +102,51 @@ whole, so it runs as before. Kernels for those three would bring them in.
 (Interleaved, `-lm none`, two runs of each: the host alone on 16
 threads, the split on 12 with `PHI_GGML_FFN=0` and with it on.)
 
-RESULTS_TABLE
+| Qwen3.8-27B UD-Q4_K_XL | pp512 | tg32 |
+| --- | --- | --- |
+| host alone | 9.19, 9.04 | 1.06, 1.07 |
+| split, plain | 14.45, 14.46 | 1.64, 1.65 |
+| split, fused | **14.68, 14.59** | 1.63, 1.61 |
+
+| Qwen3.8-35B-A3B Q4_K_M | pp512 | tg32 |
+| --- | --- | --- |
+| host alone | 93.57, 93.08 | 7.40, 7.40 |
+| split, plain | 90.82, 88.51 | 8.62, 8.55 |
+| split, fused | 91.06, 88.29 | 8.36, 8.63 |
+
+On the 27B the fused block is +1.2 percent at the prompt and -1.8 at
+generation, the second about the size of the spread: **neutral**. The
+text is the host's own, token for token, on both models.
+
+That is not what was expected before measuring, and the expectation was
+built on a bad number: the "8.7 ms of host time per block unfused" came
+from a verbose log taken at `-t 16`, which on this machine is
+oversubscribed (`2026-09-23-float16-activations.md`). At `-t 12` the
+unfused block was never that slow. What the measurement says instead:
+
+- **At one token** the host is the long pole, reading its half of the
+  weights from its own memory, and the cards finish first and wait (the
+  fused log: host 5.1 to 6.1 ms per block, cards 3.2 to 3.8). What bounds
+  generation is how much of the model the cards hold, and fusion moves
+  none of it. The host's part of a fused block also reads `ffn_down` in
+  runs of 34 superblocks with gaps between them rather than whole rows,
+  which may be the small loss.
+- **At a prompt** the balance is arithmetic, and transport was 6 to 9
+  percent of a card's time (`2026-09-23-share-and-fusion.md`); two of
+  three transfers removed is worth about the 1 percent measured.
+
+On the mixture model nothing fuses: its blocks are experts
+(`MUL_MAT_ID`), and the only change is that its SwiGLUs now run on this
+backend's private CPU pool instead of llama.cpp's, which measures the
+same (89.7 at the prompt both ways; generation within the spread).
+
+Where the fusion should pay, untested here because no model on this
+machine fits: a quantized model the cards hold most of, so that they,
+not the host, are the long pole and their round trips are the critical
+path; or batches large enough that the intermediate is the bulk of what
+crosses. The path is on by default because it is correct, measured
+neutral where it is not better, and declines back to the plain path
+exactly (`PHI_GGML_FFN=0` turns it off).
 
 ## What this does not do
 
