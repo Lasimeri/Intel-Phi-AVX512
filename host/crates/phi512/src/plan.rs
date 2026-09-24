@@ -126,8 +126,15 @@ pub struct Loop {
     pub cc: ConditionCode,
     /// The flags come from a `cmp ind, bound` (true) or from the `add`
     /// or `sub` that steps the register (false; the bound is then its
-    /// immediate, compared against the value before the step).
+    /// immediate).
     pub via_cmp: bool,
+    /// With `via_cmp` false: the step is an `add` (true) or a `sub`.
+    /// `add $-N` and `sub $N` step alike but set the flags differently.
+    pub from_add: bool,
+    /// The width in bits of the instruction that sets the flags: a 32-bit
+    /// `cmp %edx,%eax` compares the low halves, signed or not as the
+    /// condition says, whatever the upper halves of the registers hold.
+    pub width: u32,
 }
 
 fn imm_of(insn: &Instruction, op: u32) -> Option<i64> {
@@ -227,6 +234,8 @@ pub fn find_loop(insns: &Insns, entry: u64, exits: &[u64]) -> Option<Loop> {
         }
         let prev = body[body.len() - 2];
         let cc = insn.condition_code();
+        let width = (prev.op0_register().size() * 8) as u32;
+        let from_add = prev.mnemonic() == Mnemonic::Add;
         let (ind, bound, via_cmp) = match prev.mnemonic() {
             Mnemonic::Cmp => {
                 let Some(i) = gpr_index(prev.op0_register()) else { continue };
@@ -263,6 +272,8 @@ pub fn find_loop(insns: &Insns, entry: u64, exits: &[u64]) -> Option<Loop> {
             bound,
             cc,
             via_cmp,
+            from_add,
+            width,
         };
         if best.is_none_or(|b| (b.exit - b.head) < (end - head)) {
             best = Some(lp);
@@ -271,38 +282,60 @@ pub fn find_loop(insns: &Insns, entry: u64, exits: &[u64]) -> Option<Loop> {
     best
 }
 
-/// Does the loop go on, given the compared values and the condition?
-fn continues(a: u64, b: u64, cc: ConditionCode) -> Option<bool> {
+/// Does the loop go on, given the compared values, the condition and the
+/// width of the comparison? The values are cut to that width first, sign-
+/// extended for the signed conditions and not for the others, as the flags
+/// of a 32-bit `cmp` describe the low halves only.
+fn continues(a: u64, b: u64, cc: ConditionCode, width: u32) -> Option<bool> {
+    let (ua, ub, sa, sb) = if width >= 64 {
+        (a, b, a as i64, b as i64)
+    } else {
+        let mask = (1u64 << width) - 1;
+        let sext = |x: u64| (((x & mask) << (64 - width)) as i64) >> (64 - width);
+        (a & mask, b & mask, sext(a), sext(b))
+    };
     Some(match cc {
-        ConditionCode::l => (a as i64) < (b as i64),
-        ConditionCode::le => (a as i64) <= (b as i64),
-        ConditionCode::g => (a as i64) > (b as i64),
-        ConditionCode::ge => (a as i64) >= (b as i64),
-        ConditionCode::b => a < b,
-        ConditionCode::be => a <= b,
-        ConditionCode::a => a > b,
-        ConditionCode::ae => a >= b,
-        ConditionCode::ne => a != b,
-        ConditionCode::e => a == b,
+        ConditionCode::l => sa < sb,
+        ConditionCode::le => sa <= sb,
+        ConditionCode::g => sa > sb,
+        ConditionCode::ge => sa >= sb,
+        ConditionCode::b => ua < ub,
+        ConditionCode::be => ua <= ub,
+        ConditionCode::a => ua > ub,
+        ConditionCode::ae => ua >= ub,
+        ConditionCode::ne => ua != ub,
+        ConditionCode::e => ua == ub,
         _ => return None,
     })
 }
 
 /// How many times the body runs from induction value `i0` (a do-while:
 /// the body runs, the register steps, the condition decides).
+///
+/// The flags, by what set them:
+/// - `cmp ind, bound` after the step: the stepped value against the bound.
+/// - `sub ind, $N`: as `cmp ind, $N` on the value before the step.
+/// - `add ind, $N` (N of either sign): the result, which is the stepped
+///   value, against zero for the zero and signed conditions. Its carry is
+///   the unsigned carry out of the addition, not a comparison, so an
+///   unsigned condition after an `add` is not planned (`None`). Treating
+///   `add $-16` as `sub $-16` compared against -16 overestimated a
+///   count-down loop's trips.
 pub fn iterations(lp: &Loop, i0: u64, bound: u64) -> Option<u64> {
+    use ConditionCode::{a, ae, b, be};
+    if !lp.via_cmp && lp.from_add && matches!(lp.cc, b | be | a | ae) {
+        return None;
+    }
     let mut i = i0;
     let mut n: u64 = 1;
     loop {
         let next = i.wrapping_add(lp.step as u64);
         let go = if lp.via_cmp {
-            continues(next, bound, lp.cc)?
-        } else if lp.step < 0 {
-            // flags from `sub ind, imm`: the comparison is of the value before the step
-            continues(i, bound, lp.cc)?
+            continues(next, bound, lp.cc, lp.width)?
+        } else if lp.from_add {
+            continues(next, 0, lp.cc, lp.width)?
         } else {
-            // flags from `add ind, imm`: the result against zero
-            continues(next, 0, lp.cc)?
+            continues(i, bound, lp.cc, lp.width)?
         };
         if !go {
             return Some(n);
@@ -417,7 +450,17 @@ impl Tracker {
         found
     }
 
-    fn note(&mut self, addr: Val, size: u64, write: bool, form: (Register, Register, u32, u64), from_ind: Option<usize>) {
+    /// `whole`: a write whose every byte lands (not masked, not skippable);
+    /// a range can be dense only then.
+    fn note(
+        &mut self,
+        addr: Val,
+        size: u64,
+        write: bool,
+        whole: bool,
+        form: (Register, Register, u32, u64),
+        from_ind: Option<usize>,
+    ) {
         match addr {
             Val::Known(a) => self.ranges.push(MemRange {
                 addr: a,
@@ -425,7 +468,7 @@ impl Tracker {
                 write,
                 form,
                 from_ind: None,
-                dense: true,
+                dense: !write || whole,
             }),
             Val::Range { lo, hi, step } => self.ranges.push(MemRange {
                 addr: lo,
@@ -433,7 +476,7 @@ impl Tracker {
                 write,
                 form,
                 from_ind,
-                dense: step <= size,
+                dense: step <= size && (!write || whole),
             }),
             Val::Unknown => self.resolved = false,
         }
@@ -490,10 +533,18 @@ impl Tracker {
             ) {
                 let t = insn.near_branch_target();
                 if t <= addr {
-                    if let Some(lp) = find_loop(&insns.range(from..to).map(|(a, i)| (*a, *i)).collect(), t, &[]) {
-                        if lp.head == t && lp.back == addr {
-                            inner.push(lp);
-                        }
+                    let found = find_loop(&insns.range(from..to).map(|(a, i)| (*a, *i)).collect(), t, &[])
+                        .filter(|lp| lp.head == t && lp.back == addr);
+                    match found {
+                        Some(lp) => inner.push(lp),
+                        // The phase's own back edge, which the caller found.
+                        None if outer.is_some() && t == from => {}
+                        // A back edge no loop here was recognised for (its
+                        // induction in `cmp`'s second operand, a branch back
+                        // out of the phase, a body with a branch of its own):
+                        // walked once, what it touches on later trips is not
+                        // in the ranges, so the phase is not resolved.
+                        None => self.resolved = false,
                     }
                 } else if t < to {
                     skips.push((addr, t));
@@ -555,7 +606,11 @@ impl Tracker {
         let addr = insn.ip();
         // Memory operands first: their addresses use the values before the instruction.
         let info = self.fac.info(insn);
-        let mems: Vec<(Register, Register, u32, u64, bool, u64)> = info
+        // A write every lane of which lands (not masked, not in an interval
+        // a branch can skip): only such a write can make its range dense,
+        // whose interior pages the card opens without fetching.
+        let skippable = skips.iter().any(|&(j, t)| addr > j && addr < t);
+        let mems: Vec<(Register, Register, u32, u64, bool, u64, bool)> = info
             .used_memory()
             .iter()
             .map(|m| {
@@ -563,6 +618,7 @@ impl Tracker {
                     m.access(),
                     OpAccess::Write | OpAccess::ReadWrite | OpAccess::CondWrite | OpAccess::ReadCondWrite
                 );
+                let whole = matches!(m.access(), OpAccess::Write | OpAccess::ReadWrite) && !skippable;
                 (
                     m.base(),
                     m.index(),
@@ -570,11 +626,12 @@ impl Tracker {
                     m.displacement(),
                     write,
                     m.memory_size().size() as u64,
+                    whole,
                 )
             })
             .collect();
         let mut loaded: Option<u64> = None;
-        for (base, index, scale, disp, write, size) in mems {
+        for (base, index, scale, disp, write, size, whole) in mems {
             let size = if size == 0 { 64 } else { size };
             let a = self.address(insn, base, index, scale, disp);
             if !write && insn.mnemonic() == Mnemonic::Mov && insn.op0_kind() == OpKind::Register && size <= 8 {
@@ -586,7 +643,7 @@ impl Tracker {
                 }
             }
             let src = self.range_source(base, index);
-            self.note(a, size, write, (base, index, scale, disp), src);
+            self.note(a, size, write, whole, (base, index, scale, disp), src);
         }
         // Inside a nested loop's body, or an interval a branch can skip,
         // writes are not trusted; the loop's induction is already a range.
@@ -696,11 +753,16 @@ impl Tracker {
         for (a, l, w, rd, d) in v {
             if let Some(last) = out.last_mut() {
                 if a <= last.0 + last.1 + 4095 {
+                    // Bytes between the two parts are written by neither:
+                    // the merged range is not written whole, so not dense
+                    // (its interior pages would reach the program as the
+                    // card's zeros).
+                    let gap = a > last.0 + last.1;
                     let end = (last.0 + last.1).max(a + l);
                     last.1 = end - last.0;
                     last.2 |= w;
                     last.3 |= rd;
-                    last.4 &= d;
+                    last.4 = last.4 && d && !gap;
                     continue;
                 }
             }
@@ -897,7 +959,7 @@ mod tests {
     }
 
     /// A hand-written kernel's loop: running pointers stepped each iteration.
-    /// vmovaps (%rsi),%zmm0; vmovaps %zmm0,(%rdi); add /tmp/claude-1000/-home-lasimeri/1f927f0a-8413-4fec-8043-e31c53b2bb17/scratchpad/edit7.plx40,%rsi; add /tmp/claude-1000/-home-lasimeri/1f927f0a-8413-4fec-8043-e31c53b2bb17/scratchpad/edit7.plx40,%rdi; sub /tmp/claude-1000/-home-lasimeri/1f927f0a-8413-4fec-8043-e31c53b2bb17/scratchpad/edit7.plx10,%rcx; jg L
+    /// vmovaps (%rsi),%zmm0; vmovaps %zmm0,(%rdi); add $0x40,%rsi; add $0x40,%rdi; sub $0x10,%rcx; jg L
     #[test]
     fn running_pointers_cover_every_iteration() {
         let bytes = [
@@ -938,5 +1000,65 @@ mod tests {
         assert!(t.resolved, "{:?}", t.ranges);
         assert_eq!(t.merged(), vec![(0x50000, 30 * 4, false, true, false)]);
         assert_eq!(t.gpr[0], Val::Known(u64::MAX), "rax after the loop is -1");
+    }
+
+    #[test]
+    fn a_masked_store_never_makes_a_dense_range() {
+        // As running_pointers_cover_every_iteration, the store under {%k1}:
+        // vmovaps %zmm0,(%rdi){%k1} leaves the lanes k1 turns off unwritten.
+        let bytes = [
+            0x62, 0xf1, 0x7c, 0x48, 0x28, 0x06, 0x62, 0xf1, 0x7c, 0x49, 0x29, 0x07, 0x48, 0x83, 0xc6, 0x40, 0x48, 0x83, 0xc7, 0x40, 0x48,
+            0x83, 0xe9, 0x10, 0x7f, 0xe6, 0x90,
+        ];
+        let insns = decode(&bytes, 0x4000);
+        let lp = find_loop(&insns, 0x4000, &[]).expect("a loop");
+        let mut gpr = [0u64; 16];
+        gpr[1] = 65536;
+        gpr[6] = 0x10000;
+        gpr[7] = 0x80000;
+        let mut t = Tracker::new(gpr, no_mem);
+        t.run(&insns, lp.head, lp.exit, Some((1, 16, 65536, 16)));
+        assert!(t.resolved, "{:?}", t.ranges);
+        assert_eq!(
+            t.merged(),
+            vec![(0x10000, 4096 * 64, false, true, false), (0x80000, 4096 * 64, true, false, false)],
+            "the output is written but not whole"
+        );
+    }
+
+    #[test]
+    fn written_parts_with_a_gap_are_not_dense() {
+        let mut t = Tracker::new([0; 16], no_mem);
+        let form = (Register::RDI, Register::None, 1, 0);
+        t.note(Val::Known(0x1000), 64, true, true, form, None);
+        t.note(Val::Known(0x1400), 64, true, true, form, None);
+        assert_eq!(t.merged(), vec![(0x1000, 0x440, true, false, false)]);
+    }
+
+    fn looped(step: i64, cc: ConditionCode, via_cmp: bool, from_add: bool, width: u32) -> Loop {
+        Loop { head: 0, back: 0, exit: 0, ind: 1, step, bound: Bound::Imm(0), cc, via_cmp, from_add, width }
+    }
+
+    #[test]
+    fn add_of_a_negative_step_counts_down_to_zero() {
+        // add $-16,%rcx; jne L from rcx = 64: 64, 48, 32, 16, then 0 stops.
+        let lp = looped(-16, ConditionCode::ne, false, true, 64);
+        assert_eq!(iterations(&lp, 64, (-16i64) as u64), Some(4));
+        // sub $16,%rcx; jne L: the same four, compared before the step against 16.
+        let lp = looped(-16, ConditionCode::ne, false, false, 64);
+        assert_eq!(iterations(&lp, 64, 16), Some(4));
+        // An unsigned condition after an add reads its carry: not planned.
+        let lp = looped(-16, ConditionCode::ae, false, true, 64);
+        assert_eq!(iterations(&lp, 64, 0), None);
+    }
+
+    #[test]
+    fn a_32_bit_compare_reads_the_low_halves() {
+        // add $1,%eax; cmp %edx,%eax; jl L with eax = -8 held zero-extended
+        // in the frame and edx = 8: sixteen trips, not one.
+        let lp = looped(1, ConditionCode::l, true, false, 32);
+        assert_eq!(iterations(&lp, 0xffff_fff8, 8), Some(16));
+        let lp = looped(1, ConditionCode::l, true, false, 64);
+        assert_eq!(iterations(&lp, 0xffff_fff8, 8), Some(1));
     }
 }

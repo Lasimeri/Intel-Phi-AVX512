@@ -826,6 +826,10 @@ int vpu_exec_run(volatile unsigned char *ctrl, int blk_fd, int verbose)
         if (T < 1) T = 1;
     }
     uint64_t per = T > 1 ? (iters + (uint64_t)T - 1) / (uint64_t)T : 0;
+    /* As many threads as slices of `per` there are: with 64 iterations on
+     * 57 threads, per is 2 and only 32 slices exist; threads 32 and up
+     * would start past the loop's end and run iterations it never has. */
+    if (T > 1) T = (int)((iters + per - 1) / per);
     for (int t = 0; t < T; t++) {
         struct ctx *c = &g_ctx[t];
         memset(c, 0, sizeof *c);

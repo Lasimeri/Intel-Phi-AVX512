@@ -846,16 +846,18 @@ fn extract(insn: &Instruction, ev: &Ev, tg: &Target) -> Result<Rewrite, Unsuppor
                 Some(p) => em.vpermf32x4(t, Rm::Reg(s), p, 0),
                 None => em.vmov(t, Rm::Reg(s), 0, 0),
             }
-            let k = if ev.aaa != 0 && ev.w == 1 {
-                em.qmask_to_dmask(ev.aaa, lanes)
+            // The block's lanes are a prefix; a program mask over them is
+            // merged by lane into what memory holds (unaligned_move).
+            let span = em.mask_imm(lanes);
+            if ev.aaa == 0 {
+                em.store_unaligned(m, t, span, 0, false, 0);
             } else {
-                let k = em.mask_imm(lanes);
-                if ev.aaa != 0 {
-                    em.kand(k, ev.aaa);
-                }
-                k
-            };
-            em.store_unaligned(m, t, k, 0, false, 0);
+                let k = if ev.w == 1 { em.qmask_to_dmask(ev.aaa, lanes) } else { ev.aaa };
+                let old = em.temp().map_err(|e| refuse(insn, e))?;
+                em.load_unaligned(old, m, span, 0, false, 0);
+                em.vmov(old, Rm::Reg(t), k, 0);
+                em.store_unaligned(m, old, span, 0, false, 0);
+            }
         }
         None => {
             let d = ev.rm;
@@ -1044,33 +1046,50 @@ fn unaligned_move(insn: &Instruction, bytes: &[u8], ev: &Ev, tg: &Target) -> Res
         Some(m) => {
             // The pairs move dwords whatever the element size (qword elements
             // would need 8-byte alignment); a qword mask is expanded.
+            //
+            // The pairs expand and compress through their mask: the next
+            // element in memory goes to the next enabled lane. That is
+            // masking by lane only for a prefix of lanes (the vector
+            // length's), so the pairs carry only that (`span`), and a
+            // program mask is applied by lane with an aligned register move:
+            // a load goes through a temporary and is merged into the
+            // destination; a store merges into what memory holds and stores
+            // the whole span back (read, modify, write).
             let dvl = vl_lanes(ev.ll, 0);
-            let k = if ev.aaa != 0 && w == 1 {
-                em.qmask_to_dmask(ev.aaa, dvl)
-            } else if full && ev.aaa == 0 {
-                0
-            } else if full {
-                ev.aaa
-            } else {
-                let k = em.mask_imm(dvl);
-                if ev.aaa != 0 {
-                    em.kand(k, ev.aaa);
-                }
-                k
+            let span = if full { 0 } else { em.mask_imm(dvl) };
+            let prog = match (ev.aaa, w) {
+                (0, _) => None,
+                (a, 1) => Some(em.qmask_to_dmask(a, dvl)),
+                (a, _) => Some(a),
             };
             if load {
                 let d = ev.reg;
-                em.load_unaligned(d, m, k, 0, false, 0);
-                if ev.z && ev.aaa != 0 {
-                    let kz = em.k();
-                    em.knot(kz, k);
-                    em.zero(d, kz, 0);
+                match prog {
+                    None => em.load_unaligned(d, m, span, 0, false, 0),
+                    Some(k) => {
+                        let t = em.temp().map_err(|e| refuse(insn, e))?;
+                        em.load_unaligned(t, m, span, 0, false, 0);
+                        em.vmov(d, Rm::Reg(t), k, 0);
+                        if ev.z {
+                            let kz = em.k();
+                            em.knot(kz, k);
+                            em.zero(d, kz, 0);
+                        }
+                    }
                 }
                 if !full {
                     em.zero_lanes(d, upper(ev.ll));
                 }
             } else {
-                em.store_unaligned(m, ev.reg, k, 0, false, 0);
+                match prog {
+                    None => em.store_unaligned(m, ev.reg, span, 0, false, 0),
+                    Some(k) => {
+                        let t = em.temp().map_err(|e| refuse(insn, e))?;
+                        em.load_unaligned(t, m, span, 0, false, 0);
+                        em.vmov(t, Rm::Reg(ev.reg), k, 0);
+                        em.store_unaligned(m, t, span, 0, false, 0);
+                    }
+                }
             }
         }
     }
@@ -1501,13 +1520,14 @@ fn cvt_ps2ph(insn: &Instruction, ev: &Ev, tg: &Target) -> Result<Rewrite, Unsupp
     let k = if src_ll == 2 { 0 } else { em.mask_imm(lanes) };
     match MemOp::of(insn) {
         Some(m) => {
-            let k = if ev.aaa != 0 {
-                let k = em.mask_imm(lanes);
-                em.kand(k, ev.aaa);
-                k
-            } else {
-                k
-            };
+            // The pack store compresses through its mask; merging a program
+            // mask by lane would need the float16 in memory read back first.
+            if ev.aaa != 0 {
+                return Err(refuse(
+                    insn,
+                    "a masked float16 store: the pack store compresses through the mask",
+                ));
+            }
             em.store_unaligned(m, s, k, 0, true, 3);
         }
         None => {
@@ -2388,18 +2408,19 @@ fn generic(insn: &Instruction, ev: &Ev, c: Canon, tg: &Target) -> Result<Rewrite
         // selected lanes, at any alignment.
         let m = mem.ok_or_else(|| refuse(insn, "store without a memory operand"))?;
         let dvl = vl_lanes(ev.ll, 0);
-        let k = if kn != 0 && ev.w == 1 {
-            em.qmask_to_dmask(kn, dvl)
-        } else if full {
-            kn
+        // The pair compresses through its mask (unaligned_move): it carries
+        // only the vector length's lanes, and a program mask is merged by
+        // lane into what memory holds first.
+        let span = if full { 0 } else { em.mask_imm(dvl) };
+        if kn == 0 {
+            em.store_unaligned(m, ev.reg, span, 0, false, 0);
         } else {
-            let k = em.mask_imm(dvl);
-            if kn != 0 {
-                em.kand(k, kn);
-            }
-            k
-        };
-        em.store_unaligned(m, ev.reg, k, 0, false, 0);
+            let k = if ev.w == 1 { em.qmask_to_dmask(kn, dvl) } else { kn };
+            let t = em.temp().map_err(|e| refuse(insn, e))?;
+            em.load_unaligned(t, m, span, 0, false, 0);
+            em.vmov(t, Rm::Reg(ev.reg), k, 0);
+            em.store_unaligned(m, t, span, 0, false, 0);
+        }
         return Ok(Rewrite::Thunk(em.finish()));
     }
     let d = if dest_is_vvvv(ev) { ev.vvvv } else { ev.reg };
