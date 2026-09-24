@@ -147,6 +147,19 @@ struct Ctx {
     ffn_members: HashSet<usize>,
     ffn_judged: Option<Judged>,
     ffn_h16: bool,
+    /// The cards' rows are theirs alone (`PHI_GGML_OFFLOAD=1`): after the
+    /// upload the host never reads them (every multiply of a tensor with
+    /// resident rows goes to the cards, whatever it measures, and at a
+    /// batch each card computes all of its slice), and the kernel is told
+    /// to drop their pages (`drop_pages`), so a model larger than this
+    /// host's memory needs only the host's part of it resident. Off, the
+    /// rows are a copy and the host falls back on them freely.
+    offload: bool,
+    /// Bytes of the cards' resident rows the host has read since the
+    /// upload, with the file-backed address ranges `drop_pages` may act
+    /// on (from /proc/self/maps, read when an address is not in them).
+    host_read: u64,
+    file_maps: Vec<(usize, usize)>,
 }
 
 static CTX: Mutex<Option<Ctx>> = Mutex::new(None);
@@ -249,6 +262,13 @@ pub extern "C" fn phi_ggml_open() -> i32 {
         names.join(", "),
         budget as f64 / 1e9
     ));
+    // Offloaded, a card computes all of its slice at a batch too, and
+    // nothing moves that share: the host's part of it is what would read
+    // the rows back.
+    let offload = env_or("PHI_GGML_OFFLOAD", 0u32) != 0;
+    if offload {
+        say("offload: the cards' rows are theirs alone; the host never reads them after the upload, and their pages are dropped");
+    }
     let n = cards.len() as i32;
     *CTX.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ctx {
         cards,
@@ -260,8 +280,8 @@ pub extern "C" fn phi_ggml_open() -> i32 {
         min_bytes: env_or("PHI_GGML_MIN_BYTES", 4_000_000u64),
         too_small: 0,
         judged: None,
-        pp_share,
-        pp_adapt: env_or("PHI_GGML_PP_ADAPT", 1u32) != 0,
+        pp_share: if offload { 1.0 } else { pp_share },
+        pp_adapt: !offload && env_or("PHI_GGML_PP_ADAPT", 1u32) != 0,
         pp_gap: 0.0,
         pp_n: 0,
         pp_steps: 0,
@@ -275,8 +295,86 @@ pub extern "C" fn phi_ggml_open() -> i32 {
         ffn_members: HashSet::new(),
         ffn_judged: None,
         ffn_h16: env_or("PHI_GGML_FFN_H16", 0u32) != 0,
+        offload,
+        host_read: 0,
+        file_maps: Vec::new(),
     });
     n
+}
+
+/// Whether `addr..addr + len` lies in a mapping of a file (a model
+/// llama.cpp mapped rather than read). Only such pages may be dropped:
+/// a dropped page of a file comes back from the file when touched, while
+/// `MADV_PAGEOUT` on ordinary memory (`--load-mode none`) would push the
+/// weights out to swap.
+fn file_backed(maps: &mut Vec<(usize, usize)>, addr: usize, len: usize) -> bool {
+    let inside = |maps: &[(usize, usize)]| maps.iter().any(|&(a, b)| addr >= a && addr + len <= b);
+    if inside(maps) {
+        return true;
+    }
+    // Mappings made since the last look (a model loaded later, a draft).
+    maps.clear();
+    if let Ok(s) = std::fs::read_to_string("/proc/self/maps") {
+        for line in s.lines() {
+            // "start-end perms offset dev inode path": a file has an inode.
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() < 6 || f[4] == "0" || !f[5].starts_with('/') {
+                continue;
+            }
+            if let Some((a, b)) = f[0].split_once('-') {
+                if let (Ok(a), Ok(b)) = (usize::from_str_radix(a, 16), usize::from_str_radix(b, 16)) {
+                    maps.push((a, b));
+                }
+            }
+        }
+    }
+    inside(maps)
+}
+
+/// Tell the kernel the pages wholly inside `addr..addr + len` are not
+/// wanted (`MADV_PAGEOUT`): after an upload they are the card's, and left
+/// to the page cache's own judgement they would crowd out the host's part
+/// of a model larger than memory. The pages at either end may hold the
+/// host's rows too and are kept. Returns the bytes dropped.
+fn drop_pages(maps: &mut Vec<(usize, usize)>, addr: usize, len: usize) -> usize {
+    const PAGE: usize = 4096;
+    let from = (addr + PAGE - 1) & !(PAGE - 1);
+    let to = (addr + len) & !(PAGE - 1);
+    if to <= from || !file_backed(maps, addr, len) {
+        return 0;
+    }
+    // SAFETY: a hint about pages of a read-only mapping of a file; the
+    // data is unchanged and is read back from the file if touched again.
+    let r = unsafe { libc::madvise(from as *mut libc::c_void, to - from, libc::MADV_PAGEOUT) };
+    if r == 0 {
+        to - from
+    } else {
+        0
+    }
+}
+
+/// The host is to compute every row of the multiply begun last: `m` rows
+/// of `nb_a` bytes, `touched` matrices of them (the experts its columns
+/// name, at most). Any of those rows resident on a card are rows the host
+/// reads back, which `offload` exists to prevent; they are counted, and
+/// said with `reason` when verbose, so that the offload is verified by
+/// what the host did rather than inferred from the disk.
+fn host_all(ctx: &mut Ctx, key: usize, m: u64, nb_a: u64, touched: u64, reason: &str) -> i64 {
+    ctx.host_ranges = vec![(0, m)];
+    if let Some(split) = ctx.splits.get(&key) {
+        let bytes = (m - split.r0) * nb_a * touched;
+        if bytes > 0 {
+            ctx.host_read += bytes;
+            if ctx.verbose {
+                say(&format!(
+                    "the host reads {:.2} MB of the cards' rows ({reason}); {:.1} MB so far",
+                    bytes as f64 / 1e6,
+                    ctx.host_read as f64 / 1e6
+                ));
+            }
+        }
+    }
+    1
 }
 
 /// Bytes added to the activation row stride in the card's window. The
@@ -597,6 +695,21 @@ unsafe fn plan(ctx: &mut Ctx, a: *const u8, a_type: u32, m: u64, nb_a: u64, expe
             }
         }
     }
+    // Offloaded, the rows now on the cards leave the host's memory: they
+    // are r0..m of every expert, one run each.
+    if ctx.offload && r0 < m {
+        let mut dropped = 0;
+        for e in 0..experts {
+            let at = a as usize + (e * nb_a2 + r0 * nb_a) as usize;
+            dropped += drop_pages(&mut ctx.file_maps, at, ((m - r0) * nb_a) as usize);
+        }
+        if ctx.verbose {
+            say(&format!(
+                "offload: {:.1} MiB of the host's pages dropped",
+                dropped as f64 / 1048576.0
+            ));
+        }
+    }
     Split {
         r0,
         cards,
@@ -744,20 +857,20 @@ unsafe fn begin(a: *const u8, a_type: u32, m: u64, k: u64, nb_a: u64, keep: i32,
     // such twin and take float32 (`to_f16`).
     let half = ctx.half_act && a_type != MM_F32 && a_type != MM_F16 && have_f16c();
     let card_nb_b = if half { k * 2 + B_PAD } else { nb_b + B_PAD };
+    let key = a as usize;
+    // The matrices a host fallback reads: the experts the columns name, at most.
+    let touched = if mixture { n.min(mix.experts) } else { 1 };
     if keep == 0 || phi_ggml_supports(a_type, m, k, nb_a, nb_b, b_rows) == 0 || ids_bytes + b_rows * card_nb_b > B_MAX || n * m * 4 > D_MAX
     {
         ctx.host_only += 1;
-        ctx.host_ranges = vec![(0, m)];
-        return 1;
+        return host_all(ctx, key, m, nb_a, touched, "past the window's limits");
     }
-    let key = a as usize;
     // A tensor of a fused feed-forward block goes to the cards only through
     // ffn.rs, which holds ffn_down by columns; reaching it here means the
     // block was declined as a whole, and then the host does all of it.
     if ctx.ffn_members.contains(&key) {
         ctx.host_only += 1;
-        ctx.host_ranges = vec![(0, m)];
-        return 1;
+        return host_all(ctx, key, m, nb_a, touched, "a fused block's");
     }
     if !ctx.splits.contains_key(&key) {
         // A plain multiply whose largest possible card part, every card's
@@ -796,16 +909,16 @@ unsafe fn begin(a: *const u8, a_type: u32, m: u64, k: u64, nb_a: u64, keep: i32,
     // quantized kernels: `phi_dot4_*` was never restructured the way
     // they were. A model whose weights are float is therefore shared at
     // generation and left whole at prompt sizes, without waiting to
-    // learn it on a model that may be visited only a few times.
-    if class == 1 && (a_type == MM_F16 || a_type == MM_F32) {
+    // learn it on a model that may be visited only a few times. Offloaded,
+    // the rows are the card's to compute whatever it costs, as they are
+    // below for every judgement of speed.
+    if !ctx.offload && class == 1 && (a_type == MM_F16 || a_type == MM_F32) {
         ctx.too_small += 1;
-        ctx.host_ranges = vec![(0, m)];
-        return 1;
+        return host_all(ctx, key, m, nb_a, touched, "float weights at a batch");
     }
-    if ctx.splits[&key].avoid[class] {
+    if !ctx.offload && ctx.splits[&key].avoid[class] {
         ctx.too_small += 1;
-        ctx.host_ranges = vec![(0, m)];
-        return 1;
+        return host_all(ctx, key, m, nb_a, touched, "the cards did not pay for themselves");
     }
     let split = &ctx.splits[&key];
     let r0 = split.r0;
@@ -816,17 +929,22 @@ unsafe fn begin(a: *const u8, a_type: u32, m: u64, k: u64, nb_a: u64, keep: i32,
     let share = if class == 1 { ctx.pp_share } else { 1.0 };
     let mut ranges = vec![(0u64, r0)];
     let mut work = Vec::new();
+    let mut read_back = 0;
     for &(ci, lo, hi) in &split.cards {
         let mut rows = ((hi - lo) as f64 * share).round() as u64;
         rows = (hi - lo) - (((hi - lo) - rows) & !63);
         if lo + rows < hi {
             ranges.push((lo + rows, hi));
+            read_back += (hi - lo - rows) * nb_a * touched;
         }
         if rows > 0 {
             work.push((ci, lo, rows));
         }
     }
     ranges.retain(|r| r.1 > r.0);
+    // The host's part of the cards' slices at a batch is rows it reads
+    // back; never offloaded, where the share is 1.
+    ctx.host_read += read_back;
     let on_cards: u64 = work.iter().map(|&(_, _, rows)| rows).sum();
     // The weights the cards would take off the host: their rows once, or
     // once per column for a mixture. Below `min_bytes` no card can pay
@@ -835,12 +953,12 @@ unsafe fn begin(a: *const u8, a_type: u32, m: u64, k: u64, nb_a: u64, keep: i32,
     // faster than 10 GB/s, so anything under a few megabytes is finished
     // before a card's round trip (0.45 ms) has even returned. Judging
     // that by measurement instead would cost two bad multiplies per
-    // tensor, which on a small model is the whole of it.
+    // tensor, which on a small model is the whole of it. Offloaded, rows on
+    // a card go to it however few: the host has let go of them.
     let cols = if mixture { n } else { 1 };
-    if on_cards == 0 || on_cards * nb_a * cols < ctx.min_bytes {
+    if on_cards == 0 || (!ctx.offload && on_cards * nb_a * cols < ctx.min_bytes) {
         ctx.too_small += 1;
-        ctx.host_ranges = vec![(0, m)];
-        return 1;
+        return host_all(ctx, key, m, nb_a, touched, "too small to pay for a card");
     }
     // The activations into the first card's window. If any is past a
     // half's range the multiply goes as float32, to every card (none has
@@ -860,8 +978,7 @@ unsafe fn begin(a: *const u8, a_type: u32, m: u64, k: u64, nb_a: u64, keep: i32,
             }
             if ids_bytes + b_rows * card_nb_b > B_MAX {
                 ctx.host_only += 1;
-                ctx.host_ranges = vec![(0, m)];
-                return 1;
+                return host_all(ctx, key, m, nb_a, touched, "float32 activations past the window");
             }
         }
     }
@@ -1039,7 +1156,8 @@ pub unsafe extern "C" fn phi_ggml_end_id(d: *mut u8, nb_d: u64, nb_d2: u64) -> i
     if let Some(j) = ctx.judged.take() {
         let took = t_host + wait;
         let alone = t_host.as_secs_f64() / (1.0 - j.share).max(0.05);
-        if let Some(split) = ctx.splits.get_mut(&j.key) {
+        // Offloaded, nothing is judged: the host could not take the rows back.
+        if let Some(split) = ctx.splits.get_mut(&j.key).filter(|_| !ctx.offload) {
             if took.as_secs_f64() > alone {
                 // Plainly worse (a third again or more) settles it at
                 // once; a hair worse twice running also does.
@@ -1072,11 +1190,12 @@ pub unsafe extern "C" fn phi_ggml_end_id(d: *mut u8, nb_d: u64, nb_d2: u64) -> i
     }
     if ctx.verbose {
         say(&format!(
-            "multiply {}: host part {:.3} ms, waited {:.3} ms more; {}",
+            "multiply {}: host part {:.3} ms, waited {:.3} ms more; {}; the cards' rows read by the host so far {:.1} MB",
             ctx.calls,
             t_host.as_secs_f64() * 1e3,
             wait.as_secs_f64() * 1e3,
-            lines.join("; ")
+            lines.join("; "),
+            ctx.host_read as f64 / 1e6
         ));
     }
     if ok {
@@ -1187,5 +1306,39 @@ mod tests {
         // SAFETY: as above.
         let most = unsafe { to_f16(x.as_ptr(), h.as_mut_ptr(), 3) };
         assert!(most <= F16_MAX, "65504 is a half, and must not be refused");
+    }
+
+    /// Offloaded rows are dropped only from a mapping of a file, and only
+    /// whole pages: ordinary memory (a model read with `--load-mode none`)
+    /// must never be paged out to swap, and the pages at either end of a
+    /// range may hold the host's rows.
+    #[test]
+    fn drop_pages_only_whole_pages_of_a_file() {
+        let mut maps = Vec::new();
+        let heap = vec![7u8; 1 << 20];
+        assert_eq!(drop_pages(&mut maps, heap.as_ptr() as usize, heap.len()), 0, "ordinary memory");
+        assert_eq!(heap[12345], 7);
+
+        let path = std::env::temp_dir().join(format!("phi-ggml-drop-{}", std::process::id()));
+        std::fs::write(&path, vec![9u8; 64 << 10]).unwrap();
+        let f = std::fs::File::open(&path).unwrap();
+        use std::os::fd::AsRawFd;
+        // SAFETY: a read-only mapping of a file this test owns.
+        let p = unsafe { libc::mmap(std::ptr::null_mut(), 64 << 10, libc::PROT_READ, libc::MAP_SHARED, f.as_raw_fd(), 0) };
+        assert_ne!(p, libc::MAP_FAILED);
+        let at = p as usize;
+        // 100 bytes in to 100 bytes short: the first and last pages are kept.
+        assert_eq!(drop_pages(&mut maps, at + 100, (64 << 10) - 200), (64 << 10) - 2 * 4096);
+        // Less than a page, or within one: nothing.
+        assert_eq!(drop_pages(&mut maps, at + 100, 3000), 0);
+        // SAFETY: the mapping is 64 KiB of the file, still mapped.
+        assert_eq!(
+            unsafe { *(p as *const u8).add(30000) },
+            9,
+            "a dropped page reads back from the file"
+        );
+        // SAFETY: unmapping what was mapped above.
+        unsafe { libc::munmap(p, 64 << 10) };
+        std::fs::remove_file(&path).unwrap();
     }
 }

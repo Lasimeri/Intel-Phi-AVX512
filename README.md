@@ -149,6 +149,14 @@ both sides on each weight tensor and leaves with the host what the
 cards would not finish sooner, which on that model is most of the
 expert work (`docs/results/2026-09-23-mixture-of-experts.md`).
 
+A model larger than this host's 31 GiB runs from its file, the page
+cache holding what it can. By default the cards' rows are a copy, so
+they save the host no memory; with `PHI_GGML_OFFLOAD=1` they leave the
+host after the upload and it never reads them again. The same model at
+Q8_0 (37.8 GB) generates at 5.03 and 5.15 tokens per second that way,
+against 4.01 and 3.75 on the host alone, and processes a prompt at 56.9
+and 56.6 against 28.0 and 21.8 (`docs/results/2026-09-24-offload-past-memory.md`).
+
 Token generation is bound by weight bandwidth, and the cards add theirs
 to the host's; what bounds it now is how much of the model they hold,
 since two 6 GB cards take half of 17.6 GB and the host is the long pole

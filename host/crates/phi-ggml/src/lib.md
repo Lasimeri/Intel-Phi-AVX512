@@ -297,3 +297,36 @@ frees everything on every card before anything is uploaded, which also
 covers a process that crashed. It follows that one process at a time
 uses the cards: a second one started while the first runs frees the
 first's slices under it.
+
+## Offload: the cards' rows leave the host (2026-09-24)
+
+By default a card's rows are a copy. The host keeps the whole model, and
+it reads the cards' rows back whenever it computes a multiply alone:
+when the multiply is under `min_bytes`, when the judgement found the
+cards not paying on that tensor, for float weights at a batch, past the
+window's limits, and for the host's share of every card slice at a
+batch. On the 35B-A3B Q4_K_M that was 1,059 MB over sixteen tokens in
+198 such multiplies (`--verbose`, which now counts it: "the cards' rows
+read by the host so far").
+
+`PHI_GGML_OFFLOAD=1` makes the cards' rows theirs alone, for a model
+larger than this host's memory. Every multiply of a tensor with resident
+rows goes to the cards, whatever it measures and however small; at a
+batch each card computes all of its slice (the batch share is 1 and
+does not move); and after each upload the pages of the rows now on the
+cards are dropped with `madvise(MADV_PAGEOUT)` (`drop_pages`), whole
+pages only, since the pages at either end may hold the host's rows. The
+same run then read 0 MB of the cards' rows and dropped 3.25 GB of pages.
+
+It needs the model mapped from its file (`--load-mode mmap`, llama.cpp's
+default): a dropped page of a file is read back from the file if it is
+ever touched, so a miss costs time, never a wrong result. A model read
+into ordinary memory (`--load-mode none`) is left alone
+(`file_backed`, from `/proc/self/maps`), because paging that out would
+push the weights into swap. Two paths are outside it: a multiply the
+glue declines at the scheduler (`supports_op`) runs on llama.cpp's CPU
+backend over the whole weight, and the fused feed-forward
+(`PHI_GGML_FFN=1`) keeps its own rules.
+
+What it is worth, on models near and past the host's memory, is in
+`docs/results/2026-09-24-offload-past-memory.md`.

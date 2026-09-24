@@ -44,6 +44,8 @@ own; 0: ggml's disposable one per graph) and `PHI_GGML_HOST_POLL` (0: that
 pool's threads do not spin between graphs),
 `PHI_GGML_LIB` (another build of `libggml_phi.so` to load instead of this
 repository's, so two builds can be compared interleaved),
+`PHI_GGML_OFFLOAD` (1: the cards' rows leave the host, for a model
+larger than its memory; needs `--load-mode mmap`, below),
 `PHI_GGML_HOST_THREADS` (the host's threads for its rows, 12: leave the
 card daemons a CPU each, and give the program the same `-t`),
 `PHI_GGML_THREADS` (card threads, 57). `--verbose`
@@ -85,3 +87,13 @@ it works (pp64 6.22 against 9.33). 2G each is the setting here.
 host before a card is asked at all; below it a card cannot beat its own
 round trip, and asking anyway costs a measurement
 (`host/crates/phi-ggml/src/lib.md`).
+
+## A model larger than the host's memory
+
+By default each card's rows are a copy and the host keeps the whole
+model. With `PHI_GGML_OFFLOAD=1` and the model mapped (`--load-mode
+mmap`, or no load-mode option at all), the rows on the cards leave the
+host's memory after the upload and the host never reads them again, so
+only the host's part of the model needs to stay resident: the cards'
+8.5 GB or so come off what the page cache has to hold
+(`host/crates/phi-ggml/src/lib.md`, "Offload").
