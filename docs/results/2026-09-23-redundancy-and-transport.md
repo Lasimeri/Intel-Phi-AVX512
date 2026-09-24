@@ -118,7 +118,8 @@ weight in a buffer the backend cannot read (a repacked one) is declined
 rather than counted, and at the first multiply the share is set to fill
 97 percent of the budget. On the 27B: 13.7 GB offered, 31.2 percent,
 4.23 GB a card. On the 35B-A3B, whose Q4_K experts are repacked: 5.1 GB
-offered and the cap of an equal split, 2.51 GB a card where it had 1.09.
+offered and the first cap, an equal split between the cards, 2.51 GB a
+card where it had 1.09 (a cap since lowered, below).
 
 Measuring that turned up a bug older than any of this: a process's
 uploads stayed on the cards after it exited, and a new process replaced
@@ -166,7 +167,9 @@ rounds:
 | host (12 threads) and both cards, the cap, a third (about 1.7 GB a card) | 87.98, 88.45 | **9.53, 9.51** |
 
 The third over 0.203 is +6 percent at generation and 2 percent less at
-the prompt, within the host's drift between rounds.
+the prompt, lower in both rounds (87.98 against 89.20, 88.45 against
+91.13), so a measured cost of the larger share rather than drift: the
+price of the generation gain.
 
 ## The vectors
 
