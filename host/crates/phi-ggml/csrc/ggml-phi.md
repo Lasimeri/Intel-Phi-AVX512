@@ -141,6 +141,11 @@ multiply (`../src/lib.md`).
 
 `phi_reg_get_device_count` opens the cards (`phi_ggml_open`) the first time
 it is asked and reports one device when they open, none when they do not.
+It does not ask for the host's CPU backend: the count is taken when the
+backend registers, which a program may do before it registers its CPU
+backend (xks does; the first version of this asked, found no CPU device,
+and left xks's cards site running on the host alone), and `init_backend`
+gets it later.
 llama.cpp stops with "failed to initialize" when an accelerator's
 `init_backend` returns NULL, which is what a card that is down used to
 cause through `GGML_BACKEND_PATH`; with no device the backend is simply

@@ -775,12 +775,15 @@ static const char *phi_reg_get_name(ggml_backend_reg_t reg) { (void)reg; return 
 /* A device only when the cards open. llama.cpp aborts ("failed to
  * initialize") on an accelerator whose backend comes back NULL, but runs on
  * the CPU when a backend has no device: so a card that is down, or no
- * worker polling, means no device here, decided once. */
+ * worker polling, means no device here, decided once. The host's CPU
+ * backend is not asked for here: a program may register this backend
+ * before its CPU one (xks does), and the count is taken at registration;
+ * `init_backend` gets it, later. */
 static size_t phi_reg_get_device_count(ggml_backend_reg_t reg)
 {
     static int n = -1;
     (void)reg;
-    if (n < 0) n = (resolve() == 0 && phi_ggml_open() >= 0 && host_backend() == 0) ? 1 : 0;
+    if (n < 0) n = (resolve() == 0 && phi_ggml_open() >= 0) ? 1 : 0;
     return (size_t)n;
 }
 
