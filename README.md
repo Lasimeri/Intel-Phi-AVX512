@@ -196,8 +196,10 @@ the protocol layout check; `CONTRIBUTING.md` has the rules.
 | [Intel-Phi-Jev](https://github.com/Lasimeri/Intel-Phi-Jev) | `xks`, a local Jev (TypeSafe System One) whose model runs through `libggml_phi.so` (its `cards` site) and `phi512.sh` (its `avx512` site) | by Mechanical-Jev |
 | [Mechanical-Jev](https://github.com/Lasimeri/Mechanical-Jev) | `mjev`, the asking side of that Jev | |
 
-Clone them side by side and nothing needs configuring: each finds the
-next under its clone's name or the spaced one. What Intel-Phi-Jev
+Cloned side by side, the repositories find each other without
+configuration, under each one's clone name or the spaced one; the model
+and llama.cpp paths are set in Intel-Phi-Jev's `xks.conf`, and the cards
+need the stack's `phi` command with a card up. What Intel-Phi-Jev
 consumes from here (`scripts/phi512.sh`, `scripts/phi-vpu.sh`,
 `host/target/release/libggml_phi.so`, the `PHI_GGML_*` and `PHI_VPU_*`
 variables) stays as it is across changes; [`CONTRIBUTING.md`](CONTRIBUTING.md)

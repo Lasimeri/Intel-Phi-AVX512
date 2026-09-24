@@ -50,11 +50,12 @@ lib="${PHI512_LIB:-}"
 
 if [ -z "$lib" ] && [ -d "$root/host/target" ]; then
     # LD_PRELOAD splits its value on spaces and colons, and this repository
-    # is normally cloned to a path with a space in it ("Intel Phi 3120A").
-    # The space-free symlink that toolchain/env.sh maintains is the way in;
-    # if it is missing, make one, because no quoting would help here.
+    # may be checked out at a path with a space in it ("Intel Phi AVX-512").
+    # A space-free symlink to this checkout is the way in, because no
+    # quoting would help here; made when missing, and pointed at this
+    # checkout when it names another.
     cache="${XDG_CACHE_HOME:-$HOME/.cache}/intel-phi-avx512"
-    if [ ! -e "$cache" ]; then ln -sfn "$root" "$cache"; fi
+    if [ "$(readlink "$cache" 2>/dev/null)" != "$root" ]; then ln -sfn "$root" "$cache"; fi
     for cand in "$cache/host/target/release/libphi512.so" "$cache/host/target/debug/libphi512.so"; do
         [ -f "$cand" ] && { lib="$cand"; break; }
     done
