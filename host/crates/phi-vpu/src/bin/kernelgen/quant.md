@@ -80,7 +80,7 @@ means its default 1 M), so the same kernel serves one thread and the
 whole pool at once. Its prologue picks the count with a branch, not a
 `cmov`: Knights Corner deletes CMOV (ISA reference 327364-001, appendix
 B; the stack's LLVM is patched not to emit it, `Intel-Phi-3120A`,
-`docs/research/abi-and-toolchain.md`), and one here killed the worker
+[`docs/research/abi-and-toolchain.md`](https://github.com/Lasimeri/Intel-Phi-3120A/blob/main/docs/research/abi-and-toolchain.md)), and one here killed the worker
 with `trap invalid opcode` (2026-09-23). Compiled code cannot reach it;
 the scalar scaffolding this generator writes by hand can, so it is
 written as if for a P54C.

@@ -26,7 +26,7 @@ lanes all matched, because a fast wrong answer is worth nothing.
 | 4194304 | | 1.035 ms | | 243 |
 
 Compute scales; the transport is the bound. The host-memory block path
-serves one 512 KiB record at a time (`docs/results/2026-09-16-dma.md`),
+serves one 512 KiB record at a time ([`docs/results/2026-09-16-dma.md`](https://github.com/Lasimeri/Intel-Phi-3120A/blob/main/docs/results/2026-09-16-dma.md)),
 and that is where a request's time goes now. The comparison that matters
 for a host with no AVX-512 is against running the same code in software:
 `phi512` performs an AVX-512 instruction in about 152 ns once its site is

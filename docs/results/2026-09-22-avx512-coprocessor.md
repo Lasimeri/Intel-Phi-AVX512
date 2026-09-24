@@ -127,13 +127,13 @@ push 4.2 ms and 1.7 ms, and one 65536-element pull took 25 ms. Bulk data
 goes through `/dev/phiblk1`, the DMA block path, because the
 `/dev/phihost` mapping is uncached and streams at 50 MB/s. That path
 serves one 512 KiB record at a time, each a round trip to the host
-daemon with about 500 us of fixed latency (`2026-09-16-dma.md`), which
+daemon with about 500 us of fixed latency ([`2026-09-16-dma.md`](https://github.com/Lasimeri/Intel-Phi-3120A/blob/main/docs/results/2026-09-16-dma.md)), which
 is what these numbers show: 16 MiB is 32 records, about 1.3 ms each on
 the way in. Pipelining records in the host daemon and the card's block
 driver (kernel patch 0026) is the next lever, and it is a transport
 change, not a co-processor one.
 
-Done the same afternoon: `2026-09-22-block-pipeline.md`. The table
+Done the same afternoon: [`2026-09-22-block-pipeline.md`](https://github.com/Lasimeri/Intel-Phi-3120A/blob/main/docs/results/2026-09-22-block-pipeline.md). The table
 above is now 0.49 ms for 65536 elements and 45 ms for 16777216 on card
 0, both directions at the link; the "one record at a time" diagnosis
 was right but the record was not 512 KiB, it was one per scattered

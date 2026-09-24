@@ -41,7 +41,7 @@ and Knights Corner deleted parts of the x86-64 baseline. `knc_illegal`
 rejects `cmov` (which is in the 64-bit baseline and which compilers emit
 freely), `pause`, the three fences, scalar prefetch, `popcnt`, `lzcnt`,
 `tzcnt`, `clflush`, and anything VEX-encoded, since the card has no `xmm` or
-`ymm` registers at all. `docs/research/isa-deletions.md` carries the full
+`ymm` registers at all. [`docs/research/isa-deletions.md`](https://github.com/Lasimeri/Intel-Phi-3120A/blob/main/docs/research/isa-deletions.md) carries the full
 list with its sources.
 
 ## Limits worth knowing before using it

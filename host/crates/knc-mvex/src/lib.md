@@ -42,7 +42,7 @@ Instructions covered:
 Every integer vector instruction on this machine operates on 32-bit or
 64-bit lanes; there are no byte or word forms in the ISA at all, so the
 `D` set above is the complete integer vocabulary a codec can use here
-(`docs/research/compression-on-knc.md`). The `D` forms are `W0` where the
+([`docs/research/compression-on-knc.md`](https://github.com/Lasimeri/Intel-Phi-3120A/blob/main/docs/research/compression-on-knc.md)). The `D` forms are `W0` where the
 `PD` forms are `W1`, which is the only difference in the prefix.
 
 The immediate-count shifts are the one `NDD` family: the destination is
@@ -62,11 +62,11 @@ assembly.
 Three sources pin the bytes, in decreasing strength:
 
 1. Hardware: `probe_bytes_verified_on_the_card` holds the bytes of
-   `card/examples/vpu_probe.S`, which ran on the card on 2026-09-15 with
-   every lane checked (`docs/results/2026-09-15-vpu.md`), and
+   [`card/examples/vpu_probe.S`](https://github.com/Lasimeri/Intel-Phi-3120A/blob/main/card/examples/vpu_probe.S), which ran on the card on 2026-09-15 with
+   every lane checked ([`docs/results/2026-09-15-vpu.md`](https://github.com/Lasimeri/Intel-Phi-3120A/blob/main/docs/results/2026-09-15-vpu.md)), and
    `integer_bytes_verified_on_the_card` holds the bytes of
-   `card/examples/vpu_int.S`, which ran on 2026-09-20 with 0 of 32 checks
-   failing (`docs/results/2026-09-20-mvex-integer.md`). The integer set
+   [`card/examples/vpu_int.S`](https://github.com/Lasimeri/Intel-Phi-3120A/blob/main/card/examples/vpu_int.S), which ran on 2026-09-20 with 0 of 32 checks
+   failing ([`docs/results/2026-09-20-mvex-integer.md`](https://github.com/Lasimeri/Intel-Phi-3120A/blob/main/docs/results/2026-09-20-mvex-integer.md)). The integer set
    has no Intel macro to reproduce, so hardware is its only reference,
    which is why the probe covers a memory second source, the `NDD` form
    with a register above `zmm15`, and merge masking.
@@ -109,5 +109,5 @@ them and produces results bit-identical to the host's FMA3 hardware over
 The encoder library only. Its generator binary, `knc-mvex-gen`, which
 writes the card kernel's vector-state header and the stack's own
 hand-vectorised kernels and pins them in tests, stays with the stack
-(Intel-Phi-3120A, `host/crates/knc-mvex/src/main.rs`); the library was
+(Intel-Phi-3120A, [`host/crates/knc-mvex/src/main.rs`](https://github.com/Lasimeri/Intel-Phi-3120A/blob/main/host/crates/knc-mvex/src/main.rs)); the library was
 identical in both repositories at the split (stack commit 0f49eac).

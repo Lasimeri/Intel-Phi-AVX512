@@ -16,4 +16,4 @@ flight on the same card.
 
 Built on the card: `phi -c N put card/vpu/blkbench.c /tmp/blkbench.c`,
 `phi -c N run cc -O2 -o /tmp/blkbench /tmp/blkbench.c`,
-`phi -c N run /tmp/blkbench`. Results: `docs/results/2026-09-22-block-pipeline.md`.
+`phi -c N run /tmp/blkbench`. Results: [`docs/results/2026-09-22-block-pipeline.md`](https://github.com/Lasimeri/Intel-Phi-3120A/blob/main/docs/results/2026-09-22-block-pipeline.md).

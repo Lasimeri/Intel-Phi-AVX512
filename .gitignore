@@ -1,8 +1,6 @@
-# Rust
+# Build outputs
 /host/target/
 **/*.rs.bk
-
-# Build outputs
 /tools/*.out
 *.o
 *.bin

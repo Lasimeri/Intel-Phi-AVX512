@@ -24,7 +24,7 @@ compute per token against **70 ms pulling and 97 ms pushing**, at 0.2 to
 not bandwidth: the block device's round trip through the card's block
 layer and the host's daemon, whose floor is 85 us back to back and about
 85 more after an idle gap (the stack's
-`docs/results/2026-09-22-block-pipeline.md`), and at generation every
+[`docs/results/2026-09-22-block-pipeline.md`](https://github.com/Lasimeri/Intel-Phi-3120A/blob/main/docs/results/2026-09-22-block-pipeline.md)), and at generation every
 request comes after a gap.
 
 ## What was redundant, and what removing it was worth

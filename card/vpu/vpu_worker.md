@@ -157,7 +157,7 @@ With the host daemon pipelining records, the card driver's poller
 staying awake around requests (kernel patch 0029) and huge pages, the
 transport for 65536 elements is 0.25 ms in and 0.17 ms out on card 0,
 against 0.05 ms of compute: 0.49 ms wall for a request that cost 2.9 ms
-the day it first worked (`docs/results/2026-09-22-block-pipeline.md`).
+the day it first worked ([`docs/results/2026-09-22-block-pipeline.md`](https://github.com/Lasimeri/Intel-Phi-3120A/blob/main/docs/results/2026-09-22-block-pipeline.md)).
 64 MiB each way moves at the link, 21 ms in and 20 ms out.
 
 ## Status codes

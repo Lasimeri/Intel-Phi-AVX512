@@ -56,7 +56,7 @@ executed thousands of times on the host CPU.
 
 The polynomial kernel is the one the card has compiled in
 (`card/examples/avx512_poly.S`, degree 30, 16 lanes), so the comparison
-is direct (`2026-09-22-block-pipeline.md`):
+is direct ([`2026-09-22-block-pipeline.md`](https://github.com/Lasimeri/Intel-Phi-3120A/blob/main/docs/results/2026-09-22-block-pipeline.md)):
 
 | degree-30 polynomial | host emulation (seamless) | card, explicit, transport included |
 | --- | --- | --- |

@@ -7,9 +7,9 @@ HOST := host
 .PHONY: help build test fmt clippy docs-check layout-check check clean
 
 help: ## Show this help
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-14s %s\n", $$1, $$2}'
 
-build: ## Build the host workspace (libphi512.so, phi-vpu, the translator, the encoder)
+build: ## Build the host workspace (libphi512.so, libggml_phi.so, phi-vpu, the translator, the encoder)
 	cd $(HOST) && cargo build && cargo build --release
 
 test: ## Run host tests that do not need the card

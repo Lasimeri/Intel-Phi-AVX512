@@ -101,7 +101,7 @@ A `cmovne` added to the bench kernel's prologue killed the worker with
 Knights Corner deletes CMOV, which the ISA reference lists among the
 removed instructions (327364-001, appendix B) and the stack repository
 has carried from the start (`Intel-Phi-3120A`, `README.md` and
-`docs/research/abi-and-toolchain.md`: its LLVM is patched so that
+[`docs/research/abi-and-toolchain.md`](https://github.com/Lasimeri/Intel-Phi-3120A/blob/main/docs/research/abi-and-toolchain.md): its LLVM is patched so that
 `FeatureX86_64` does not imply `FeatureCMOV`, and `phi-isa-audit` flags
 any that survive). So no compiled code here can hit it, and nothing had:
 only hand-written scalar code in `kernelgen` can, and it uses a branch

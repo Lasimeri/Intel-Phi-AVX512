@@ -37,10 +37,12 @@ the rest is moving 64 MiB each way over the card's Gen2 x8 link.
   card kernel must carry patch 0030 (the vector unit across a signal
   handler), which every kernel built there since 2026-09-22 does. The
   scripts here find the stack through `PHI_STACK_ROOT`, the `phi`
-  command on PATH, or a directory named `Intel Phi 3120A` next to this
-  one (`scripts/stack.md`).
+  command on PATH, or a checkout next to this one or in `$HOME`, named
+  `Intel-Phi-3120A` (a `git clone`) or `Intel Phi 3120A`
+  ([`scripts/stack.md`](scripts/stack.md)).
 - `make build` here: `libphi512.so` (the library the wrapper preloads),
-  `phi-vpu` (the explicit driver), the translator and the encoder.
+  `libggml_phi.so` (the ggml backend), `phi-vpu` (the explicit driver),
+  the translator and the encoder.
 - The card's worker is deployed and started by the wrapper itself the
   first time (`scripts/phi-vpu.sh -c N deploy|start` by hand); it lives
   on the card's persistent disk after that.
@@ -174,6 +176,7 @@ same ones).
 | `host/crates/avx512-xlate` | EVEX to MVEX: the byte-level rewriter for the seamless path and the builder-based translator for kernels |
 | `host/crates/knc-mvex` | the MVEX encoder the translator builds on |
 | `host/crates/phi-vpu` | the protocol with the card worker, the shared window, the explicit driver |
+| `host/crates/phi-ggml` | `libggml_phi.so`, the ggml backend: matrix multiplies shared by rows between the host and the cards |
 | `card/vpu` | the card-side worker: the exec engine and the explicit path's thread pool; built on the card by `scripts/phi-vpu.sh deploy` |
 | `card/examples` | the AVX-512 kernel and its translation the explicit path and the ground-truth check use |
 | `tools` | the seamless test, the conformance programs, the protocol layout check |
@@ -183,6 +186,22 @@ same ones).
 
 `make check` runs the documentation rules, formatting, lints, tests and
 the protocol layout check; `CONTRIBUTING.md` has the rules.
+
+## The repositories
+
+| repository | what | how it is found |
+| --- | --- | --- |
+| [Intel-Phi-3120A](https://github.com/Lasimeri/Intel-Phi-3120A) | the cards' software stack: boots them, serves their memory, the `phi` command | `PHI_STACK_ROOT`, else `phi` on PATH, else a checkout next to this one, else in `$HOME` |
+| Intel-Phi-AVX512 (this one) | the cards as an AVX-512 co-processor | `PHI_AVX512_ROOT`, else a checkout next to Intel-Phi-Jev, else in `$HOME` |
+| [Intel-Phi-Jev](https://github.com/Lasimeri/Intel-Phi-Jev) | `xks`, a local Jev (TypeSafe System One) whose model runs through `libggml_phi.so` (its `cards` site) and `phi512.sh` (its `avx512` site) | by Mechanical-Jev |
+| [Mechanical-Jev](https://github.com/Lasimeri/Mechanical-Jev) | `mjev`, the asking side of that Jev | |
+
+Clone them side by side and nothing needs configuring: each finds the
+next under its clone's name or the spaced one. What Intel-Phi-Jev
+consumes from here (`scripts/phi512.sh`, `scripts/phi-vpu.sh`,
+`host/target/release/libggml_phi.so`, the `PHI_GGML_*` and `PHI_VPU_*`
+variables) stays as it is across changes; [`CONTRIBUTING.md`](CONTRIBUTING.md)
+has the rules the repositories share. MIT ([`LICENSE-MIT`](LICENSE-MIT)).
 
 ## History
 

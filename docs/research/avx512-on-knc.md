@@ -302,4 +302,4 @@ Bit-exact AVX-512F execution on this card is possible. The work is:
 The approximation instructions are inside the AVX-512 error bound but not bit
 identical, because AVX-512 does not define their bits.
 
-Related: `isa-deletions.md`, `abi-and-toolchain.md`.
+Related: [`isa-deletions.md`](https://github.com/Lasimeri/Intel-Phi-3120A/blob/main/docs/research/isa-deletions.md), [`abi-and-toolchain.md`](https://github.com/Lasimeri/Intel-Phi-3120A/blob/main/docs/research/abi-and-toolchain.md).
