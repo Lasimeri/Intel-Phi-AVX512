@@ -49,3 +49,13 @@ stored: 0 float32, 1 float16. The card's quantized kernels up-convert a
 float16 memory operand for nothing, so this halves what crosses the link
 and what sits in the card's L2; the float weight types have no such
 kernel and the card rejects the request rather than misreading the rows.
+
+`K_FFN` (7) is a feed-forward block's share in one request, its
+descriptor `Ffn` (`struct vpu_ffn`, 192 bytes) at `OFF_FFN` (13440, just
+after the matmul one): three resident slices (gate and up rows, down's
+columns for the same run of the intermediate), the run, the shapes, the
+activations and the result, and `h_type`, the intermediate's format on
+the card (0 float32, 1 float16, which overflows past 65504). The unit
+test and `tools/vpu-layout-check.c` pin the offsets as for the others.
+`MM_SWIGLU` (98) is the diagnostic type that runs the card's SwiGLU
+alone (`card/vpu/vpu_matmul.md`).

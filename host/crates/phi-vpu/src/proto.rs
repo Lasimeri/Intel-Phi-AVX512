@@ -352,6 +352,9 @@ pub const MM_Q5_K: u32 = 3;
 pub const MM_Q6_K: u32 = 4;
 pub const MM_Q8_0: u32 = 5;
 pub const MM_IQ4_XS: u32 = 6;
+/// Diagnostic (`VPU_MM_SWIGLU`): `d = silu(g) * u` over `m` floats, g at
+/// `b_off` and u at `b_off + nb_b`, through the card's `phi_swiglu`.
+pub const MM_SWIGLU: u32 = 98;
 
 /// `struct vpu_matmul`: one upload, multiply or free.
 #[repr(C)]
@@ -381,6 +384,73 @@ pub struct Matmul {
     pub n_tokens: u64,
     pub b_rows: u64,
     pub ids_bytes: u64,
+}
+
+/// A feed-forward block's share in one request: the gate and up rows of
+/// this card's run of the intermediate, the SwiGLU of them, and the down
+/// projection over the same run of its columns, returned as a partial sum
+/// over every output row (`struct vpu_ffn`, vpu_matmul.h). The
+/// intermediate never crosses the link.
+pub const K_FFN: u32 = 7;
+/// Window offset of the feed-forward descriptor, after the matmul one.
+pub const OFF_FFN: usize = 13440;
+
+/// `struct vpu_ffn`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Ffn {
+    /// The resident slices: gate and up `rows` rows of `k` (strides
+    /// `nb_gate`, `nb_up`), down `m_out` rows of this card's columns
+    /// only (stride `nb_down`).
+    pub gate_id: u64,
+    pub up_id: u64,
+    pub down_id: u64,
+    pub gate_type: u32,
+    pub up_type: u32,
+    pub down_type: u32,
+    /// The activations: 0 float32, 1 float16.
+    pub b_type: u32,
+    /// The run this request computes: a multiple of 256, at most what
+    /// the slices hold (a batch may give the host the rest of it).
+    pub rows: u64,
+    pub k: u64,
+    pub m_out: u64,
+    pub n: u64,
+    pub nb_gate: u64,
+    pub nb_up: u64,
+    pub nb_down: u64,
+    pub nb_b: u64,
+    pub b_off: u64,
+    pub d_off: u64,
+    pub chunk: u64,
+    /// The intermediate as the down projection reads it: 0 float32, which
+    /// holds any magnitude, 1 float16, whose kernels are quicker and which
+    /// overflows past 65504 (so only for activations known to be bounded).
+    pub h_type: u32,
+    pub pad: u32,
+    pub reserved: [u64; 7],
+}
+
+#[cfg(test)]
+mod ffn_layout {
+    use super::*;
+    use std::mem::{offset_of, size_of};
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn ffn_descriptor_matches_the_c_struct() {
+        assert_eq!(size_of::<Ffn>(), 192);
+        assert_eq!(offset_of!(Ffn, gate_type), 24);
+        assert_eq!(offset_of!(Ffn, b_type), 36);
+        assert_eq!(offset_of!(Ffn, rows), 40);
+        assert_eq!(offset_of!(Ffn, m_out), 56);
+        assert_eq!(offset_of!(Ffn, nb_gate), 72);
+        assert_eq!(offset_of!(Ffn, nb_b), 96);
+        assert_eq!(offset_of!(Ffn, b_off), 104);
+        assert_eq!(offset_of!(Ffn, d_off), 112);
+        assert_eq!(offset_of!(Ffn, chunk), 120);
+        assert_eq!(offset_of!(Ffn, h_type), 128);
+        assert!(OFF_FFN >= OFF_MATMUL + 128 && OFF_FFN + 192 <= 16384);
+    }
 }
 
 #[cfg(test)]

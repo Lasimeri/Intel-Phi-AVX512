@@ -205,3 +205,27 @@ the 27B, two rounds each:
 The card's row stride is `k * 2 + B_PAD` rather than `nb_b + B_PAD`; the
 padding is unchanged and for the same reason (`B_PAD`, the L1 set
 conflict).
+
+## Feed-forward blocks, fused (ffn.rs)
+
+The backend also takes ggml's SwiGLU (the split form llama.cpp builds,
+`ggml_swiglu_split(gate, up)`), so that a feed-forward block's gate, up,
+SwiGLU and down arrive in one sub-graph. The C glue finds the blocks by
+structure and runs each as one request per card through `ffn.rs`: each
+card holds a run of the intermediate as gate and up rows and down's
+columns, and returns a partial sum the host adds to its own; the
+intermediate never crosses the link. `ffn.md` has the shape,
+`docs/results/2026-09-23-ffn-per-request.md` the numbers.
+
+The two paths share what should be shared: the batch share and its
+estimator (`pp_feed`, which both feed), the per-tensor judgement's rule
+(per block for the fused one), the float16 activations, and the cards'
+budget. They do not share tensors: a block's three are the fused path's
+alone once it has planned them (`Ctx::ffn_members`), because it holds
+`ffn_down` by columns and the plain path would want rows; if the plain
+path had given them to the cards first, those slices are freed.
+
+`PHI_GGML_FFN=0` turns it off (SwiGLU is not taken and the graph splits
+as before), `PHI_GGML_FFN_H16=1` keeps the intermediate as float16 on
+the card (faster down kernels, and it overflows past 65504, so only
+where the activations are known to be bounded).

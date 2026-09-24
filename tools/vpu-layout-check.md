@@ -12,3 +12,7 @@ tcc -run tools/vpu-layout-check.c      # or: make layout-check
 The two sides share memory with nothing checking the layout at run time,
 so this is the check. It is a sibling of `ring-layout-check.c`, which does
 the same for the ring transport.
+
+It covers the feed-forward descriptor too (`struct vpu_ffn`,
+`VPU_K_FFN`, `VPU_OFF_FFN`, since 2026-09-23), and `matmul.b_type`, the
+activations' format, whose offset nothing pinned before.

@@ -20,3 +20,11 @@ end), encoded for the card directly rather than translated from an
 AVX-512 assembly file, because the float16 up-converting load and the
 byte up-conversions have no AVX-512 spelling the assembly-level
 translator (`avx512-xlate`) knows.
+
+The feed-forward's SwiGLU is `glu.rs` (`phi_swiglu` and its float16 and
+masked twins), emitted after the quantized kernels; it uses `quant.rs`'s
+assembler and shared constant block, whose `Asm::i` and `Asm::t` are
+`pub(crate)` for it. Regenerate into a temporary file and move it into
+place only when the generator succeeded: a redirect straight into
+`card/vpu/vpu_matmul_kernel.S` truncates it when the build fails, and the
+card's next build then fails on every kernel symbol (2026-09-23).

@@ -56,7 +56,10 @@ pub const C_U_15: i32 = 776;
 pub const C_U_C0: i32 = 780;
 pub const C_U_3: i32 = 784;
 pub const C_U_32: i32 = 788;
-pub const C_BYTES: i32 = 832;
+// The SwiGLU kernel's two (glu.rs): -log2(e) and 1.0, broadcast.
+pub const C_NEG_LOG2E: i32 = 832;
+pub const C_ONE: i32 = 836;
+pub const C_BYTES: i32 = 896;
 /// Prefetch distances, in superblocks: the L1 line two ahead, the L2 six
 /// ahead (about 500 ns of work at the kernels' rate, past GDDR latency).
 const PF_L1: i32 = 2;
@@ -74,11 +77,11 @@ const ROWS: [Gpr; 8] = [Gpr::Rsi, Gpr::R10, Gpr::R11, Gpr::Rax, Gpr::Rbx, Gpr::R
 pub struct Asm(pub String);
 
 impl Asm {
-    fn i(&mut self, x: &Insn) {
+    pub(crate) fn i(&mut self, x: &Insn) {
         self.0.push_str(&x.gas());
         self.0.push('\n');
     }
-    fn t(&mut self, x: &str) {
+    pub(crate) fn t(&mut self, x: &str) {
         self.0.push_str("    ");
         self.0.push_str(x);
         self.0.push('\n');

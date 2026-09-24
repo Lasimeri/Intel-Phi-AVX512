@@ -126,3 +126,7 @@ The float weight formats have no twin, because their kernels are the
 `phi_dot4_*` family and not generated here; the card refuses a float16
 activation request for them rather than reading the rows wrongly
 (`card/vpu/vpu_matmul.md`).
+
+The shared constant block is 896 bytes now: `C_NEG_LOG2E` (832) and
+`C_ONE` (836) are the SwiGLU's (`glu.rs`), -log2(e) and 1.0 broadcast
+from memory. The card's `consts_init` writes them with the rest.

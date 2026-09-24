@@ -189,3 +189,12 @@ every huge page to the multiplies: on a card with 5.5 GiB it is half a
 gigabyte more of the model resident. `scripts/phi-ggml.sh` starts
 workers with `-e 0`; `scripts/phi-vpu.sh start` passes anything in
 `PHI_VPU_ARGS`.
+
+## The matrix-multiply requests
+
+`VPU_K_UPLOAD`, `VPU_K_MATMUL`, `VPU_K_FREE`, `VPU_K_MATMUL_ID` and
+`VPU_K_FFN` (7, a feed-forward block's share in one request, since
+2026-09-23) all go to `vpu_matmul_run` (`vpu_matmul.md`), which reads
+its descriptor from the control area: the matmul one at
+`VPU_OFF_MATMUL`, the feed-forward one at `VPU_OFF_FFN`. The worker adds
+nothing of its own to them but the timing in the reply.

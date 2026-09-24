@@ -218,6 +218,30 @@ mod tests {
     }
 
     #[test]
+    fn a_converting_store_is_the_plain_store_plus_sss() {
+        use crate::vmovaps_store;
+        let plain = vmovaps_store(Mem::new(Gpr::Rdx, 32), Zmm(5));
+        let none = vmovaps_store_conv(Mem::new(Gpr::Rdx, 32), Zmm(5), Conv::None, K(0));
+        assert_eq!(plain.bytes, none.bytes);
+        // {float16} is SSS 011 in P2, a mask its aaa, nothing else moves
+        let half = vmovaps_store_conv(Mem::new(Gpr::Rdx, 32), Zmm(5), Conv::F16, K(1));
+        assert_eq!(half.bytes[3], plain.bytes[3] | 0x30 | 1);
+        assert_eq!(&half.bytes[4..], &plain.bytes[4..]);
+        assert_eq!(half.text, "vmovaps [rdx+32] {k1}{float16}, zmm5");
+    }
+
+    #[test]
+    fn exponent_adjustment_lands_in_the_high_nibble() {
+        // 8.24 fixed point is I6..I4 = 101, round to nearest I1..I0 = 00: 0x50
+        let i = vcvtfxpntps2dq_adj(Zmm(2), Src::Reg(Zmm(3)), Round::Nearest, ExpAdj::Q8_24, K(0));
+        assert_eq!(i.bytes, vec![0x62, 0xf3, 0x79, 0x08, 0xcb, 0xd3, 0x50]);
+        // no adjustment is the plain form, byte for byte
+        let plain = vcvtfxpntps2dq(Zmm(2), Src::Reg(Zmm(3)), Round::Zero, K(0));
+        let adj = vcvtfxpntps2dq_adj(Zmm(2), Src::Reg(Zmm(3)), Round::Zero, ExpAdj::None, K(0));
+        assert_eq!(plain.bytes, adj.bytes);
+    }
+
+    #[test]
     fn unpack_forms() {
         // int32 form D0, float32 form D1, both unprefixed; the store twin carries 66
         assert_eq!(
@@ -266,6 +290,55 @@ pub fn vcvtfxpntps2dq(dst: Zmm, src: Src, mode: Round, k: K) -> Insn {
             src_sss(src),
         ),
         text: format!("vcvtfxpntps2dq {dst}{}, {src}, {}", mask_text(k), mode as u8),
+    }
+}
+
+/// `vmovaps mt {k}, zmm {conv}`: store sixteen floats through a
+/// down-conversion, under a write-mask (MVEX.512.0F.W0 29 /r with SSS the
+/// `Df32` conversion; ISA reference 327364-001, page 379, and table 2.12).
+/// `Conv::F16` writes sixteen halves (32 bytes, 32-byte aligned) rounded in
+/// MXCSR.RC; a lane whose mask bit is clear is not written at all, so two
+/// threads may each store their own lanes of one vector. The broadcast
+/// values of SSS are reserved for stores and refused here.
+pub fn vmovaps_store_conv(mem: Mem, src: Zmm, conv: Conv, k: K) -> Insn {
+    assert!(conv != Conv::Bcast1 && conv != Conv::Bcast4, "001 and 010 are reserved for stores");
+    Insn {
+        bytes: with_sss(mvex(Map::M0F, Pp::None, false, src.0, 0, Rm::Mem(mem), k.0, 0x29, None), conv as u8),
+        text: format!("vmovaps {mem}{}{conv}, {src}", mask_text(k)),
+    }
+}
+
+/// The exponent adjustment of `vcvtfxpntps2dq`: bits I6..I4 of its
+/// immediate, which scale the float by 2^n before the conversion so the
+/// integer it produces is a fixed-point number with n fraction bits (ISA
+/// reference 327364-001, page 169, the "Exponent Adjustment" table; 1xxx
+/// in I7..I4 is reserved and must raise an invalid opcode, so it has no
+/// variant here). `Q8_24` is the one `vexp223ps` reads (page 190).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ExpAdj {
+    None = 0,
+    Q28_4 = 1,
+    Q27_5 = 2,
+    Q24_8 = 3,
+    Q16_16 = 4,
+    Q8_24 = 5,
+    Q1_31 = 6,
+    Q0_32 = 7,
+}
+
+/// `vcvtfxpntps2dq` with an exponent adjustment: float32 to a fixed-point
+/// int32 with `adj`'s fraction bits, rounded in `mode`, saturating (out of
+/// range gives INT_MAX or INT_MIN and NaN gives 0, page 169). With
+/// `ExpAdj::Q8_24` and then `vexp223ps` this is Intel's exp2.
+pub fn vcvtfxpntps2dq_adj(dst: Zmm, src: Src, mode: Round, adj: ExpAdj, k: K) -> Insn {
+    let imm = ((adj as u8) << 4) | mode as u8;
+    Insn {
+        bytes: with_sss(
+            mvex(Map::M0F3A, Pp::P66, false, dst.0, 0, src_rm(src), k.0, 0xcb, Some(imm)),
+            src_sss(src),
+        ),
+        text: format!("vcvtfxpntps2dq {dst}{}, {src}, {imm:#04x}", mask_text(k)),
     }
 }
 

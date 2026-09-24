@@ -62,3 +62,37 @@ Qwen3.8-27B it shows `ffn_gate` and `ffn_up` arriving in one sub-graph
 against one `attn_post_norm` tensor, and `ffn_down` arriving alone
 behind a `ffn_swiglu` the CPU computed, because this backend does not
 claim the gated-linear op.
+
+## Feed-forward blocks
+
+The glue takes `GGML_OP_GLU` when it is SwiGLU in the split form, float32
+with evenly spaced rows (`phi_supports_glu`), unless `PHI_GGML_FFN=0`.
+That is what brings a block's four nodes into one sub-graph; the dumps
+from before and after (`PHI_GGML_GRAPH`) are in the results note.
+
+`phi_graph_compute` scans each sub-graph first (`find_quad`): a SwiGLU
+whose two inputs are multiplies of the same activations in this
+sub-graph, read by a later multiply, with shapes that chain, none of the
+three intermediates marked as a graph output or read by any other node
+here, since the fused path never writes them. A block's gate, up and
+SwiGLU are then skipped where they stand and the block runs at its down
+multiply (`run_ffn`): Rust's `phi_ggml_ffn_begin` starts the cards, the
+host's runs of the intermediate are computed here as one ggml graph
+(`host_ffn`: row leaves of gate and up, the SwiGLU, a leaf of down's
+columns cut at the run's superblocks, summed into the result, the
+intermediates in a scratch buffer kept between calls), and
+`phi_ggml_ffn_end` adds the cards' partials. If the fused path declines
+(a shape it cannot take, or a block judged not worth the cards), the
+four nodes run exactly as they would have without it: the multiplies
+the plain way (`run_mul_mat`) and the SwiGLU on the host.
+
+A SwiGLU that is not part of a block this backend fuses (a mixture of
+experts' own, whose inputs are `MUL_MAT_ID`) runs on the private CPU
+backend here (`host_glu`), which is what llama.cpp's CPU backend would
+have done with it.
+
+The k-sliced multiply `host_ffn` relies on, a quantized weight's leaf
+whose rows are shorter than their stride and start whole blocks in, was
+checked against the whole multiply for Q4_K, Q5_K, Q6_K, Q8_0 and IQ4_XS
+before any of this was written: equal within 1.1e-8 to 5.1e-8 of the
+magnitude, the summation order and nothing else (the results note).

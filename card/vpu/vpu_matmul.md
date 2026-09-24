@@ -171,3 +171,66 @@ sends float32 for them (`host/crates/phi-ggml/src/lib.md`).
 Nothing about this costs the card anything: the up-conversion is a field
 of the memory operand, so the same 128 fused multiply-adds per eight-row
 call read half the bytes (`kernelgen/quant.md` has the rates).
+
+## A feed-forward block in one request (VPU_K_FFN)
+
+`struct vpu_ffn` (192 bytes at `VPU_OFF_FFN`, 13440, just past the
+matmul descriptor in the control area) describes one card's share of a
+SwiGLU feed-forward block: a run `lo..hi` of the intermediate, resident
+as three slices the host uploaded once: `rows` rows of the gate matrix,
+the same rows of the up matrix, and the same **columns** of the down
+matrix (every one of its `m_out` rows, cut at the run's superblocks, so
+it is an ordinary quantized matrix of `m_out` rows of `rows` weights).
+One request then computes, for every column c of the activations,
+
+```text
+h[c][i] = silu(gate[i] . x[c]) * (up[i] . x[c])      i in the run
+d[c][o] = sum over the run of down[o][i] * h[c][i]    every output row o
+```
+
+and returns `d`, a partial sum over the run, which the host adds to its
+own (`host/crates/phi-ggml/src/ffn.md`). The intermediate never leaves
+the card: the request's input is the block's input and its output is
+the block's output, and one round trip replaces three.
+
+`ffn_run` checks each of the three as the ordinary multiply it is
+(`shape_ok`), then runs two dispatches:
+
+1. `ffn_slice` on every thread: the thread's rows of the run, by single
+   rows (the balance any multiply gets), gate then up through
+   `rows_range_q` (the quantized loop with an explicit row range; the
+   old `rows_slice_q` is now that plus `slice_rows`), then the SwiGLU of
+   exactly those rows (`swiglu_range`: whole vectors, and the vector
+   holding either end under a lane mask, `kernelgen/glu.md`). No other
+   thread writes those rows, so the three steps need no barrier.
+2. The down projection over `h`, an ordinary quantized multiply through
+   `rows_slice` whose activations are `h`'s columns.
+
+`h` is float32 unless the request says float16 (`h_type` 1): float16
+lets the down projection use its faster `h` kernels, but overflows past
+65504, and the host does not know the intermediate's range. Its columns
+are a quarter of a page longer than the run, for the same L1 set reason
+as the host's activation padding.
+
+Measured on card 0 (`phi-vpu matmul-check`, one card's share of the 27B:
+gate and up Q5_K 4352 x 5120, down Q6_K 5120 x 4352, compute only, best
+of 4), against the three multiplies it replaces with the same work:
+
+| n | fused, float32 h | fused, float16 h | the three |
+| --- | --- | --- | --- |
+| 1 | 2.620 ms | 2.513 | 2.404 |
+| 8 | 4.798 | 4.807 | 4.409 |
+| 64 | 35.433 | **33.767** | 36.860 |
+
+The compute is within 9 percent either way; what the fusion removes is
+the transport, which the same log puts at about 0.7 ms of pull and 0.9
+of push per request at these sizes, paid once instead of three times.
+The down projection's shape costs a little (5120 rows of 4352 weights
+reads its activations more often per weight than 1280 rows of 17408),
+which is the remaining gap at n 1 and 8.
+
+`VPU_MM_SWIGLU` (98) is the SwiGLU kernel on its own for the checker:
+`m` floats of g at `b_off`, `m` of u at `b_off + nb_b`; `b_type` 0 runs
+`phi_swiglu` over whole vectors, 1 and 2 run `swiglu_range` in float16
+and float32 over abutting ranges that start and end inside vectors,
+leaving the lanes outside them as 0xdead, so a mask off by one shows.

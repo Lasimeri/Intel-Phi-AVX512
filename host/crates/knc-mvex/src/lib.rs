@@ -31,7 +31,9 @@
 use std::fmt;
 
 mod conv;
+mod transc;
 pub use conv::*;
+pub use transc::*;
 
 /// A 512-bit vector register, `zmm0` to `zmm31`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

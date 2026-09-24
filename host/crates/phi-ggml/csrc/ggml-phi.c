@@ -35,6 +35,15 @@ int phi_ggml_end(uint8_t *d, uint64_t nb_d);
 int phi_ggml_end_id(uint8_t *d, uint64_t nb_d, uint64_t nb_d2);
 void phi_ggml_free_all(void);
 
+/* A feed-forward block for the fused path (Rust: ffn.rs, FfnArgs). */
+struct phi_ffn_args {
+    const uint8_t *gate, *up, *down, *x;
+    uint32_t gate_type, up_type, down_type, pad;
+    uint64_t k, inter, m_out, n, nb_gate, nb_up, nb_down, nb_x;
+};
+int64_t phi_ggml_ffn_begin(const struct phi_ffn_args *a);
+int phi_ggml_ffn_end(uint8_t *y, uint64_t nb_y);
+
 /* ---- ggml, resolved at run time ---- */
 
 #define GGML_FNS(X) \
@@ -55,7 +64,12 @@ void phi_ggml_free_all(void);
     X(ggml_backend_dev_t, dev_by_type, ggml_backend_dev_by_type, (enum ggml_backend_dev_type)) \
     X(ggml_backend_t, dev_init, ggml_backend_dev_init, (ggml_backend_dev_t, const char *)) \
     X(ggml_backend_reg_t, dev_backend_reg, ggml_backend_dev_backend_reg, (ggml_backend_dev_t)) \
-    X(void *, reg_get_proc_address, ggml_backend_reg_get_proc_address, (ggml_backend_reg_t, const char *))
+    X(void *, reg_get_proc_address, ggml_backend_reg_get_proc_address, (ggml_backend_reg_t, const char *)) \
+    X(struct ggml_tensor *, swiglu_split, ggml_swiglu_split, (struct ggml_context *, struct ggml_tensor *, struct ggml_tensor *)) \
+    X(struct ggml_tensor *, add, ggml_add, (struct ggml_context *, struct ggml_tensor *, struct ggml_tensor *)) \
+    X(size_t, row_size, ggml_row_size, (enum ggml_type, int64_t)) \
+    X(size_t, nbytes, ggml_nbytes, (const struct ggml_tensor *)) \
+    X(bool, is_contiguous_1, ggml_is_contiguous_1, (const struct ggml_tensor *))
 
 #define DECL(ret, name, sym, args) static ret (*p_##name) args;
 GGML_FNS(DECL)
@@ -177,6 +191,118 @@ static int host_rows(const struct ggml_tensor *node, int64_t from, int64_t to)
     return st == GGML_STATUS_SUCCESS ? 0 : -1;
 }
 
+/* A float32 tensor whose rows are evenly spaced (ggml_is_contiguous_1),
+ * as one leaf of all its rows: a mixture's SwiGLU is three-dimensional,
+ * and a SwiGLU works row by row either way. */
+static struct ggml_tensor *alias_rows(struct ggml_context *ctx, const struct ggml_tensor *t)
+{
+    int64_t rows = t->ne[1] * t->ne[2] * t->ne[3];
+    return alias(ctx, t, 0, rows);
+}
+
+/* A SwiGLU node on the host, whole: ggml's own kernel, the result pointed
+ * at the node's data. This backend takes SwiGLU so that a feed-forward
+ * block arrives in one sub-graph; the ones it does not fuse run here. */
+static int host_glu(const struct ggml_tensor *node)
+{
+    struct ggml_init_params params = { p_tensor_overhead() * 8 + p_graph_overhead_custom(16, false) + 4096, NULL, true };
+    struct ggml_context *ctx = p_init(params);
+    if (!ctx) return -1;
+    struct ggml_tensor *h = p_swiglu_split(ctx, alias_rows(ctx, node->src[0]), alias_rows(ctx, node->src[1]));
+    h->data = node->data;
+    h->nb[1] = node->nb[1];
+    h->nb[2] = h->nb[3] = node->nb[1] * h->ne[1];
+    struct ggml_cgraph *g = p_new_graph_custom(ctx, 16, false);
+    p_build_forward_expand(g, h);
+    enum ggml_status st = p_backend_graph_compute(g_cpu, g);
+    p_free(ctx);
+    return st == GGML_STATUS_SUCCESS ? 0 : -1;
+}
+
+/* ---- a feed-forward block, fused ---- */
+
+/* One block as it sits in a sub-graph: the gate and up multiplies of the
+ * same activations, their SwiGLU, and the down multiply of that (node
+ * indices). */
+struct ffn_quad { int gate, up, glu, down; };
+
+/* The host's intermediates of a block, kept between calls: ggml's own
+ * allocation would fault its pages in again every time, and at a prompt
+ * this is tens of megabytes. */
+static unsigned char *g_scratch;
+static size_t g_scratch_cap;
+
+static void *bump(unsigned char **at, size_t bytes)
+{
+    void *p = *at;
+    *at += (bytes + 63) & ~(size_t)63;
+    return p;
+}
+
+/* The host's runs of a block's intermediate, `ranges[r]` = from..to: for
+ * each, its gate and up rows, their SwiGLU, and down over the same columns
+ * (a leaf of down's rows cut at the run's superblocks, which ggml's
+ * multiply takes as it takes any row stride; checked 2026-09-23 against
+ * the whole multiply, docs/results/2026-09-23-ffn-per-request.md), summed
+ * into the block's result. One graph, so ggml's pool runs it without
+ * coming back here between the steps. */
+static int host_ffn(struct ggml_tensor *const *nodes, const struct ffn_quad *q, const uint64_t (*ranges)[2], int nr)
+{
+    const struct ggml_tensor *gate = nodes[q->gate], *up = nodes[q->up];
+    struct ggml_tensor *down = nodes[q->down];
+    const struct ggml_tensor *wg = gate->src[0], *wu = up->src[0], *wd = down->src[0], *x = gate->src[1];
+    int64_t n = x->ne[1], m_out = wd->ne[1];
+    size_t need = 0;
+    for (int r = 0; r < nr; r++)
+        need += 3 * (((size_t)(ranges[r][1] - ranges[r][0]) * n * 4 + 63) & ~(size_t)63) + (((size_t)m_out * n * 4 + 63) & ~(size_t)63) * 2;
+    if (need > g_scratch_cap) {
+        free(g_scratch);
+        g_scratch = aligned_alloc(64, need);
+        g_scratch_cap = g_scratch ? need : 0;
+        if (!g_scratch) return -1;
+    }
+    struct ggml_init_params params = { p_tensor_overhead() * (16 + 12 * (size_t)nr) + p_graph_overhead_custom(64, false) + 4096, NULL, true };
+    struct ggml_context *ctx = p_init(params);
+    if (!ctx) return -1;
+    unsigned char *at = g_scratch;
+    struct ggml_tensor *xx = alias(ctx, x, 0, n), *acc = NULL;
+    for (int r = 0; r < nr; r++) {
+        int64_t from = (int64_t)ranges[r][0], rows = (int64_t)(ranges[r][1] - ranges[r][0]);
+        struct ggml_tensor *gg = p_mul_mat(ctx, alias(ctx, wg, from, rows), xx);
+        gg->data = bump(&at, p_nbytes(gg));
+        struct ggml_tensor *uu = p_mul_mat(ctx, alias(ctx, wu, from, rows), xx);
+        uu->data = bump(&at, p_nbytes(uu));
+        struct ggml_tensor *hh = p_swiglu_split(ctx, gg, uu);
+        hh->data = bump(&at, p_nbytes(hh));
+        struct ggml_tensor *wdc = p_new_tensor_2d(ctx, wd->type, rows, m_out);
+        wdc->data = (char *)wd->data + p_row_size(wd->type, from);
+        wdc->nb[1] = wd->nb[1];
+        wdc->nb[2] = wdc->nb[3] = wd->nb[1] * m_out;
+        struct ggml_tensor *yy = p_mul_mat(ctx, wdc, hh);
+        yy->data = bump(&at, p_nbytes(yy));
+        if (acc) {
+            acc = p_add(ctx, acc, yy);
+            acc->data = bump(&at, p_nbytes(acc));
+        } else {
+            acc = yy;
+        }
+    }
+    acc->data = down->data;
+    acc->nb[1] = down->nb[1];
+    acc->nb[2] = acc->nb[3] = down->nb[1] * n;
+    struct ggml_cgraph *g = p_new_graph_custom(ctx, 64, false);
+    p_build_forward_expand(g, acc);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    enum ggml_status st = p_backend_graph_compute(g_cpu, g);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    if (getenv("PHI_GGML_VERBOSE"))
+        fprintf(stderr, "ggml-phi: host part of a feed-forward block, %d run(s) of %lld, n %lld: compute %.3f ms\n", nr,
+                (long long)wg->ne[1], (long long)n, (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
+    p_free(ctx);
+    return st == GGML_STATUS_SUCCESS ? 0 : -1;
+}
+
 /* ---- what the cards take ---- */
 
 /* ggml's type to the card service's code (proto.rs MM_*), or -1. */
@@ -232,6 +358,137 @@ static bool phi_supports_mul_mat(const struct ggml_tensor *op)
     return phi_ggml_supports((uint32_t)t, (uint64_t)src0->ne[1], (uint64_t)src0->ne[0], src0->nb[1], src1->nb[1], (uint64_t)src1->ne[1]) != 0;
 }
 
+/* PHI_GGML_FFN (1): take SwiGLU, so that a feed-forward block's four
+ * nodes arrive in one sub-graph and run as one request per card; 0 leaves
+ * the graph as it was before. */
+static int ffn_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PHI_GGML_FFN");
+        on = !(e && atoi(e) == 0);
+    }
+    return on;
+}
+
+/* SwiGLU in the split form llama.cpp builds (ggml_swiglu_split(gate, up):
+ * silu(src0) * src1), float32, rows evenly spaced. */
+static bool phi_supports_glu(const struct ggml_tensor *op)
+{
+    const struct ggml_tensor *a = op->src[0], *b = op->src[1];
+    if (!ffn_enabled() || resolve() != 0 || !a || !b) return false;
+    if (ggml_get_op_params_i32(op, 0) != GGML_GLU_OP_SWIGLU) return false;
+    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
+    return p_is_contiguous_1(a) && p_is_contiguous_1(b) && p_is_contiguous_1(op);
+}
+
+/* A multiply of a quantized weight the cards take, two-dimensional, to be
+ * computed in this sub-graph. */
+static int weight_mm(const struct ggml_tensor *t)
+{
+    const struct ggml_tensor *w = t->src[0], *x = t->src[1];
+    return t->op == GGML_OP_MUL_MAT && w && x && (t->flags & GGML_TENSOR_FLAG_COMPUTE) && strstr(w->name, "weight") &&
+           card_type(w->type) >= 2 && w->ne[2] == 1 && w->ne[3] == 1 && x->ne[2] == 1 && x->ne[3] == 1 &&
+           x->type == GGML_TYPE_F32 && x->nb[0] == 4 && t->type == GGML_TYPE_F32 && t->nb[0] == 4;
+}
+
+static int node_index(const struct ggml_cgraph *cg, const struct ggml_tensor *t, int before)
+{
+    for (int i = 0; i < before; i++)
+        if (cg->nodes[i] == t) return i;
+    return -1;
+}
+
+/* Does any node of the sub-graph but `except` read `t`, directly or
+ * through a view? */
+static int read_elsewhere(const struct ggml_cgraph *cg, const struct ggml_tensor *t, const struct ggml_tensor *except)
+{
+    for (int i = 0; i < cg->n_nodes; i++) {
+        const struct ggml_tensor *nd = cg->nodes[i];
+        if (nd == except) continue;
+        if (nd->view_src == t) return 1;
+        for (int s = 0; s < GGML_MAX_SRC; s++)
+            if (nd->src[s] == t) return 1;
+    }
+    return 0;
+}
+
+/* Is node i the SwiGLU of a feed-forward block the fused path can take?
+ * By structure, not by name or order: its two inputs are multiplies of
+ * the same activations in this sub-graph, a later multiply reads it, the
+ * shapes chain, and none of the three intermediates is an output of the
+ * graph or read by anything else here, since the fused path never writes
+ * them. */
+static int find_quad(const struct ggml_cgraph *cg, int i, struct ffn_quad *q)
+{
+    const struct ggml_tensor *glu = cg->nodes[i];
+    if (glu->op != GGML_OP_GLU || !(glu->flags & GGML_TENSOR_FLAG_COMPUTE) || !phi_supports_glu(glu)) return 0;
+    const struct ggml_tensor *g = glu->src[0], *u = glu->src[1];
+    int ig = node_index(cg, g, i), iu = node_index(cg, u, i);
+    if (ig < 0 || iu < 0 || !weight_mm(g) || !weight_mm(u) || g->src[1] != u->src[1]) return 0;
+    int id = -1;
+    for (int j = i + 1; j < cg->n_nodes && id < 0; j++)
+        if (cg->nodes[j]->op == GGML_OP_MUL_MAT && cg->nodes[j]->src[1] == glu) id = j;
+    if (id < 0 || !weight_mm(cg->nodes[id])) return 0;
+    const struct ggml_tensor *wg = g->src[0], *wu = u->src[0], *wd = cg->nodes[id]->src[0];
+    if (wg->ne[0] != wu->ne[0] || wg->ne[1] != wu->ne[1] || wd->ne[0] != wg->ne[1]) return 0;
+    if ((g->flags | u->flags | glu->flags) & GGML_TENSOR_FLAG_OUTPUT) return 0;
+    if (read_elsewhere(cg, g, glu) || read_elsewhere(cg, u, glu) || read_elsewhere(cg, glu, cg->nodes[id])) return 0;
+    q->gate = ig;
+    q->up = iu;
+    q->glu = i;
+    q->down = id;
+    return 1;
+}
+
+/* One multiply, the plain way: the cards start on their rows (Rust,
+ * phi_ggml_begin), the host computes its ranges here, the cards' rows are
+ * gathered. */
+static int run_mul_mat(struct ggml_tensor *node)
+{
+    const struct ggml_tensor *src0 = node->src[0], *src1 = node->src[1];
+    int keep = strstr(src0->name, "weight") != NULL;
+    int64_t nr = phi_ggml_begin(src0->data, (uint32_t)card_type(src0->type), (uint64_t)src0->ne[1], (uint64_t)src0->ne[0],
+                                src0->nb[1], keep, src1->data, (uint64_t)src1->ne[1], src1->nb[1]);
+    if (nr < 0) return -1;
+    for (int64_t r = 0; r < nr; r++) {
+        uint64_t from, to;
+        if (!phi_ggml_host_range((uint64_t)r, &from, &to)) break;
+        if (to > from && host_rows(node, (int64_t)from, (int64_t)to) != 0) return -1;
+    }
+    return phi_ggml_end(node->data, node->nb[1]) == 0 ? 0 : -1;
+}
+
+/* A block: the cards' runs through Rust (ffn.rs), the host's here, the
+ * partials added. If the fused path declines, the four nodes run exactly
+ * as they would have without it: the multiplies the plain way (whose
+ * Rust side keeps a planned block's tensors on the host, and gives the
+ * cards those of a block it never planned) and the SwiGLU on the host. */
+static int run_ffn(struct ggml_tensor *const *nodes, const struct ffn_quad *q)
+{
+    struct ggml_tensor *gate = nodes[q->gate], *up = nodes[q->up], *glu = nodes[q->glu], *down = nodes[q->down];
+    const struct ggml_tensor *wg = gate->src[0], *wu = up->src[0], *wd = down->src[0], *x = gate->src[1];
+    struct phi_ffn_args a = {
+        wg->data, wu->data, wd->data, x->data,
+        (uint32_t)card_type(wg->type), (uint32_t)card_type(wu->type), (uint32_t)card_type(wd->type), 0,
+        (uint64_t)wg->ne[0], (uint64_t)wg->ne[1], (uint64_t)wd->ne[1], (uint64_t)x->ne[1],
+        wg->nb[1], wu->nb[1], wd->nb[1], x->nb[1],
+    };
+    int64_t nr = phi_ggml_ffn_begin(&a);
+    if (nr == -2) return run_mul_mat(gate) || run_mul_mat(up) || host_glu(glu) || run_mul_mat(down) ? -1 : 0;
+    if (nr < 0) return -1;
+    uint64_t ranges[17][2];
+    int got = 0;
+    for (int64_t r = 0; r < nr && got < 17; r++)
+        if (phi_ggml_host_range((uint64_t)r, &ranges[got][0], &ranges[got][1]) && ranges[got][1] > ranges[got][0]) got++;
+    if (got == 0) {
+        for (int64_t c = 0; c < x->ne[1]; c++) memset((char *)down->data + c * down->nb[1], 0, (size_t)wd->ne[1] * 4);
+    } else if (host_ffn(nodes, q, (const uint64_t(*)[2])ranges, got) != 0) {
+        return -1;
+    }
+    return phi_ggml_ffn_end(down->data, down->nb[1]) == 0 ? 0 : -1;
+}
+
 /* ---- backend ---- */
 
 static const char *phi_backend_get_name(ggml_backend_t backend) { (void)backend; return "Phi"; }
@@ -263,24 +520,39 @@ static enum ggml_status phi_graph_compute(ggml_backend_t backend, struct ggml_cg
 {
     (void)backend;
     dump_graph(cgraph);
+    /* The feed-forward blocks of this sub-graph first: a block's gate, up
+     * and SwiGLU are skipped where they stand (role 1) and the whole block
+     * runs at its down multiply (role 2), which comes after all three. */
+    static unsigned char *role;
+    static struct ffn_quad *quads;
+    static int cap;
+    if (cgraph->n_nodes > cap) {
+        free(role);
+        free(quads);
+        cap = cgraph->n_nodes;
+        role = malloc((size_t)cap);
+        quads = malloc((size_t)cap * sizeof *quads);
+        if (!role || !quads) { cap = 0; return GGML_STATUS_ALLOC_FAILED; }
+    }
+    memset(role, 0, (size_t)cgraph->n_nodes);
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        struct ffn_quad q;
+        if (!find_quad(cgraph, i, &q)) continue;
+        role[q.gate] = role[q.up] = role[q.glu] = 1;
+        role[q.down] = 2;
+        quads[q.down] = q;
+    }
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor *node = cgraph->nodes[i];
-        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) continue;
-        switch (node->op) {
-        case GGML_OP_MUL_MAT: {
-            const struct ggml_tensor *src0 = node->src[0], *src1 = node->src[1];
-            int keep = strstr(src0->name, "weight") != NULL;
-            int64_t nr = phi_ggml_begin(src0->data, (uint32_t)card_type(src0->type), (uint64_t)src0->ne[1], (uint64_t)src0->ne[0],
-                                        src0->nb[1], keep, src1->data, (uint64_t)src1->ne[1], src1->nb[1]);
-            if (nr < 0) return GGML_STATUS_FAILED;
-            for (int64_t r = 0; r < nr; r++) {
-                uint64_t from, to;
-                if (!phi_ggml_host_range((uint64_t)r, &from, &to)) break;
-                if (to > from && host_rows(node, (int64_t)from, (int64_t)to) != 0) return GGML_STATUS_FAILED;
-            }
-            if (phi_ggml_end(node->data, node->nb[1]) != 0) return GGML_STATUS_FAILED;
-            break;
+        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || role[i] == 1) continue;
+        if (role[i] == 2) {
+            if (run_ffn(cgraph->nodes, &quads[i]) != 0) return GGML_STATUS_FAILED;
+            continue;
         }
+        switch (node->op) {
+        case GGML_OP_MUL_MAT:
+            if (run_mul_mat(node) != 0) return GGML_STATUS_FAILED;
+            break;
         case GGML_OP_MUL_MAT_ID: {
             const struct ggml_tensor *src0 = node->src[0], *src1 = node->src[1], *ids = node->src[2];
             int keep = strstr(src0->name, "weight") != NULL;
@@ -299,6 +571,9 @@ static enum ggml_status phi_graph_compute(ggml_backend_t backend, struct ggml_cg
             if (phi_ggml_end_id(node->data, node->nb[1], node->nb[2]) != 0) return GGML_STATUS_FAILED;
             break;
         }
+        case GGML_OP_GLU:
+            if (host_glu(node) != 0) return GGML_STATUS_FAILED;
+            break;
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
         case GGML_OP_VIEW:
@@ -396,6 +671,8 @@ static bool phi_dev_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor
         return phi_supports_mul_mat(op);
     case GGML_OP_MUL_MAT_ID:
         return phi_supports_mul_mat_id(op);
+    case GGML_OP_GLU:
+        return phi_supports_glu(op);
     default:
         return false;
     }

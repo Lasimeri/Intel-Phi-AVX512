@@ -52,6 +52,12 @@ typedef void (*qkern)(const uint8_t *blk, const void *x, const void *const *rows
     QKONE(phi_##fmt##_1h) QKONE(phi_##fmt##_4h) QKONE(phi_##fmt##_8h)
 QK(q4k) QK(q5k) QK(q6k) QK(q8_0) QK(iq4xs)
 void phi_probe(const uint8_t *blk, const float *x, const float *consts, float *out);
+/* h = silu(g) * u over `count` vectors of 16 floats, all 64-byte aligned (kernelgen/glu.md) */
+void phi_swiglu(const float *g, const float *u, float *h, long count, const float *consts);
+/* the same, storing float16 (h advances 32 bytes a vector); and one vector of it under a lane mask */
+void phi_swiglu16(const float *g, const float *u, uint16_t *h, long count, const float *consts);
+void phi_swiglu16_edge(const float *g, const float *u, uint16_t *h, unsigned mask, const float *consts);
+void phi_swiglu_edge(const float *g, const float *u, float *h, unsigned mask, const float *consts);
 void phi_bench(long kind, const void *buf, long count);
 
 /* A mapping: huge pages when the card had some left, else 4 KiB pages;
@@ -164,7 +170,7 @@ static float half_at(const uint8_t *p)
  * 16, 4, 2, 2^-1..2^-8, the IQ4_XS values, the index and shift vectors
  * of the scale decoding, a few integers. */
 #define TAB_FLOATS 32
-#define C_BYTES 832
+#define C_BYTES 896
 
 static unsigned char g_consts[1024] __attribute__((aligned(64)));
 
@@ -206,6 +212,9 @@ static void consts_init(void)
     put_u32(780, 0xc0);
     put_u32(784, 3);
     put_u32(788, 32);
+    /* the SwiGLU kernel's (kernelgen/glu.rs): -log2(e) and 1 */
+    put_f32(832, -1.44269504088896340736f);
+    put_f32(836, 1.0f);
 }
 
 /* Two sets of kernels per format: one that reads float32 activations and
@@ -327,13 +336,12 @@ static void slice_rows(int slice, int nslices, uint64_t m, uint64_t *i0, uint64_
     *i1 = m * (uint64_t)(core + 1) / (uint64_t)ncores;
 }
 
-static void rows_slice_q(void *arg, int slice, int nslices)
+/* Rows i0..i1 of the job, shared with `nmates` threads on the same core
+ * as `mate` (slice_rows). The feed-forward request calls this directly
+ * with rows of its own choosing (ffn_slice). */
+static void rows_range_q(const struct job *j, uint64_t i0, uint64_t i1, int mate, int nmates)
 {
-    struct job *j = arg;
     const struct qfmt *f = &g_fmt[j->type];
-    uint64_t i0, i1;
-    int mate, nmates;
-    slice_rows(slice, nslices, j->m, &i0, &i1, &mate, &nmates);
     uint64_t ns = j->k / 256, tail = j->k % 256;   /* tail: Q8_0 only */
     unsigned bb = f->block_bytes;
     const float *cs = (const float *)g_consts;
@@ -392,6 +400,15 @@ static void rows_slice_q(void *arg, int slice, int nslices)
             }
         }
     }
+}
+
+static void rows_slice_q(void *arg, int slice, int nslices)
+{
+    const struct job *j = arg;
+    uint64_t i0, i1;
+    int mate, nmates;
+    slice_rows(slice, nslices, j->m, &i0, &i1, &mate, &nmates);
+    rows_range_q(j, i0, i1, mate, nmates);
 }
 
 /* The column groups of an ordinary multiply: consecutive columns, one
@@ -606,6 +623,201 @@ static int shape_ok(const struct vpu_matmul *mm)
     return 1;
 }
 
+static const char *type_name(uint32_t t)
+{
+    static const char *names[VPU_MM_TYPES] = { "f32", "f16", "q4_K", "q5_K", "q6_K", "q8_0", "iq4_xs" };
+    return t < VPU_MM_TYPES ? names[t] : "?";
+}
+
+/* ------------------------------------------------------------------ */
+/* A feed-forward block's share in one request (VPU_K_FFN)              */
+
+/* The gate and up products (n columns of `rows` floats each) and the
+ * SwiGLU of them (n columns of `ldh`, float32 or float16), all in card
+ * memory. */
+static struct { struct mapping m; size_t cap; } g_fg, g_fu, g_fh;
+
+struct ffn_job {
+    struct job gate, up;    /* their d is g_fg and g_fu */
+    void *h;
+    int h16;                /* h is float16, which the down projection's `h` kernels read */
+    uint64_t ldh;           /* elements between two columns of h */
+};
+
+/* One vector of the SwiGLU under a lane mask, in either format; `at` is
+ * the vector's first element. */
+static void swiglu_edge(const float *g, const float *u, void *h, int h16, uint64_t at, unsigned mask)
+{
+    const float *cs = (const float *)g_consts;
+    if (h16) phi_swiglu16_edge(g + at, u + at, (uint16_t *)h + at, mask, cs);
+    else phi_swiglu_edge(g + at, u + at, (float *)h + at, mask, cs);
+}
+
+/* h[i0..i1) = silu(g[i0..i1)) * u[i0..i1) for any i0 and i1: the whole
+ * vectors inside the range at once, and the vector holding either end,
+ * if the range does not begin or end on one, under a mask of just the
+ * range's lanes. g, u and h are the column's first element (64-byte
+ * aligned for g and u, 64 or 32 for h by its format). The partial
+ * vectors read the neighbouring thread's lanes, perhaps half written,
+ * and store none of them: every lane of h is stored by exactly one
+ * thread. */
+static void swiglu_range(const float *g, const float *u, void *h, int h16, uint64_t i0, uint64_t i1)
+{
+    const float *cs = (const float *)g_consts;
+    uint64_t a = i0 & ~(uint64_t)15, b = i1 & ~(uint64_t)15;
+    if (a == b) {
+        if (i1 > i0) swiglu_edge(g, u, h, h16, a, ((1u << (i1 - a)) - 1) & ~((1u << (i0 - a)) - 1));
+        return;
+    }
+    uint64_t s = a;
+    if (i0 > a) {
+        swiglu_edge(g, u, h, h16, a, 0xffffu & ~((1u << (i0 - a)) - 1));
+        s = a + 16;
+    }
+    if (b > s) {
+        if (h16) phi_swiglu16(g + s, u + s, (uint16_t *)h + s, (long)((b - s) / 16), cs);
+        else phi_swiglu(g + s, u + s, (float *)h + s, (long)((b - s) / 16), cs);
+    }
+    if (i1 > b) swiglu_edge(g, u, h, h16, b, (1u << (i1 - b)) - 1);
+}
+
+/* One thread's part of the intermediate: its gate rows and up rows for
+ * every column, then the SwiGLU of exactly those rows, which no other
+ * thread writes, so the three steps need no barrier between them; the
+ * only one is before the down projection, which reads every row. The
+ * split is by single rows (the same balance as any multiply: the 16-row
+ * split this began with left 80 rows on the slowest of 57 threads
+ * against a mean of 76.35 for 4352, 3 to 6 percent measured), with the
+ * SwiGLU's edges masked (swiglu_range). One thread per slice: a pool
+ * larger than 57 pairs threads on a core by rows (slice_rows), and the
+ * SwiGLU of a row needs both mates' halves done, so the pairing is not
+ * used here. */
+static void ffn_slice(void *arg, int slice, int nslices)
+{
+    const struct ffn_job *f = arg;
+    uint64_t m = f->gate.m;
+    uint64_t i0 = m * (uint64_t)slice / (uint64_t)nslices, i1 = m * (uint64_t)(slice + 1) / (uint64_t)nslices;
+    if (i1 <= i0) return;
+    rows_range_q(&f->gate, i0, i1, 0, 1);
+    rows_range_q(&f->up, i0, i1, 0, 1);
+    size_t esize = f->h16 ? 2 : 4;
+    for (uint64_t c = 0; c < f->gate.n; c++)
+        swiglu_range(f->gate.d + c * m, f->up.d + c * m, (unsigned char *)f->h + c * f->ldh * esize, f->h16, i0, i1);
+}
+
+static int ffn_run(volatile unsigned char *ctrl, int threads, int verbose,
+                   uint64_t *compute_ns, uint64_t *pull_ns, uint64_t *push_ns, int *live)
+{
+    struct vpu_ffn ff;
+    memcpy(&ff, (const void *)(ctrl + VPU_OFF_FFN), sizeof ff);
+    if (ff.rows == 0 || ff.rows % 256 != 0 || ff.n == 0 || ff.k == 0 || ff.m_out == 0) return VPU_E_REQUEST;
+    if (ff.b_off % VPU_BLOCK != 0 || ff.d_off % VPU_BLOCK != 0) return VPU_E_REQUEST;
+    if (!quantized(ff.gate_type) || !quantized(ff.up_type) || !quantized(ff.down_type)) return VPU_E_REQUEST;
+    uint32_t b_type = ff.b_type ? 1 : 0;
+    /* h in the format asked for (float32 unless the host knows the values
+     * fit a half), its columns a quarter of a page longer than the run:
+     * the reason is phi-ggml's B_PAD, activation rows at a 4 KiB multiple
+     * sharing L1 sets */
+    int h16 = ff.h_type == 1;
+    size_t hsize = h16 ? 2 : 4;
+    uint64_t ldh = ff.rows + 256 / hsize;
+    /* Each of the three is an ordinary multiply to the kernels, and is
+     * checked as one. */
+    struct vpu_matmul g = { .a_type = ff.gate_type, .b_type = b_type, .m = ff.rows, .n = ff.n, .k = ff.k, .nb_a = ff.nb_gate, .nb_b = ff.nb_b };
+    struct vpu_matmul u = g;
+    u.a_type = ff.up_type;
+    u.nb_a = ff.nb_up;
+    struct vpu_matmul dn = { .a_type = ff.down_type, .b_type = (uint32_t)h16, .m = ff.m_out, .n = ff.n, .k = ff.rows, .nb_a = ff.nb_down, .nb_b = ldh * hsize };
+    if (!shape_ok(&g) || !shape_ok(&u) || !shape_ok(&dn)) return VPU_E_REQUEST;
+    int ig = cache_find(ff.gate_id), iu = cache_find(ff.up_id), id = cache_find(ff.down_id);
+    if (ig < 0 || iu < 0 || id < 0) return VPU_E_REQUEST;
+    if (ff.rows * ff.nb_gate > g_cache[ig].bytes || ff.rows * ff.nb_up > g_cache[iu].bytes ||
+        ff.m_out * ff.nb_down > g_cache[id].bytes)
+        return VPU_E_REQUEST;
+
+    uint64_t t0 = now_ns();
+    size_t blen = blocks(ff.n * ff.nb_b), dlen = blocks(ff.n * ff.m_out * 4);
+    size_t glen = (size_t)(ff.n * ff.rows * 4), hlen = (size_t)(ff.n * ldh * hsize);
+    if (grow(&g_b, blen) != 0 || grow(&g_d, dlen) != 0 || grow(&g_fg, glen) != 0 || grow(&g_fu, glen) != 0 ||
+        grow(&g_fh, hlen) != 0 || grow(&g_groups, 3 * ff.n * sizeof(struct group)) != 0)
+        return VPU_E_ALLOC;
+    if (vpu_pull(g_b.m.p, blen, ff.b_off) != 0) return VPU_E_PULL;
+    *pull_ns = now_ns() - t0;
+
+    uint32_t chunk = (uint32_t)ff.chunk;
+    if (chunk < 1 || chunk > ROW_CHUNK_MAX) chunk = ROW_CHUNK;
+    struct group *gs = g_groups.m.p;
+    struct ffn_job f;
+    memset(&f, 0, sizeof f);
+    f.gate.a = g_cache[ig].m.p;
+    f.gate.b = g_b.m.p;
+    f.gate.d = g_fg.m.p;
+    f.gate.m = ff.rows;
+    f.gate.n = ff.n;
+    f.gate.k = ff.k;
+    f.gate.nb_a = ff.nb_gate;
+    f.gate.nb_b = ff.nb_b;
+    f.gate.type = ff.gate_type;
+    f.gate.chunk = chunk;
+    f.gate.b_type = b_type;
+    f.gate.xblock = b_type ? 512u : 1024u;
+    f.up = f.gate;
+    f.up.a = g_cache[iu].m.p;
+    f.up.d = g_fu.m.p;
+    f.up.nb_a = ff.nb_up;
+    f.up.type = ff.up_type;
+    f.gate.groups = gs;
+    f.gate.ngroups = groups_plain(gs, &f.gate);
+    f.up.groups = gs + ff.n;
+    f.up.ngroups = groups_plain(gs + ff.n, &f.up);
+    f.h = g_fh.m.p;
+    f.h16 = h16;
+    f.ldh = ldh;
+    struct job dj;
+    memset(&dj, 0, sizeof dj);
+    dj.a = g_cache[id].m.p;
+    dj.b = g_fh.m.p;
+    dj.d = g_d.m.p;
+    dj.m = ff.m_out;
+    dj.n = ff.n;
+    dj.k = ff.rows;
+    dj.nb_a = ff.nb_down;
+    dj.nb_b = ldh * hsize;
+    dj.type = ff.down_type;
+    dj.chunk = chunk;
+    dj.b_type = (uint32_t)h16;
+    dj.xblock = h16 ? 512u : 1024u;
+    dj.groups = gs + 2 * ff.n;
+    dj.ngroups = groups_plain(gs + 2 * ff.n, &dj);
+
+    int max = vpu_pool_threads() + 1;
+    if (max > POOL_SLOTS) max = POOL_SLOTS;
+    if (threads < 1) threads = 1;
+    if (threads > max) threads = max;
+    int t1 = threads, t2 = threads;
+    if ((uint64_t)t1 > ff.rows) t1 = (int)ff.rows;
+    if ((uint64_t)t2 > ff.m_out) t2 = (int)ff.m_out;
+    uint64_t c0 = now_ns();
+    *live = vpu_pool_map(ffn_slice, &f, t1);
+    uint64_t c1 = now_ns();
+    vpu_pool_map(rows_slice, &dj, t2);
+    uint64_t c2 = now_ns();
+    *compute_ns = c2 - c0;
+
+    uint64_t p0 = now_ns();
+    if (vpu_push(g_d.m.p, dlen, ff.d_off) != 0) return VPU_E_PUSH;
+    *push_ns = now_ns() - p0;
+    if (verbose) {
+        printf("ffn: %llu rows of gate (%s) and up (%s) against %llu, then down %llux%llu (%s), n %llu, %d threads: "
+               "pull %.3f, gate+up+swiglu %.3f, down %.3f, push %.3f ms\n",
+               (unsigned long long)ff.rows, type_name(ff.gate_type), type_name(ff.up_type), (unsigned long long)ff.k,
+               (unsigned long long)ff.m_out, (unsigned long long)ff.rows, type_name(ff.down_type), (unsigned long long)ff.n,
+               *live, *pull_ns / 1e6, (c1 - c0) / 1e6, (c2 - c1) / 1e6, *push_ns / 1e6);
+        fflush(stdout);
+    }
+    return VPU_OK;
+}
+
 int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, int verbose,
                    uint64_t *compute_ns, uint64_t *pull_ns, uint64_t *push_ns, int *live)
 {
@@ -614,6 +826,7 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
     *compute_ns = *pull_ns = *push_ns = 0;
     *live = 0;
     if (g_consts[0] == 0) consts_init();
+    if (kernel == VPU_K_FFN) return ffn_run(ctrl, threads, verbose, compute_ns, pull_ns, push_ns, live);
 
     if (kernel == VPU_K_FREE) {
         if (mm.a_id == 0) {
@@ -651,6 +864,41 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
     }
     if (mm.m == 0 || mm.n == 0 || mm.k == 0 || mm.b_off % VPU_BLOCK != 0 || mm.d_off % VPU_BLOCK != 0) return VPU_E_REQUEST;
     if (kernel == VPU_K_MATMUL_ID && (mm.n_used == 0 || mm.b_rows == 0 || mm.n_tokens == 0 || mm.n != mm.n_used * mm.n_tokens || mm.ids_bytes % 64 != 0 || mm.a_id == 0)) return VPU_E_REQUEST;
+    if (mm.a_type == VPU_MM_SWIGLU) {
+        /* The SwiGLU kernel on its own, for matmul-check's conformance
+         * case (m floats of g at b_off, m of u at b_off + nb_b): nothing
+         * uses it before the host has compared every lane with its own
+         * silu. One thread; this measures correctness, not rate. */
+        if (mm.m % 16 != 0 || mm.nb_b % VPU_BLOCK != 0 || mm.nb_b < mm.m * 4) return VPU_E_REQUEST;
+        size_t blen = blocks(2 * mm.nb_b), dlen = blocks(mm.m * 4);
+        if (grow(&g_b, blen) != 0 || grow(&g_d, dlen) != 0) return VPU_E_ALLOC;
+        uint64_t t0 = now_ns();
+        if (vpu_pull(g_b.m.p, blen, mm.b_off) != 0) return VPU_E_PULL;
+        *pull_ns = now_ns() - t0;
+        const float *gv = g_b.m.p, *uv = (const float *)((const unsigned char *)g_b.m.p + mm.nb_b);
+        uint64_t c0 = now_ns();
+        if (mm.b_type == 0) {
+            phi_swiglu(gv, uv, g_d.m.p, (long)(mm.m / 16), (const float *)g_consts);
+        } else {
+            /* The paths the feed-forward's threads use (b_type 1 float16,
+             * 2 float32, both through swiglu_range): abutting ranges that begin and end inside vectors, one
+             * wholly inside a vector, covering 3..m-5 and nothing else,
+             * so a lane stored twice or not at all, or a mask off by
+             * one, shows as a wrong value or a disturbed fill (0xdead). */
+            int h16 = mm.b_type == 1;
+            if (h16) for (uint64_t i = 0; i < mm.m; i++) ((uint16_t *)g_d.m.p)[i] = 0xdead;
+            else for (uint64_t i = 0; i < mm.m; i++) ((uint32_t *)g_d.m.p)[i] = 0xdeaddeadu;
+            uint64_t cut[] = { 3, 21, 100, 107, 110, mm.m - 5 };
+            for (unsigned r = 0; r + 1 < sizeof cut / sizeof cut[0]; r++)
+                swiglu_range(gv, uv, g_d.m.p, h16, cut[r], cut[r + 1]);
+        }
+        *compute_ns = now_ns() - c0;
+        uint64_t p0 = now_ns();
+        if (vpu_push(g_d.m.p, dlen, mm.d_off) != 0) return VPU_E_PUSH;
+        *push_ns = now_ns() - p0;
+        *live = 1;
+        return VPU_OK;
+    }
     if (mm.a_type == VPU_MM_PROBE) {
         if (mm.a_off % VPU_BLOCK != 0) return VPU_E_REQUEST;
         if (grow(&g_a, VPU_BLOCK) != 0 || grow(&g_b, VPU_BLOCK) != 0 || grow(&g_d, VPU_BLOCK) != 0) return VPU_E_ALLOC;

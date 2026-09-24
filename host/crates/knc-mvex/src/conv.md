@@ -25,6 +25,8 @@ quantized kernels need on top.
 | `vprefetch`, `Cache` | `vprefetch0` (L1) and `vprefetch1` (L2), MVEX.512.0F.W0 18 /1 and /2: the software prefetch the kernels stream their weights with |
 | `vpermd` | lane permute by index, the sixteen-entry table lookup the iq4_xs format needs (MVEX.NDS.512.66.0F38.W0 36) |
 | `vcvtfxpntps2dq` | float32 to int32 with a rounding mode (MVEX.512.66.0F3A.W0 CB ib, the rewriter's `vcvtps2dq`) |
+| `vcvtfxpntps2dq_adj`, `ExpAdj` | the same with an exponent adjustment in I6..I4 of the immediate, so the integer is fixed point with that many fraction bits (ISA reference 327364-001, page 169); `Q8_24` feeds `vexp223ps` (transc.rs) |
+| `vmovaps_store_conv` | store through a down-conversion under a write-mask (MVEX.512.0F.W0 29 with SSS the `Df32` value, page 379 and table 2.12): `Conv::F16` writes sixteen halves, 32 bytes, and a lane whose mask bit is clear is not written, which is how two threads store their own lanes of one vector (kernelgen/glu.rs) |
 
 Sources for the encodings: the two conversion opcodes and the `{1to16}`
 field are the ones `host/crates/avx512-xlate/src/rewrite.rs` emits for
@@ -34,3 +36,11 @@ the conversion values follow the float16 load lib.rs had (SSS 011, in
 use since the ggml backend's first kernels) and Intel's enumeration
 order. The tests pin the bytes; the kernels built on them are checked
 against a host reference by `phi-vpu matmul-check` before use.
+
+The exponent adjustment and the converting store were added for the
+fused feed-forward's SwiGLU (2026-09-23). Their bytes are pinned by the
+tests here (a converting store is the plain store with SSS set, and no
+adjustment is the plain conversion byte for byte), and the SwiGLU built
+on them is checked on the card lane by lane, in float32 and float16,
+including ranges whose partial vectors are masked
+(`host/crates/phi-vpu/src/matmul.rs`, `check_swiglu`).

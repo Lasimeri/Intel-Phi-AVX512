@@ -15,7 +15,7 @@
 //! The C side is only the glue ggml's C interface requires; everything
 //! that talks to the cards is here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{fence, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -23,6 +23,8 @@ use std::time::{Duration, Instant};
 use phi_vpu::matmul::{self, A_MAX, B_MAX, D_MAX, OFF_A, OFF_B, OFF_D, WINDOW_LEN};
 use phi_vpu::proto::*;
 use phi_vpu::window::{wait_ready, Window};
+
+mod ffn;
 
 /// One card: its window, what it keeps, and the multiply in flight.
 struct Card {
@@ -38,6 +40,9 @@ struct Card {
     full: bool,
     /// The request in flight.
     pending: Option<Pending>,
+    /// The fused feed-forward request in flight (ffn.rs), apart from the
+    /// plain one so that neither `end` can take the other's reply.
+    ffn_pending: Option<ffn::FfnPending>,
     busy: Duration,
 }
 
@@ -119,6 +124,16 @@ struct Ctx {
     calls: u64,
     t_begin: Instant,
     host_only: u64,
+    /// The fused feed-forward (ffn.rs): each block's split, by its gate
+    /// tensor's address; every tensor in one, which the plain path then
+    /// leaves to the host (the card holds ffn_down by columns there, not
+    /// by rows); the multiply being judged; and whether the card keeps
+    /// the intermediate as float16 (`PHI_GGML_FFN_H16`, 0: float32 holds
+    /// any value, float16 overflows past 65504).
+    ffns: HashMap<usize, ffn::FfnSplit>,
+    ffn_members: HashSet<usize>,
+    ffn_judged: Option<Judged>,
+    ffn_h16: bool,
 }
 
 static CTX: Mutex<Option<Ctx>> = Mutex::new(None);
@@ -153,6 +168,7 @@ fn open_card(index: usize, threads: u32, budget: u64) -> Result<Card, String> {
         budget,
         full: false,
         pending: None,
+        ffn_pending: None,
         busy: Duration::ZERO,
     })
 }
@@ -214,6 +230,10 @@ pub extern "C" fn phi_ggml_open() -> i32 {
         calls: 0,
         t_begin: Instant::now(),
         host_only: 0,
+        ffns: HashMap::new(),
+        ffn_members: HashSet::new(),
+        ffn_judged: None,
+        ffn_h16: env_or("PHI_GGML_FFN_H16", 0u32) != 0,
     });
     n
 }
@@ -246,25 +266,80 @@ const PP_WINDOW: u32 = 8;
 /// precision than ggml's own CPU kernels keep: they quantize the same
 /// activations to Q8_K for these multiplies.
 ///
+/// Returns the largest magnitude it converted, because a half stops at
+/// 65504 and anything larger becomes infinity: the caller compares it
+/// with `F16_MAX` and sends the multiply as float32 instead. Nothing
+/// bounds a model's activations; ggml's own kernels are safe from this
+/// because Q8_K scales each block. The check costs one `and` and one
+/// `max` per eight floats in a loop that is converting them anyway.
+///
 /// # Safety
 /// `src` must be `n` readable floats and `dst` `n` writable halves.
 #[target_feature(enable = "f16c,avx")]
-unsafe fn to_f16(src: *const f32, dst: *mut u16, n: usize) {
+unsafe fn to_f16(src: *const f32, dst: *mut u16, n: usize) -> f32 {
     use std::arch::x86_64::*;
     let mut i = 0;
     // SAFETY: the caller's contract; eight at a time, then the tail.
     unsafe {
+        let abs = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffff));
+        let mut top = _mm256_setzero_ps();
         while i + 8 <= n {
             let v = _mm256_loadu_ps(src.add(i));
+            top = _mm256_max_ps(top, _mm256_and_ps(v, abs));
             _mm_storeu_si128(dst.add(i) as *mut __m128i, _mm256_cvtps_ph::<0>(v));
             i += 8;
         }
+        let mut lanes = [0f32; 8];
+        _mm256_storeu_ps(lanes.as_mut_ptr(), top);
+        let mut most = lanes.iter().fold(0f32, |m, &x| m.max(x));
         for j in i..n {
-            let one = _mm_set_ss(*src.add(j));
+            let x = *src.add(j);
+            most = most.max(x.abs());
+            let one = _mm_set_ss(x);
             *dst.add(j) = _mm_extract_epi16::<0>(_mm_cvtps_ph::<0>(one)) as u16;
         }
+        most
     }
 }
+
+/// The activation rows into one card's window at `off`, `card_nb_b` apart
+/// (a quarter of a page further apart than the tensor's own rows: see
+/// B_PAD), as float16 (`to_f16`) or float32. A mixture's rows run token
+/// by token. Returns the largest magnitude when converting, else 0.
+///
+/// # Safety
+/// `b` must be `b_rows` rows of `k` floats at the strides `nb_b` and `mix`
+/// give; the window area from `off` must hold `b_rows * card_nb_b` bytes.
+#[allow(clippy::too_many_arguments)]
+unsafe fn put_rows(card: &Card, b: *const u8, b_rows: u64, k: u64, nb_b: u64, mix: &Mixture, off: u64, card_nb_b: u64, half: bool) -> f32 {
+    let mut most = 0f32;
+    for c in 0..b_rows {
+        let src = if mix.n_used > 0 {
+            (c % mix.b_rows) * nb_b + (c / mix.b_rows) * mix.nb_b2
+        } else {
+            c * nb_b
+        };
+        let at = off + c * card_nb_b;
+        // SAFETY: the caller's contract.
+        unsafe {
+            if half {
+                most = most.max(to_f16(
+                    b.add(src as usize) as *const f32,
+                    card.w.ptr(at, (k * 2) as usize) as *mut u16,
+                    k as usize,
+                ));
+            } else {
+                std::ptr::copy_nonoverlapping(b.add(src as usize), card.w.ptr(at, (k * 4) as usize), (k * 4) as usize);
+            }
+        }
+    }
+    most
+}
+
+/// The largest finite half. A value past it converts to infinity, and the
+/// card would multiply by that (found by the fused feed-forward's check,
+/// 2026-09-23: `phi-vpu matmul-check`, `check_ffn`).
+const F16_MAX: f32 = 65504.0;
 
 /// Whether this host can convert to float16 in hardware; without it the
 /// activations cross the link as float32, which is only slower.
@@ -288,8 +363,14 @@ pub extern "C" fn phi_ggml_supports(a_type: u32, m: u64, k: u64, nb_a: u64, nb_b
 
 /// Ring a card's doorbell for the descriptor `mm` without waiting.
 fn ring(card: &Card, kernel: u32, mm: &Matmul) -> u64 {
+    card.w.write(OFF_MATMUL, *mm);
+    doorbell(card, kernel)
+}
+
+/// Ring a card's doorbell for `kernel`, whose descriptor is already in
+/// the control area; the request's sequence number.
+fn doorbell(card: &Card, kernel: u32) -> u64 {
     let w = &card.w;
-    w.write(OFF_MATMUL, *mm);
     let seq = w.read::<u64>(OFF_REQ) + 1;
     let req = Request {
         seq: seq - 1,
@@ -451,6 +532,22 @@ pub struct Mixture {
     nb_b2: u64,
 }
 
+impl Mixture {
+    /// An ordinary multiply: one matrix, every column its own row of b.
+    fn none() -> Self {
+        Mixture {
+            experts: 1,
+            nb_a2: 0,
+            ids: std::ptr::null(),
+            n_used: 0,
+            n_tokens: 0,
+            ids_nb1: 0,
+            b_rows: 1,
+            nb_b2: 0,
+        }
+    }
+}
+
 /// Start `d[n][m] = a[m][k] . b[n][k]` on the cards: the weight's shares
 /// are planned and uploaded on first sight (`keep` marks a tensor that
 /// does not change), the activations are copied to each card and the
@@ -512,16 +609,7 @@ pub unsafe extern "C" fn phi_ggml_begin(
     n: u64,
     nb_b: u64,
 ) -> i64 {
-    let mix = Mixture {
-        experts: 1,
-        nb_a2: 0,
-        ids: std::ptr::null(),
-        n_used: 0,
-        n_tokens: 0,
-        ids_nb1: 0,
-        b_rows: 1,
-        nb_b2: 0,
-    };
+    let mix = Mixture::none();
     // SAFETY: the caller's contract.
     unsafe { begin(a, a_type, m, k, nb_a, keep, b, n, nb_b, mix) }
 }
@@ -556,6 +644,14 @@ unsafe fn begin(a: *const u8, a_type: u32, m: u64, k: u64, nb_a: u64, keep: i32,
         return 1;
     }
     let key = a as usize;
+    // A tensor of a fused feed-forward block goes to the cards only through
+    // ffn.rs, which holds ffn_down by columns; reaching it here means the
+    // block was declined as a whole, and then the host does all of it.
+    if ctx.ffn_members.contains(&key) {
+        ctx.host_only += 1;
+        ctx.host_ranges = vec![(0, m)];
+        return 1;
+    }
     if !ctx.splits.contains_key(&key) {
         // SAFETY: the caller's contract.
         let split = unsafe { plan(ctx, a, a_type, m, nb_a, mix.experts, mix.nb_a2) };
@@ -624,12 +720,35 @@ unsafe fn begin(a: *const u8, a_type: u32, m: u64, k: u64, nb_a: u64, keep: i32,
         ctx.host_ranges = vec![(0, m)];
         return 1;
     }
+    // The activations into the first card's window. If any is past a
+    // half's range the multiply goes as float32, to every card (none has
+    // been rung yet), or to the host alone when float32 does not fit.
+    let (mut half, mut card_nb_b) = (half, card_nb_b);
+    if half {
+        let (ci, _, _) = work[0];
+        // SAFETY: b is b_rows rows as nb_b and mix say; the area is B_MAX.
+        let most = unsafe { put_rows(&ctx.cards[ci], b, b_rows, k, nb_b, &mix, OFF_B + ids_bytes, card_nb_b, true) };
+        if most > F16_MAX {
+            half = false;
+            card_nb_b = nb_b + B_PAD;
+            if ctx.verbose {
+                say(&format!(
+                    "activations up to {most:e} do not fit a half: this multiply goes as float32"
+                ));
+            }
+            if ids_bytes + b_rows * card_nb_b > B_MAX {
+                ctx.host_only += 1;
+                ctx.host_ranges = vec![(0, m)];
+                return 1;
+            }
+        }
+    }
     ctx.judged = Some(Judged {
         key,
         class,
         share: on_cards as f64 / m as f64,
     });
-    for &(ci, lo, rows) in &work {
+    for (w_i, &(ci, lo, rows)) in work.iter().enumerate() {
         let card = &mut ctx.cards[ci];
         if mixture {
             // The expert each column picks, one token's after another.
@@ -644,28 +763,10 @@ unsafe fn begin(a: *const u8, a_type: u32, m: u64, k: u64, nb_a: u64, keep: i32,
                 };
             }
         }
-        // Row by row, a quarter of a page further apart than the tensor's
-        // own rows: see B_PAD. A mixture's rows run token by token, and
-        // the quantized kernels take the rows as float16 (`to_f16`).
-        for c in 0..b_rows {
-            let src = if mixture {
-                (c % mix.b_rows) * nb_b + (c / mix.b_rows) * mix.nb_b2
-            } else {
-                c * nb_b
-            };
-            let at = OFF_B + ids_bytes + c * card_nb_b;
-            // SAFETY: b is b_rows rows of nb_b bytes at those strides; the area is B_MAX.
-            unsafe {
-                if half {
-                    to_f16(
-                        b.add(src as usize) as *const f32,
-                        card.w.ptr(at, (k * 2) as usize) as *mut u16,
-                        k as usize,
-                    );
-                } else {
-                    std::ptr::copy_nonoverlapping(b.add(src as usize), card.w.ptr(at, nb_b as usize), nb_b as usize);
-                }
-            };
+        // The first card has its rows already when they went as float16.
+        if !(half && w_i == 0) {
+            // SAFETY: as above.
+            unsafe { put_rows(card, b, b_rows, k, nb_b, &mix, OFF_B + ids_bytes, card_nb_b, half) };
         }
         let mm = Matmul {
             a_id: card.ids[&key],
@@ -836,37 +937,8 @@ pub unsafe extern "C" fn phi_ggml_end_id(d: *mut u8, nb_d: u64, nb_d2: u64) -> i
         // total in its reply. Average the relative gap over a window of
         // multiplies before moving, because one card time is worth
         // nothing; move by half of it; stop after `PP_STEPS`.
-        if j.class == 1 && ctx.pp_adapt && ctx.pp_steps < PP_STEPS && !t_card.is_zero() {
-            let (th, tc) = (t_host.as_secs_f64(), t_card.as_secs_f64());
-            ctx.pp_gap += (th - tc) / th.max(tc);
-            ctx.pp_n += 1;
-            if ctx.pp_n == PP_WINDOW {
-                let gap = ctx.pp_gap / PP_WINDOW as f64;
-                ctx.pp_gap = 0.0;
-                ctx.pp_n = 0;
-                let was = ctx.pp_share;
-                ctx.pp_share = (was * (1.0 + 0.5 * gap)).clamp(PP_MIN, 1.0);
-                if ctx.pp_share != was {
-                    ctx.pp_steps += 1;
-                    if ctx.verbose {
-                        say(&format!(
-                            "over {PP_WINDOW} batch multiplies the host ran {:+.0} percent against the slowest card, so the batch share goes {was:.2} to {:.2}",
-                            gap * 100.0,
-                            ctx.pp_share
-                        ));
-                    }
-                    // At the floor a card's part of a batch multiply can
-                    // fall under `min_bytes`, which then declines it
-                    // without the `avoid` judgement saying so. Worth a
-                    // word, or the tensor goes quiet for no visible reason.
-                    if ctx.pp_share <= PP_MIN {
-                        say(&format!(
-                            "the batch share is at its floor ({PP_MIN}): the cards are the slower side at this batch size, and a multiply whose card part now falls under {} bytes goes to the host whole",
-                            ctx.min_bytes
-                        ));
-                    }
-                }
-            }
+        if j.class == 1 {
+            pp_feed(ctx, t_host, t_card);
         }
     }
     if ctx.verbose {
@@ -882,6 +954,47 @@ pub unsafe extern "C" fn phi_ggml_end_id(d: *mut u8, nb_d: u64, nb_d2: u64) -> i
         0
     } else {
         -1
+    }
+}
+
+/// One batch multiply's two sides, for the share estimator (`Ctx::pp_gap`;
+/// lib.md). Called by both the plain path and the fused feed-forward
+/// (ffn.rs): the balance being learned is the machine's, not a tensor's.
+pub(crate) fn pp_feed(ctx: &mut Ctx, t_host: Duration, t_card: Duration) {
+    if !ctx.pp_adapt || ctx.pp_steps >= PP_STEPS || t_card.is_zero() {
+        return;
+    }
+    let (th, tc) = (t_host.as_secs_f64(), t_card.as_secs_f64());
+    ctx.pp_gap += (th - tc) / th.max(tc);
+    ctx.pp_n += 1;
+    if ctx.pp_n < PP_WINDOW {
+        return;
+    }
+    let gap = ctx.pp_gap / PP_WINDOW as f64;
+    ctx.pp_gap = 0.0;
+    ctx.pp_n = 0;
+    let was = ctx.pp_share;
+    ctx.pp_share = (was * (1.0 + 0.5 * gap)).clamp(PP_MIN, 1.0);
+    if ctx.pp_share == was {
+        return;
+    }
+    ctx.pp_steps += 1;
+    if ctx.verbose {
+        say(&format!(
+            "over {PP_WINDOW} batch multiplies the host ran {:+.0} percent against the slowest card, so the batch share goes {was:.2} to {:.2}",
+            gap * 100.0,
+            ctx.pp_share
+        ));
+    }
+    // At the floor a card's part of a batch multiply can fall under
+    // `min_bytes`, which then declines it without the `avoid` judgement
+    // saying so. Worth a word, or the tensor goes quiet for no visible
+    // reason.
+    if ctx.pp_share <= PP_MIN {
+        say(&format!(
+            "the batch share is at its floor ({PP_MIN}): the cards are the slower side at this batch size, and a multiply whose card part now falls under {} bytes goes to the host whole",
+            ctx.min_bytes
+        ));
     }
 }
 
@@ -914,4 +1027,36 @@ pub extern "C" fn ggml_backend_init() -> *mut libc::c_void {
     }
     // SAFETY: a plain call into the glue compiled into this library.
     unsafe { ggml_backend_phi_reg() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The float16 activations report their largest magnitude, which is
+    /// what sends a multiply as float32 when it is past a half's range.
+    #[test]
+    fn to_f16_reports_the_largest_magnitude() {
+        if !have_f16c() {
+            return;
+        }
+        // 19 values: two runs of eight through the vector loop and a tail
+        // of three through the scalar one, the largest in each place once.
+        for at in [2usize, 13, 17] {
+            let mut x: Vec<f32> = (0..19).map(|i| (i as f32 - 9.0) * 0.5).collect();
+            x[at] = -70000.0;
+            let mut h = vec![0u16; 19];
+            // SAFETY: 19 floats in, 19 halves out.
+            let most = unsafe { to_f16(x.as_ptr(), h.as_mut_ptr(), 19) };
+            assert_eq!(most, 70000.0);
+            assert!(most > F16_MAX);
+            // what the card would have multiplied by: -infinity
+            assert_eq!(h[at], 0xfc00);
+        }
+        let x = [1.0f32, -65504.0, 3.0];
+        let mut h = [0u16; 3];
+        // SAFETY: as above.
+        let most = unsafe { to_f16(x.as_ptr(), h.as_mut_ptr(), 3) };
+        assert!(most <= F16_MAX, "65504 is a half, and must not be refused");
+    }
 }

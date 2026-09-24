@@ -90,3 +90,31 @@ The rate loop calls the same checked path, so the shape the backend
 ships (`--m 4096 --k 5120 --pad 256 --act 1`, in chunks of 32) is
 verified against the host at n 1, 8 and 64, not only the conformance
 shapes above it.
+
+## The feed-forward request and its SwiGLU
+
+`matmul-check` runs `check_swiglu` first: the card's SwiGLU on 4096
+values (a sweep of g across both saturation points, specials, then
+typical values) against the host's float64, then the same through the
+ranged float32 and float16 paths with the lanes outside every range
+required untouched. The tolerance is the error budget, documented on the
+function and in `kernelgen/glu.md`.
+
+Then `check_ffn` for five combinations of weight types (every quantized
+type in each of the three places at least once, as a model mixes them),
+with a float32 intermediate, and the first again with float16, at n 1, 4,
+8 and 13: random gate, up and down slices uploaded as the backend does
+(down by columns), random activations, and a float64 reference of the
+whole chain. Its tolerance carries the gate and up errors through the
+SwiGLU (silu' is at most 1.1 in magnitude) into the down projection, so
+it is derived, not tuned. A float16 case uses activations a sixty-fourth
+the size, because these random weights drive h to 1e5 and float16 stops
+at 65504; the float32 cases use the full range and pass.
+
+Last, a rate: one card's share of the 27B's feed-forward (4352 of a
+17408-row intermediate) against the three multiplies it replaces with
+the same work, the fused request with both intermediate formats. The
+numbers are in `card/vpu/vpu_matmul.md`.
+
+`request_ffn` writes the descriptor at `OFF_FFN` and rings the same
+doorbell `request` does (`ring_and_wait`).

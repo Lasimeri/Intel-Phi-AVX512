@@ -32,3 +32,8 @@ activation rows and `phi_q4k_8h` float16 ones, the same instructions
 with `{float16}` on the product's memory operand and a 32-byte row
 stride. 30 kernels in all, and the card picks the pair by the request's
 `b_type` (`vpu_matmul.md`).
+
+The feed-forward's SwiGLU is here too: `phi_swiglu`, `phi_swiglu16`,
+`phi_swiglu_edge` and `phi_swiglu16_edge`, from `kernelgen/glu.rs`
+(glu.md has the instruction sequence, its accuracy and why there are
+masked forms).
