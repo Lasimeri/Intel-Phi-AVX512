@@ -97,3 +97,8 @@ host's memory after the upload and the host never reads them again, so
 only the host's part of the model needs to stay resident: the cards'
 8.5 GB or so come off what the page cache has to hold
 (`host/crates/phi-ggml/src/lib.md`, "Offload").
+
+A card whose worker cannot be started (a card that is down keeps its
+`/dev/shm` window, which the stack does not unlink) is left out with a
+line saying so, and the run goes on with the others; only no card at all
+stops it. Before 2026-09-24 one such card ended the whole run.

@@ -17,7 +17,18 @@
 # See phi512.md.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
-root=$(cd "$here/.." && pwd)
+# The checkout this runs from, or, for the copy phi512-install.sh puts in
+# /usr/local/bin, the checkout it was installed from (written into that
+# copy at install; PHI512_ROOT overrides): the worker script and driver
+# live there, not next to the installed command.
+installed_root=""
+if [ -f "$here/phi-vpu.sh" ]; then
+    root=$(cd "$here/.." && pwd)
+    installed=
+else
+    root=${PHI512_ROOT:-$installed_root}
+    installed=1
+fi
 
 verbose=0
 card=${PHI512_CARD:-0}
@@ -45,10 +56,10 @@ done
 # Where the library is. Three places, in order: an explicit override, the
 # build tree when this script is being run from a clone, and the installed
 # copy. The build tree wins during development so a fresh build is picked
-# up without reinstalling.
+# up without reinstalling; the installed command uses the installed one.
 lib="${PHI512_LIB:-}"
 
-if [ -z "$lib" ] && [ -d "$root/host/target" ]; then
+if [ -z "$lib" ] && [ -z "$installed" ] && [ -d "$root/host/target" ]; then
     # LD_PRELOAD splits its value on spaces and colons, and this repository
     # may be checked out at a path with a space in it ("Intel Phi AVX-512").
     # A space-free symlink to this checkout is the way in, because no
@@ -78,6 +89,10 @@ else
     done
     if [ -z "$driver" ] || ! "$driver" --card "$card" status 2>/dev/null | grep -q "worker: polling"; then
         echo "phi512: card $card has no worker polling; starting it" >&2
+        [ -f "$root/scripts/phi-vpu.sh" ] || {
+            echo "phi512: no Intel-Phi-AVX512 checkout at '$root' to start the worker from; set PHI512_ROOT" >&2
+            exit 1
+        }
         "$root/scripts/phi-vpu.sh" -c "$card" start >&2 || {
             echo "phi512: could not start the worker on card $card (is the card up? phi -c $card status)" >&2
             exit 1

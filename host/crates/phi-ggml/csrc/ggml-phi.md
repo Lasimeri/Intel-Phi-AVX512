@@ -136,3 +136,17 @@ weight out of the count the share is sized by. Every weight a multiply
 is accepted for is noted (`phi_ggml_note_weight`) with its whole size,
 and the Rust side sizes the cards' share from the total at the first
 multiply (`../src/lib.md`).
+
+## A device only when the cards open (2026-09-24)
+
+`phi_reg_get_device_count` opens the cards (`phi_ggml_open`) the first time
+it is asked and reports one device when they open, none when they do not.
+llama.cpp stops with "failed to initialize" when an accelerator's
+`init_backend` returns NULL, which is what a card that is down used to
+cause through `GGML_BACKEND_PATH`; with no device the backend is simply
+not used and the program runs on the CPU.
+
+`PHI_GGML_FFN` is turned off, with a line saying so, when
+`PHI_GGML_OFFLOAD` is set: the fused path keeps its rows on the host and
+hands a declined block back to the host whole, the opposite of the
+offload's contract.

@@ -344,6 +344,7 @@ pub unsafe extern "C" fn phi_ggml_ffn_begin(args: *const FfnArgs) -> i64 {
         key,
         class,
         share: on_cards as f64 / a.inter as f64,
+        adapts: class == 1,
     });
     let h_type = u32::from(ctx.ffn_h16);
     let first = work[0].0;
@@ -473,7 +474,7 @@ pub unsafe extern "C" fn phi_ggml_ffn_end(y: *mut u8, nb_y: u64) -> i32 {
                 s.bad[j.class] = 0;
             }
         }
-        if j.class == 1 {
+        if j.adapts {
             pp_feed(ctx, t_host, t_card);
         }
     }

@@ -77,3 +77,11 @@ advertising the feature would send glibc's `memcpy` and `strlen` down
 AVX-512 paths, which are short, constant, and would each become a fault.
 Succeeding at advertisement would make the machine slower at its most
 common work.
+
+The installed command is a copy of `scripts/phi512.sh` with this checkout
+written into it (`installed_root`), since nothing of the repository sits
+next to `/usr/local/bin`: it starts the card's worker from this checkout's
+`scripts/phi-vpu.sh`, and preloads the installed `/usr/lib/libphi512.so`.
+Before 2026-09-24 the installed copy looked for the worker script under
+`/usr/local` and always failed in card mode. `PHI512_ROOT` overrides the
+recorded checkout.

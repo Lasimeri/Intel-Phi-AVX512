@@ -110,7 +110,13 @@ if ! self_test "$lib_src"; then
 fi
 
 as_root install -Dm755 "$lib_src" "$LIB"
-as_root install -Dm755 "$here/phi512.sh" "$BIN"
+# The installed command has no checkout next to it: it is told this one,
+# where the worker script and driver are (phi512.md).
+staged=$(mktemp)
+awk -v r="$root" '/^installed_root=""$/ { gsub(/"/, "\\\"", r); print "installed_root=\"" r "\""; next } { print }' "$here/phi512.sh" > "$staged"
+grep -q '^installed_root="/' "$staged" || { echo "$0: could not record the checkout in the installed phi512" >&2; rm -f "$staged"; exit 1; }
+as_root install -Dm755 "$staged" "$BIN"
+rm -f "$staged"
 
 echo "${green}installed${off} $LIB and $BIN"
 

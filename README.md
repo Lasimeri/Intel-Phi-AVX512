@@ -139,7 +139,12 @@ host alone 6.93 / 2.31, host and both cards **9.56 / 2.72**.
 A mixture-of-experts model works the same way: ggml runs its expert
 weights through MUL_MAT_ID, which the cards take as well, each keeping
 the same rows of every expert, and the answers match the host's token
-for token. It is worth less so far: Qwen3.8-35B-A3B-Distill
+for token. (Until 2026-09-24 that held at generation only: at a batch the
+plain split read every expert after the first at the wrong stride, so a
+prompt's outputs were wrong while its speed was measured; fixed, and
+checked on a 1,800-token prompt, in
+`docs/results/2026-09-24-q8-remeasured-and-moe-stride.md`. The offloaded
+split was never affected.) It is worth less so far: Qwen3.8-35B-A3B-Distill
 (Q4_K_M, 20.2 GiB, 256 experts with 8 used per token) gains 26 percent
 at generation (9.53 and 9.51 tokens per second against 7.54) and loses
 about 8 at pp512 (87.98 and 88.45 against 93.39 and 97.32), interleaved
@@ -158,6 +163,10 @@ host after the upload and it never reads them again. The same model at
 Q8_0 (37.8 GB) generates at 5.03 and 5.15 tokens per second that way,
 against 4.01 and 3.75 on the host alone, and processes a prompt at 56.9
 and 56.6 against 28.0 and 21.8 (`docs/results/2026-09-24-offload-past-memory.md`).
+Re-measured that evening with less page cache free (about 21 GB): 4.98
+and 4.87 against 3.39 and 3.32 at generation, 46.5 and 58.8 against 24.0
+and 35.9 at pp512, each run re-reading 60 to 104 GB from the NVMe
+(`docs/results/2026-09-24-q8-remeasured-and-moe-stride.md`).
 
 Token generation is bound by weight bandwidth, and the cards add theirs
 to the host's; what bounds it now is how much of the model they hold,

@@ -25,13 +25,20 @@ threads_default=57
 
 # The card over its own SSH forward, with the pinned host key: every card
 # boots the same image and presents the same key, so one alias covers all.
+# The forward is loopback to the card over PCIe and the card's dropbear has
+# no post-quantum key exchange, so OpenSSH 10's warning about that is
+# turned off where this ssh knows the option (an older one would refuse it).
+nopq=()
+if ssh -G -o WarnWeakCrypto=no-pq-kex phi >/dev/null 2>&1; then
+    nopq=(-o WarnWeakCrypto=no-pq-kex)
+fi
 ssh_() {
-    ssh -o BatchMode=yes -o ConnectTimeout=10 -p "$PHI_PORT" -o IdentitiesOnly=yes -i "$HOME/.ssh/phi_ed25519" \
+    ssh "${nopq[@]}" -o BatchMode=yes -o ConnectTimeout=10 -p "$PHI_PORT" -o IdentitiesOnly=yes -i "$HOME/.ssh/phi_ed25519" \
         -o UserKnownHostsFile="$HOME/.ssh/known_hosts_phi" -o HostKeyAlias=phi -o StrictHostKeyChecking=accept-new \
         root@127.0.0.1 "$@"
 }
 scp_() {
-    scp -O -q -P "$PHI_PORT" -o IdentitiesOnly=yes -i "$HOME/.ssh/phi_ed25519" \
+    scp "${nopq[@]}" -O -q -P "$PHI_PORT" -o IdentitiesOnly=yes -i "$HOME/.ssh/phi_ed25519" \
         -o UserKnownHostsFile="$HOME/.ssh/known_hosts_phi" -o HostKeyAlias=phi -o StrictHostKeyChecking=accept-new "$@"
 }
 
@@ -146,9 +153,16 @@ case "$cmd" in
         # 4 KiB page; vpu_worker.md). PHI_VPU_HUGEPAGES is the reservation,
         # 768 pages = 1.5 GiB by default: 256 for the seamless path pool, the rest for buffers.
         want=${PHI_VPU_HUGEPAGES:-768}
+        # The old worker goes first, and is waited for: its uploads hold
+        # huge pages, and a reservation made while it still has them is only
+        # partly granted.
+        if running; then
+            ssh_ "pkill -f '$pat'"
+            for _ in $(seq 50); do running || break; sleep 0.2; done
+            if running; then echo "phi-vpu.sh: the old worker on card $PHI_CARD did not stop" >&2; exit 1; fi
+        fi
         have=$(ssh_ "echo $want > /proc/sys/vm/nr_hugepages; cat /proc/sys/vm/nr_hugepages")
         [ "$have" = "$want" ] || echo "phi-vpu.sh: card $PHI_CARD gave $have of $want huge pages; larger requests fall back to 4 KiB pages" >&2
-        if running; then ssh_ "pkill -f '$pat'"; sleep 0.5; fi
         # PHI_VPU_ARGS carries extra worker options (-s MS, -i US). The
         # kill above is a separate ssh call on purpose: a pkill in the same
         # command line as "./phi-vpu-worker" matches its own shell.

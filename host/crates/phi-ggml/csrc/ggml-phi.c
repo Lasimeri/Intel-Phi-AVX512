@@ -424,7 +424,16 @@ static int ffn_enabled(void)
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("PHI_GGML_FFN");
+        const char *o = getenv("PHI_GGML_OFFLOAD");
         on = e && atoi(e) != 0;
+        /* The fused path keeps its gate, up and down rows on the host and
+         * hands a declined block back to it whole, which is the opposite of
+         * the offload's "the cards' rows are theirs alone": with both set,
+         * the offload wins and the blocks go through the plain path. */
+        if (on && o && atoi(o) != 0) {
+            fprintf(stderr, "ggml-phi: PHI_GGML_FFN is off under PHI_GGML_OFFLOAD (the fused path keeps its rows on the host)\n");
+            on = 0;
+        }
     }
     return on;
 }
@@ -763,7 +772,17 @@ static const struct ggml_backend_device_i phi_device_i = {
 /* ---- registration ---- */
 
 static const char *phi_reg_get_name(ggml_backend_reg_t reg) { (void)reg; return "Phi"; }
-static size_t phi_reg_get_device_count(ggml_backend_reg_t reg) { (void)reg; return 1; }
+/* A device only when the cards open. llama.cpp aborts ("failed to
+ * initialize") on an accelerator whose backend comes back NULL, but runs on
+ * the CPU when a backend has no device: so a card that is down, or no
+ * worker polling, means no device here, decided once. */
+static size_t phi_reg_get_device_count(ggml_backend_reg_t reg)
+{
+    static int n = -1;
+    (void)reg;
+    if (n < 0) n = (resolve() == 0 && phi_ggml_open() >= 0 && host_backend() == 0) ? 1 : 0;
+    return (size_t)n;
+}
 
 static ggml_backend_dev_t phi_reg_get_device(ggml_backend_reg_t reg, size_t index)
 {

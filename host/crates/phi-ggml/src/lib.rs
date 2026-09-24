@@ -58,6 +58,11 @@ struct Split {
     /// from what the last calls measured, not from a rule about shapes.
     bad: [u32; 2],
     avoid: [bool; 2],
+    /// The tensor it was planned for (rows, bytes per row, type, experts):
+    /// splits are found by address, and a tensor of another shape at an
+    /// address a freed one had must be planned again, or the rows its
+    /// cards were given no longer fit it.
+    shape: [u64; 4],
 }
 
 /// Which tensor and batch class the multiply in flight belongs to, and
@@ -68,6 +73,9 @@ struct Judged {
     key: usize,
     class: usize,
     share: f64,
+    /// Whether its split followed `pp_share` (a plain multiply at a batch;
+    /// a mixture's is the whole slice), and so teaches the estimator.
+    adapts: bool,
 }
 
 struct Ctx {
@@ -203,8 +211,8 @@ fn open_card(index: usize, threads: u32, budget: u64) -> Result<Card, String> {
 
 /// Open the cards (`PHI_GGML_CARDS`, a comma list of indices; default
 /// every card whose worker answers) and settle the shares. Returns the
-/// number of cards, or -1 after a message (the backend then refuses to
-/// initialise and llama.cpp runs without it).
+/// number of cards, or -1 after a message (the backend then offers no
+/// device, and llama.cpp runs on the CPU without it).
 #[no_mangle]
 pub extern "C" fn phi_ggml_open() -> i32 {
     // llama.cpp initialises the backend once per model (the draft model
@@ -219,10 +227,14 @@ pub extern "C" fn phi_ggml_open() -> i32 {
     let fixed = std::env::var("PHI_GGML_FRACTION").ok().and_then(|s| s.parse::<f64>().ok());
     let pp_share = env_or("PHI_GGML_PP_SHARE", 0.75f64).clamp(0.0, 1.0);
     let verbose = std::env::var_os("PHI_GGML_VERBOSE").is_some();
-    let want: Vec<usize> = match std::env::var("PHI_GGML_CARDS") {
+    let mut want: Vec<usize> = match std::env::var("PHI_GGML_CARDS") {
         Ok(s) => s.split(',').filter_map(|x| x.trim().parse().ok()).collect(),
         Err(_) => (0..16).filter(|&i| phi_vpu::cards::hostmem_path(i).exists()).collect(),
     };
+    // Each card once: opened twice, two contexts would number their uploads
+    // from the same id and share one doorbell sequence on the same worker.
+    want.sort_unstable();
+    want.dedup();
     let mut cards = Vec::new();
     for i in want {
         match open_card(i, threads, budget) {
@@ -610,6 +622,17 @@ fn wait(card: &Card, seq: u64, timeout: Duration) -> Result<Reply, String> {
     }
 }
 
+/// What an upload of `bytes` takes of a card: the worker allocates it with
+/// 64 bytes of slack in whole 2 MiB huge pages (`big_alloc` and `SLACK` in
+/// card/vpu/vpu_matmul.c), so a budget counted in raw bytes runs a
+/// model's hundreds of slices hundreds of megabytes past the pages
+/// `phi-ggml.sh` reserves.
+fn card_cost(bytes: u64) -> u64 {
+    const SLACK: u64 = 64;
+    const HUGE: u64 = 2 << 20;
+    (matmul::round_up(bytes) + SLACK).div_ceil(HUGE) * HUGE
+}
+
 /// Decide and carry out the shares of a weight tensor seen for the first
 /// time: each card that still has budget takes `fraction` of the rows,
 /// uploaded now. A mixture's tensor holds `experts` matrices of `m` rows
@@ -641,7 +664,8 @@ unsafe fn plan(ctx: &mut Ctx, a: *const u8, a_type: u32, m: u64, nb_a: u64, expe
             continue;
         }
         let bytes = rows * nb_a * experts;
-        if card.uploaded + bytes > card.budget {
+        let cost = card_cost(bytes);
+        if card.uploaded + cost > card.budget {
             card.full = true;
             say(&format!(
                 "card {}: its budget is spent at {:.2} GB resident",
@@ -673,7 +697,7 @@ unsafe fn plan(ctx: &mut Ctx, a: *const u8, a_type: u32, m: u64, nb_a: u64, expe
             Ok(_) => {
                 card.next_id += 1;
                 card.ids.insert(a as usize, id);
-                card.uploaded += bytes;
+                card.uploaded += cost;
                 lo -= rows;
                 r0 = lo;
                 cards.push((ci, lo, lo + rows));
@@ -725,6 +749,7 @@ unsafe fn plan(ctx: &mut Ctx, a: *const u8, a_type: u32, m: u64, nb_a: u64, expe
         cards,
         bad: [0; 2],
         avoid: [false; 2],
+        shape: [m, nb_a, u64::from(a_type), experts],
     }
 }
 
@@ -882,6 +907,17 @@ unsafe fn begin(a: *const u8, a_type: u32, m: u64, k: u64, nb_a: u64, keep: i32,
         ctx.host_only += 1;
         return host_all(ctx, key, m, nb_a, touched, "a fused block's");
     }
+    let shape = [m, nb_a, u64::from(a_type), mix.experts];
+    if ctx.splits.get(&key).is_some_and(|s| s.shape != shape) {
+        // Another tensor where a freed one was (a second model in the same
+        // process): its old rows on the cards are not this tensor's. They
+        // stay resident until replaced; this one is planned afresh.
+        say("a weight tensor at an address already planned has another shape: planned again");
+        ctx.splits.remove(&key);
+        for card in &mut ctx.cards {
+            card.ids.remove(&key);
+        }
+    }
     if !ctx.splits.contains_key(&key) {
         // A plain multiply whose largest possible card part, every card's
         // `fraction` of the rows, cannot reach `min_bytes` is never given
@@ -895,6 +931,7 @@ unsafe fn begin(a: *const u8, a_type: u32, m: u64, k: u64, nb_a: u64, keep: i32,
                 cards: Vec::new(),
                 bad: [0; 2],
                 avoid: [false; 2],
+                shape,
             }
         } else {
             // SAFETY: the caller's contract.
@@ -936,7 +973,12 @@ unsafe fn begin(a: *const u8, a_type: u32, m: u64, k: u64, nb_a: u64, keep: i32,
     // resident rows start there), the host the rest of it as one more range.
     // What counts is the tokens, not the columns: a mixture's columns at
     // one token are as many experts, each read once, like n 1.
-    let share = if class == 1 { ctx.pp_share } else { 1.0 };
+    // Not for a mixture: its experts are uploaded `(hi - lo) * nb_a` apart,
+    // and the card finds expert e at `e * m * nb_a` from the request's `m`,
+    // so a request for fewer rows than the slice would read every expert
+    // after the first at the wrong offset (the descriptor has no expert
+    // stride of its own). A mixture's slice is the cards' whole at a batch.
+    let share = if class == 1 && !mixture { ctx.pp_share } else { 1.0 };
     let mut ranges = vec![(0u64, r0)];
     let mut work = Vec::new();
     let mut read_back = 0;
@@ -996,6 +1038,7 @@ unsafe fn begin(a: *const u8, a_type: u32, m: u64, k: u64, nb_a: u64, keep: i32,
         key,
         class,
         share: on_cards as f64 / m as f64,
+        adapts: class == 1 && !mixture,
     });
     let first = work[0].0;
     for (w_i, &(ci, lo, rows)) in work.iter().enumerate() {
@@ -1194,7 +1237,7 @@ pub unsafe extern "C" fn phi_ggml_end_id(d: *mut u8, nb_d: u64, nb_d2: u64) -> i
         // total in its reply. Average the relative gap over a window of
         // multiplies before moving, because one card time is worth
         // nothing; move by half of it; stop after `PP_STEPS`.
-        if j.class == 1 {
+        if j.adapts {
             pp_feed(ctx, t_host, t_card);
         }
     }

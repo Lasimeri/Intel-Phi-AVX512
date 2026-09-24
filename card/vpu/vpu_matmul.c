@@ -1141,7 +1141,9 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
         uint64_t have = (mm.a_id != 0) ? g_cache[cache_find(mm.a_id)].bytes : g_a.cap;
         experts = j.a_stride ? have / j.a_stride : 0;
         for (uint64_t p = 0; p < mm.n; p++)
-            if (j.ids[p] >= (int32_t)experts) return VPU_E_REQUEST;
+            /* Negative too: the quantized path counts by id before any
+             * thread runs, and -1 would write before its buffer. */
+            if (j.ids[p] < 0 || j.ids[p] >= (int32_t)experts) return VPU_E_REQUEST;
     }
     /* The columns in groups of eight, four or one, built once here and
      * read by every thread. The float kernels take one column at a time

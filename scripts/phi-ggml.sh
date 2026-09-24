@@ -49,19 +49,27 @@ if [ -z "$cards" ]; then
     done
 fi
 [ -n "$cards" ] || { echo "$0: no card window in /dev/shm; is a card up?" >&2; exit 1; }
-ncards=0
+# A card whose worker cannot be started is left out, not the whole run: a
+# card that is down keeps its /dev/shm window (the stack never unlinks it),
+# and the backend would have skipped it anyway.
+up=""
 for c in $(echo "$cards" | tr ',' ' '); do
-    ncards=$((ncards + 1))
     if ! "$root/scripts/phi-vpu.sh" -c "$c" status 2>/dev/null | grep -q "worker: polling"; then
         echo "$0: card $c has no worker polling; starting it" >&2
         # Every huge page is card memory a slice of the model can sit in:
         # reserve most of the card for them, and leave the seamless path's
         # pool empty (-e 0), which this backend never uses.
-        PHI_VPU_HUGEPAGES=${PHI_VPU_HUGEPAGES:-2400} \
+        if ! PHI_VPU_HUGEPAGES=${PHI_VPU_HUGEPAGES:-2400} \
             PHI_VPU_ARGS="-e 0 ${PHI_VPU_ARGS:-}" \
-            "$root/scripts/phi-vpu.sh" -c "$c" start >&2
+            "$root/scripts/phi-vpu.sh" -c "$c" start >&2; then
+            echo "$0: card $c left out: its worker did not start (phi -c $c status)" >&2
+            continue
+        fi
     fi
+    up="${up:+$up,}$c"
 done
+[ -n "$up" ] || { echo "$0: no card has a worker polling; nothing to share the work with" >&2; exit 1; }
+cards=$up
 export PHI_GGML_CARDS="$cards"
 # The share of every weight matrix each card keeps is the backend's to
 # size: it totals the weights the scheduler offers it and fills the cards'

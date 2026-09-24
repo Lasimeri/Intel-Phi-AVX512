@@ -334,3 +334,34 @@ backend over the whole weight, and the fused feed-forward
 
 What it is worth, on models near and past the host's memory, is in
 `docs/results/2026-09-24-offload-past-memory.md`.
+
+## Corrections of 2026-09-24 (a review pass)
+
+- **A mixture's batch share is the whole slice.** The upload lays a
+  mixture's experts `(hi - lo) * nb_a` apart in the card's buffer, and the
+  card finds expert e at `e * m * nb_a` from the request's `m`. At a batch
+  the plain path sent `m` = the card's share of its slice (`pp_share`, cut
+  in steps of 64 rows), so for a slice of more than about 86 rows every
+  expert after the first was read at the wrong offset, silently: the id
+  check could not see it, since a smaller stride makes more experts fit.
+  It needed the share below 1, so the offload (share 1) and generation
+  were never affected, and the judgement kept most expert work on the host
+  at a batch; the split's MoE prompt numbers before this date, and any
+  MoE prompt processed with the plain split, carry the error where a card
+  took a batch multiply of a large expert tensor. A mixture's multiply now
+  sends the whole slice at a batch, and only plain multiplies teach the
+  share estimator (`Judged::adapts`). A descriptor field for the expert
+  stride would let a mixture share its slice at a batch again.
+- **Shapes are checked, not only addresses.** A split is found by the
+  weight tensor's address; a tensor of another shape where a freed one was
+  (a second model in one process) is planned again, where it used to reuse
+  the old rows, and could read or write past them. Two models of the same
+  layout at the same addresses still share a plan: nothing here sees a
+  weight buffer freed.
+- **The budget counts what the card allocates**: each upload in whole
+  2 MiB pages with the worker's 64 bytes of slack (`card_cost`), not raw
+  bytes.
+- **Each card once**: `PHI_GGML_CARDS=0,0` opens card 0 once.
+- **No card, no device**: when the cards do not open, the registry reports
+  no device (ggml-phi.md), and llama.cpp runs on the CPU instead of
+  stopping with "failed to initialize".

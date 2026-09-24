@@ -13,7 +13,12 @@ scripts/phi-vpu.sh [-c N] poly [args]   run the host driver; deploys and starts 
 host-memory window (`/dev/shm/phi-hostmem` for card 0, `phi-hostmem-N`
 for card N) and its own SSH forward (`127.0.0.1:2222+N`), so each runs
 its own worker, and the script reaches it over its own port with the
-pinned host key; no `~/.ssh/config` stanza is needed. Needs the card up
+pinned host key; no `~/.ssh/config` stanza is needed. OpenSSH 10 warns
+on every connection that does not use a post-quantum key exchange, which
+the card's dropbear lacks; the forward is loopback to the card over PCIe,
+so the script passes `WarnWeakCrypto=no-pq-kex` when the local ssh knows
+that option (checked with `ssh -G`; an older ssh would refuse it and the
+script then passes nothing). Needs the card up
 (`phi -c N status`) with the native toolchain on its disk (`cc` builds
 the worker on the card). The worker lives in `/opt/phi-vpu` on the card
 (`PHI_VPU_DIR` to change), which is on the card's persistent disk, so a
@@ -96,3 +101,10 @@ through the host), else on the card itself with `build.sh`, which
 builds alone and slowly while the card serves. The host build must be
 static: the cross toolchain's default is a dynamic executable wanting
 `/lib/ld-musl-x86_64.so.1`, which the card does not have.
+
+`start` stops a running worker first and waits until it is gone (up to
+10 s) before it asks for huge pages: the old worker's uploads hold huge
+pages, and a reservation made while it still had them was only partly
+granted, so the new worker's uploads went to 4 KiB pages (before
+2026-09-24 the order was the other way round, with a fixed half-second
+wait).

@@ -267,3 +267,8 @@ On the 27B at one token: the host's wait for the cards fell from 64 to
 12 ms per token, the slower card's pulls from about 70 ms to 16 and its
 pushes from 97 to 7, and generation went from 1.66 to 1.83 tokens per
 second (`docs/results/2026-09-23-redundancy-and-transport.md`).
+
+A mixture's expert ids are checked once before any thread runs, negative
+ones included (2026-09-24): the quantized path counts columns by id, and
+an id of -1 would have written before its buffer instead of failing the
+request.
