@@ -323,7 +323,11 @@ default): a dropped page of a file is read back from the file if it is
 ever touched, so a miss costs time, never a wrong result. A model read
 into ordinary memory (`--load-mode none`) is left alone
 (`file_backed`, from `/proc/self/maps`), because paging that out would
-push the weights into swap. Two paths are outside it: a multiply the
+push the weights into swap; the offload says so once, since it would
+then cost its routing and save nothing. It adds no arithmetic, only
+sends the cards multiplies the default would keep on the host: a
+32-token greedy completion of the Q4_K_M is the same text byte for byte
+with and without it (`llama-completion --temp 0`). Two paths are outside it: a multiply the
 glue declines at the scheduler (`supports_op`) runs on llama.cpp's CPU
 backend over the whole weight, and the fused feed-forward
 (`PHI_GGML_FFN=1`) keeps its own rules.

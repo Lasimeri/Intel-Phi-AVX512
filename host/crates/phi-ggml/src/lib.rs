@@ -160,6 +160,8 @@ struct Ctx {
     /// on (from /proc/self/maps, read when an address is not in them).
     host_read: u64,
     file_maps: Vec<(usize, usize)>,
+    /// Whether the offload has said the model is not mapped from its file.
+    unmapped_said: bool,
 }
 
 static CTX: Mutex<Option<Ctx>> = Mutex::new(None);
@@ -298,6 +300,7 @@ pub extern "C" fn phi_ggml_open() -> i32 {
         offload,
         host_read: 0,
         file_maps: Vec::new(),
+        unmapped_said: false,
     });
     n
 }
@@ -698,6 +701,13 @@ unsafe fn plan(ctx: &mut Ctx, a: *const u8, a_type: u32, m: u64, nb_a: u64, expe
     // Offloaded, the rows now on the cards leave the host's memory: they
     // are r0..m of every expert, one run each.
     if ctx.offload && r0 < m {
+        // Read into ordinary memory, the model's pages cannot be dropped,
+        // and the offload then costs its routing and saves nothing: said
+        // once, since nothing else would show it.
+        if !ctx.unmapped_said && !file_backed(&mut ctx.file_maps, a as usize, 1) {
+            ctx.unmapped_said = true;
+            say("offload: the model is not mapped from its file (--load-mode none?), so its pages stay in memory; use --load-mode mmap");
+        }
         let mut dropped = 0;
         for e in 0..experts {
             let at = a as usize + (e * nb_a2 + r0 * nb_a) as usize;

@@ -98,8 +98,14 @@ The answer to the question: a larger quantization does not take this
 model to 1 token a second. Q8_0 on the host alone is 3.75 to 4.01, as
 the bytes per token predicted (4.3), because a mixture reads a twelfth
 of itself per token and the page cache holds most of what a token
-reads. With the cards holding their rows outright it is 5.0 to 5.2,
-the speed of Q6_K.
+reads. With the cards holding their rows outright it is 5.0 to 5.2:
+about 18 percent below Q6_K at its best (the split, 6.27 and 6.13), level
+with Q6_K on the host alone or offloaded, and within Q6_K's range on
+the prompt (56.9 and 56.6 against 61.6 to 67.1). Nor does it make Q8_0
+fit: offloaded it still reads 6 to 8 MB a token from the NVMe, because
+the host's part, about 29 GB, is still more than the page cache can
+give it. The offload moves a slice of every expert rather than whole
+experts, which takes the same 8.8 GB off the host either way.
 
 ## What the runs also showed
 
