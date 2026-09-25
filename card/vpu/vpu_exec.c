@@ -280,6 +280,10 @@ static void open_pages(struct chunk *c, uint64_t addr, uint64_t len)
 {
     if (!c->fourk) return;
     mprotect((void *)addr, len, PROT_READ | PROT_WRITE | (c->exec ? PROT_EXEC : 0));
+    /* Not populated here: MADV_POPULATE_WRITE was tried (2026-09-25) and a
+     * 64 MiB range took 276 ms, the kernel zeroing every fresh page on this
+     * one thread, where the faults of the pool's staged copy spread the same
+     * zeroing over 57 (the fetch 284 ms in all against 396). */
 }
 
 /* Every change of protection flushes the TLB on every CPU a thread of this

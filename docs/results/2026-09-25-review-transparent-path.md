@@ -168,3 +168,11 @@ the scattered 4 KiB pages): at 1M the integers 23.1-23.8 to 18.1-18.3 ms
 and the polynomial 32-50 to 23-37; at 16 M the loop's 64 MiB goes back in
 34 ms. The dot product writes nothing back and is unchanged. The review
 test, narrow, ground and the emulator's conformance pass.
+
+Tried and dropped: `madvise(MADV_POPULATE_WRITE)` over an opened run, to
+allocate the pages in one call rather than a fault per page. The dot
+product's 64 MiB ranges then took 276 ms in the populate alone: the kernel
+zeroes every fresh page, and there it did so on one thread, where the
+staged copy's faults spread the same zeroing over the pool's 57 (the fetch
+396 ms in all against 284). What is left of the 16 M dot product's time
+is that zeroing and the host's copy into the window (52 ms for 128 MiB).
