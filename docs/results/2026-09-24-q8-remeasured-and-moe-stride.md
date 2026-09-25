@@ -62,3 +62,22 @@ the wrong experts; their speeds stand as measured, their outputs were not
 the model's. The offloaded split, the dense 27B, and every generation
 figure are unaffected. Intel-Phi-Jev's `cards` site runs offloaded, so its
 answers were not affected either.
+
+## On the corrected backend (2026-09-25)
+
+The same benchmark on bd166f4, after the budget began counting each
+upload in whole 2 MiB pages (`card_cost`) and a mixture's batch share
+became its whole slice, same order and method:
+
+| | pp512 tok/s | tg64 tok/s | NVMe read per run |
+| --- | --- | --- | --- |
+| host alone | 22.09, 24.24 | 3.52, 2.68 | 103, 93 GB |
+| host and both cards, offloaded | 60.82, 46.16 | 4.91, 4.77 | 63, 62 GB |
+
+The cards' budget is now spent at 4.39 GB resident each (4.37 before,
+counted in raw bytes). Offloaded generation, 4.77 to 4.91, is within the
+spread of the day before (4.87 to 4.98); the prompt figures swing as
+before. The host alone lost ground inside the run (3.52 to 2.68, the load
+average at 20 by its end): this host's drift, which is why the rounds are
+interleaved. Against it, the cards are 1.4 to 1.8 times at generation and
+2 to 2.8 times at pp512.

@@ -2308,12 +2308,16 @@ fn canon(map: u8, pp: u8, w: u8, op: u8, reg: u8) -> Option<Canon> {
     }
 }
 
-/// A byte or word compare for equality whose only consumer is
-/// `kortestq`/`kortestd` on its result (a scan for a differing byte,
+/// A byte or word compare for equality or inequality whose only consumer
+/// is `kortestq`/`kortestd` on its result (a scan for a differing byte,
 /// as compilers emit for memcmp-like loops): the card's masks are 16
-/// bits, one per dword, so the compare becomes the dword compare, whose
-/// result is zero exactly when the byte compare's is. The region
-/// builder checks the consumer and calls this instead of `rewrite`.
+/// bits, one per dword, so the compare becomes the dword compare. That
+/// keeps one fact, not both: for equality, "every byte equal" (the mask
+/// all ones, CF) is "every dword equal", but "no byte equal" (ZF) is not
+/// "no dword equal"; for inequality, "no byte differs" (ZF) is "no dword
+/// differs", and CF is not kept. The region builder checks the consumer
+/// and the branch after it (phi512's `bytecmp_flag_kept`) and calls this
+/// instead of `rewrite` only then.
 pub fn rewrite_bytecmp_for_kortest(insn: &Instruction, bytes: &[u8], tg: &Target) -> Result<Rewrite, Unsupported> {
     use Mnemonic as M;
     if insn.encoding() != EncodingKind::EVEX || bytes.len() < 6 {

@@ -488,7 +488,49 @@ fn bytecmp_pair(insn: &Instruction, bytes: &[u8], tg: &Target, text: &Map) -> Op
     {
         return None;
     }
+    // And the branch after it must read the one flag the dword compare
+    // keeps (bytecmp_flag_kept).
+    let after = n.next_ip();
+    if after >= text.hi {
+        return None;
+    }
+    let avail = ((text.hi - after).min(15)) as usize;
+    // SAFETY: [after, after+avail) is inside the readable, executable mapping `text`.
+    let ab = unsafe { std::slice::from_raw_parts(after as *const u8, avail) };
+    let branch = Decoder::with_ip(64, ab, after, DecoderOptions::NONE).decode();
+    if !bytecmp_flag_kept(insn, &branch) {
+        return None;
+    }
     avx512_xlate::rewrite::rewrite_bytecmp_for_kortest(insn, bytes, tg).ok()
+}
+
+/// Whether the dword compare that replaces a byte or word compare keeps
+/// the flag `branch` reads after `kortest`. For an equality compare the
+/// dword mask is all ones exactly when the byte mask is (every byte equal
+/// is every dword equal), so CF is kept, but not ZF: bytes can match one
+/// by one where no whole dword does. For inequality the other way round:
+/// no byte differs exactly when no dword differs, so ZF is kept, not CF.
+/// A branch reading anything else, or no branch, keeps nothing.
+fn bytecmp_flag_kept(cmp: &Instruction, branch: &Instruction) -> bool {
+    use iced_x86::ConditionCode as C;
+    use iced_x86::Mnemonic as M;
+    if branch.flow_control() != FlowControl::ConditionalBranch {
+        return false;
+    }
+    let equality = match cmp.mnemonic() {
+        M::Vpcmpeqb | M::Vpcmpeqw => true,
+        M::Vpcmpb | M::Vpcmpub | M::Vpcmpw | M::Vpcmpuw => match cmp.immediate8() & 7 {
+            0 => true,
+            4 => false,
+            _ => return false,
+        },
+        _ => return false,
+    };
+    match branch.condition_code() {
+        C::b | C::ae => equality,
+        C::e | C::ne => !equality,
+        _ => false,
+    }
 }
 
 /// Where an address is, for a message: `module+offset` through `dladdr`,
@@ -1460,6 +1502,30 @@ mod tests {
         let at = free_range(&maps, 4 << 20, c, 4 << 20, c).unwrap();
         assert_eq!(at, 8 << 20);
         assert_eq!(at % c, 0);
+    }
+
+    #[test]
+    fn a_byte_compare_is_rewritten_only_for_the_flag_its_dword_twin_keeps() {
+        let d = |b: &[u8]| Decoder::with_ip(64, b, 0x1000, DecoderOptions::NONE).decode();
+        // vpcmpeqb k1, zmm0, [rdi]; vpcmpb k1, zmm0, [rdi], 4 (not equal)
+        let eq = d(&[0x62, 0xf1, 0x7d, 0x48, 0x74, 0x0f]);
+        let ne = d(&[0x62, 0xf3, 0x7d, 0x48, 0x3f, 0x0f, 0x04]);
+        let (jb, jae, je, jne, ja) = (
+            d(&[0x72, 0x10]),
+            d(&[0x73, 0x10]),
+            d(&[0x74, 0x10]),
+            d(&[0x75, 0x10]),
+            d(&[0x77, 0x10]),
+        );
+        // Equality keeps "all equal" (CF), not "none equal" (ZF).
+        assert!(bytecmp_flag_kept(&eq, &jb) && bytecmp_flag_kept(&eq, &jae));
+        assert!(!bytecmp_flag_kept(&eq, &je) && !bytecmp_flag_kept(&eq, &jne));
+        // Inequality keeps "none differ" (ZF), not "all differ" (CF).
+        assert!(bytecmp_flag_kept(&ne, &je) && bytecmp_flag_kept(&ne, &jne));
+        assert!(!bytecmp_flag_kept(&ne, &jb));
+        // Both flags, or no branch at all: nothing kept.
+        assert!(!bytecmp_flag_kept(&eq, &ja));
+        assert!(!bytecmp_flag_kept(&eq, &d(&[0x90])));
     }
 
     #[test]

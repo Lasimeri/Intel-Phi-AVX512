@@ -128,3 +128,19 @@ passed over. Each region analysed gets its own; they are 2 MiB of address
 space each, not memory. The review that found it named it a candidate
 cause of the avx512 site's flash-attention failure ("touched memory the
 process never mapped" in demand mode); that run has not been repeated.
+
+## A byte compare for kortest: only for the flag it keeps (2026-09-25)
+
+A byte or word compare whose result only feeds `kortestq`/`kortestd` is
+rewritten as the dword compare (the card's masks have a bit per dword).
+That keeps one fact: for equality, "every byte equal" (CF after
+`kortest`) is "every dword equal", but "no byte equal" (ZF) is not "no
+dword equal", since bytes can match one by one where no whole dword does;
+for inequality it is the other way round. The rewrite used to check only
+that `kortest` followed; now the branch after it must read the kept flag
+(`jb`/`jae` after an equality compare, `je`/`jne` after an inequality
+one), else the compare is not rewritten and the program is told the card
+cannot run it. A NUL scan (`vpcmpeqb` against zero, `kortestq`, `je`) had
+been able to run past its terminator. Still assumed, not checked: that
+nothing reads the mask register itself after the branch (a `kmovq` and
+`tzcnt` to find the byte would see dword lanes).

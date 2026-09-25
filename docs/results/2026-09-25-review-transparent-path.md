@@ -120,3 +120,10 @@ attention failure's cause is still to be run.
 And the emulator's over-reads: a memory source is read at its own size and
 a masked load reads only its enabled lanes (`host/crates/phi512/src/emulate.md`);
 a guard-page test dies with SIGSEGV on the old read and passes on the new.
+
+And the byte compare for `kortest` (`host/crates/phi512/src/offload.md`):
+rewritten only when the branch after `kortest` reads the one flag the
+dword compare keeps (CF after equality, ZF after inequality); the
+rewriter's comment claimed both. Unit test on decoded compares and
+branches. Still assumed: nothing reads the mask register itself after
+the branch.
