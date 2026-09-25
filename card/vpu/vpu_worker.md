@@ -149,8 +149,8 @@ the page cache would serve whatever the last reader saw:
   record to the host per physically contiguous run of a buffer, so a
   4 KiB-paged buffer fresh from `malloc` cost 15 records per 64 KiB and
   88 per 512 KiB request, each a round trip of host work; a huge-paged
-  buffer is one record per 512 KiB request. Measured 2026-09-22 with
-  `blkbench.c` on card 0: a 512 KiB `pread` went from 1.8 ms to 0.24 ms,
+  buffer is one record per 512 KiB request. Measured 2026-09-22 with the
+  stack's `card/examples/blkbench.c` on card 0: a 512 KiB `pread` went from 1.8 ms to 0.24 ms,
   16 MiB from 7.4 ms to 5.2 ms, the Gen2 x8 link.
 
 With the host daemon pipelining records, the card driver's poller

@@ -38,8 +38,9 @@ accessible: an access the planner did not declare now faults instead of
 reading whatever the card held, and every fetch pays for scattered pages
 and a change of protection on 57 threads
 ([`docs/results/2026-09-22-ggml-backend.md`](docs/results/2026-09-22-ggml-backend.md),
-"the price of soundness"; the transport itself is unchanged,
-`card/vpu/blkbench.md`).
+"the price of soundness"; the transport itself is unchanged, as the
+stack's block-path timer shows,
+[`card/examples/blkbench.md`](https://github.com/Lasimeri/Intel-Phi-3120A/blob/main/card/examples/blkbench.md)).
 
 ## What you need
 

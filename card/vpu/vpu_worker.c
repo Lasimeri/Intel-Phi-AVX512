@@ -303,8 +303,10 @@ int vpu_push(const void *src, size_t len, uint64_t off) { return push(src, len, 
  * buffer, and a 4 KiB-paged buffer fresh from malloc is scattered, 15
  * records per 64 KiB and 88 per 512 KiB request, at about 20 us of host
  * work each; a huge-paged buffer is one record per 512 KiB request.
- * Measured 2026-09-22 with blkbench.c on card 0: a 512 KiB pread went
- * from 1.8 ms to 0.34 ms, 16 MiB from 7.4 ms to 5.5 ms (the link). */
+ * Measured 2026-09-22 with the stack's card/examples/blkbench.c on card
+ * 0 (Intel-Phi-3120A, docs/results/2026-09-22-block-pipeline.md): a
+ * 512 KiB pread went from 1.8 ms to 0.24 ms, 16 MiB from 7.4 ms to 5.2 ms
+ * (the link). */
 #define HUGE_BYTES (2UL << 20)
 struct buf { float *p; size_t cap; int huge; };
 

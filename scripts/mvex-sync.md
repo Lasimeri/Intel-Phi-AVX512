@@ -8,7 +8,10 @@ hand-vectorised kernels) builds on the same library there. A path or git
 dependency across the two repositories would tie a build to one
 directory name or to the network, so the library is carried, the one
 exception to the family's "nothing of a sibling is copied"
-(`CONTRIBUTING.md`, "The family").
+(`CONTRIBUTING.md`, "The family"). A hash of every tracked file in both
+repositories (2026-09-25) found one other: the block-path timer,
+`blkbench.c`, which the split left with the stack; the copy here was
+removed and its mentions point at the stack's.
 
 This script keeps that honest. It finds the stack as
 [`stack.sh`](stack.md) does and compares every library source (`*.rs`
