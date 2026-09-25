@@ -46,6 +46,10 @@ pool's threads do not spin between graphs),
 repository's, so two builds can be compared interleaved),
 `PHI_GGML_OFFLOAD` (1: the cards' rows leave the host, for a model
 larger than its memory; needs `--load-mode mmap`, below),
+`PHI_GGML_ALL_ROWS` (1, with the offload: the cards may keep every row,
+the host none, for a model that fits them),
+`PHI_GGML_SPIN_US` (the wait for a card spins this many microseconds,
+then sleeps between looks; unset, it spins throughout),
 `PHI_GGML_HOST_THREADS` (the host's threads for its rows, 12: leave the
 card daemons a CPU each, and give the program the same `-t`),
 `PHI_GGML_THREADS` (card threads, 57),

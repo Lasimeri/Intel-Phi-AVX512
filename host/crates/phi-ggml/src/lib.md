@@ -335,6 +335,46 @@ backend over the whole weight, and the fused feed-forward
 What it is worth, on models near and past the host's memory, is in
 `docs/results/2026-09-24-offload-past-memory.md`.
 
+## Every row on the cards, and a host that waits asleep (2026-09-25)
+
+Two opt-in settings for a host that should keep as little of the work as
+possible (Intel-Phi-Jev's aim of 2026-09-25), neither changing anything
+unset:
+
+- `PHI_GGML_ALL_ROWS=1`, with `PHI_GGML_OFFLOAD=1` only (said and
+  ignored without it): the share's cap becomes the cards' equal split
+  (`share_cap`), so a model that fits the cards' budgets has every row of
+  every shared matrix on them and the host none. The cap exists for the
+  judgement, which needs host rows to time; offloaded, no judgement runs.
+  A zero-row host range is skipped by the glue (`to > from`).
+- `PHI_GGML_SPIN_US=N`: `wait` spins N microseconds for a card's reply,
+  then looks every 50 us (`NAP`) with the thread asleep. Unset, it spins
+  throughout, as before.
+
+Measured 2026-09-25 through Intel-Phi-Jev's `xks --site cards serve`
+(offloaded), `examples/query.json`, the steady request of three, the
+xks process's CPU from `/proc/PID/stat` and its resident memory:
+
+| subject, threads | setting | wall | xks CPU | xks resident |
+| --- | --- | --- | --- | --- |
+| Qwen2.5 0.5B f16, 2 | host only (x86 site) | 1.45 s | 2.84 s | 1.46 GiB |
+| same | cards, the host keeping a third | 4.57 s | 5.6 s | 1.09 GiB |
+| same | `ALL_ROWS` | 6.2 s | 6.7 s | 0.91 GiB |
+| same | `ALL_ROWS`, `SPIN_US=0` | 6.2 s | 1.24 s | 0.91 GiB |
+| Qwen3.8 35B-A3B Q4_K_M, 4 | cards (20.5 % of every matrix each) | 8.8 s | 34.5 s | 14.1 GiB |
+| same | `SPIN_US=0` | 9.5 s | 36.1 s | 13.7 GiB |
+
+With every row on the cards the spinning wait was the host's largest
+cost, one thread kept busy for the whole request; asleep, the host keeps
+about a core's worth of work less, at the same wall time. On the 35B the
+cards hold 41 % of its 20.9 GB of shared weights (their 4.4 GB budgets),
+the host computes the rest and is the long pole (5.8 s of host rows
+against 3.0 s per card in one request, `xks ledger`), so there is little
+wait to save, and the naps made it slower: leave `SPIN_US` unset there.
+`ALL_ROWS` changes nothing on the 35B (its share, 0.205, is under
+either cap). The card daemons' own share of a request (about 1.5 s of
+CPU each, serving the transfers) is the stack's and is not changed here.
+
 ## Corrections of 2026-09-24 (a review pass)
 
 - **A mixture's batch share is the whole slice.** The upload lays a

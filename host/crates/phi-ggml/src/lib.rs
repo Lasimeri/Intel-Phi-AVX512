@@ -16,7 +16,7 @@
 //! that talks to the cards is here.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{fence, Ordering};
+use std::sync::atomic::{fence, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -163,6 +163,9 @@ struct Ctx {
     /// host's memory needs only the host's part of it resident. Off, the
     /// rows are a copy and the host falls back on them freely.
     offload: bool,
+    /// The cards may keep every row (`PHI_GGML_ALL_ROWS=1`, offloaded
+    /// only): `share_cap`.
+    all_rows: bool,
     /// Bytes of the cards' resident rows the host has read since the
     /// upload, with the file-backed address ranges `drop_pages` may act
     /// on (from /proc/self/maps, read when an address is not in them).
@@ -258,8 +261,15 @@ pub extern "C" fn phi_ggml_open() -> i32 {
             say(&format!("could not clear card {}: {e}", card.index));
         }
     }
+    let offload = env_or("PHI_GGML_OFFLOAD", 0u32) != 0;
+    let all_rows = env_or("PHI_GGML_ALL_ROWS", 0u32) != 0;
+    if all_rows && !offload {
+        say("PHI_GGML_ALL_ROWS needs PHI_GGML_OFFLOAD=1 (the judgement needs host rows): ignored");
+    }
+    let all_rows = all_rows && offload;
+    set_spin(std::env::var("PHI_GGML_SPIN_US").ok().and_then(|s| s.parse::<u64>().ok()));
     // A fixed share is held to the same cap as a sized one (`share_cap`).
-    let cap = share_cap(cards.len());
+    let cap = share_cap(cards.len(), all_rows);
     if fixed.is_some_and(|f| f > cap) {
         say(&format!(
             "PHI_GGML_FRACTION above {cap:.3} would leave the host too few rows to judge the cards by: {cap:.3} it is"
@@ -279,9 +289,11 @@ pub extern "C" fn phi_ggml_open() -> i32 {
     // Offloaded, a card computes all of its slice at a batch too, and
     // nothing moves that share: the host's part of it is what would read
     // the rows back.
-    let offload = env_or("PHI_GGML_OFFLOAD", 0u32) != 0;
     if offload {
         say("offload: the cards' rows are theirs alone; the host never reads them after the upload, and their pages are dropped");
+    }
+    if all_rows {
+        say("all rows: the cards may keep every row of a matrix, the host none (a model that fits them leaves the host no weight arithmetic)");
     }
     let n = cards.len() as i32;
     *CTX.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ctx {
@@ -310,6 +322,7 @@ pub extern "C" fn phi_ggml_open() -> i32 {
         ffn_judged: None,
         ffn_h16: env_or("PHI_GGML_FFN_H16", 0u32) != 0,
         offload,
+        all_rows,
         host_read: 0,
         file_maps: Vec::new(),
         unmapped_said: false,
@@ -552,7 +565,18 @@ pub extern "C" fn phi_ggml_note_weight(data: *const u8, bytes: u64) {
 /// cards, and they are taken off them. Capped at an equal split between
 /// the cards (half each on two), the 35B-A3B generated 8.30 tokens a
 /// second against 9.05 at 0.203 (`docs/results/2026-09-23-redundancy-and-transport.md`).
-fn share_cap(ncards: usize) -> f64 {
+///
+/// `all_rows` (`PHI_GGML_ALL_ROWS=1`, with the offload only) lifts the cap
+/// to the cards' equal split, the host keeping nothing: offloaded, no
+/// judgement runs, so the reason above does not apply, and a model that
+/// fits the cards leaves the host none of its weight arithmetic. That is
+/// the trade for a host kept free rather than a fast one: the host is
+/// faster per flop than a card, so a model the host could share is
+/// slower whole on the cards.
+fn share_cap(ncards: usize, all_rows: bool) -> f64 {
+    if all_rows {
+        return 1.0 / ncards.max(1) as f64;
+    }
     1.0 / (ncards as f64 + 1.0)
 }
 
@@ -572,7 +596,7 @@ fn settle_fraction(ctx: &mut Ctx) {
         return;
     }
     let budget = ctx.cards.iter().map(|c| c.budget).min().unwrap_or(0);
-    ctx.fraction = (0.97 * budget as f64 / total as f64).min(share_cap(ctx.cards.len()));
+    ctx.fraction = (0.97 * budget as f64 / total as f64).min(share_cap(ctx.cards.len(), ctx.all_rows));
     say(&format!(
         "{:.1} GB of weights offered to the cards: each keeps {:.1}% of every weight matrix's rows",
         total as f64 / 1e9,
@@ -605,8 +629,28 @@ fn doorbell(card: &Card, kernel: u32) -> u64 {
     seq
 }
 
+/// How long `wait` spins before it sleeps between looks, in nanoseconds
+/// (`PHI_GGML_SPIN_US`; unset, it spins throughout, as it always has).
+static SPIN_NS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// The pause between looks once the spin budget is spent. The kernel's
+/// timer slack (50 us by default) comes on top of it.
+const NAP: Duration = Duration::from_micros(50);
+
+fn set_spin(us: Option<u64>) {
+    let ns = us.map_or(u64::MAX, |u| u.saturating_mul(1000));
+    SPIN_NS.store(ns, Ordering::Relaxed);
+    if let Some(u) = us {
+        say(&format!(
+            "waiting for a card spins {u} us, then looks every {} us: a host thread is not kept busy for the cards",
+            NAP.as_micros()
+        ));
+    }
+}
+
 fn wait(card: &Card, seq: u64, timeout: Duration) -> Result<Reply, String> {
     let start = Instant::now();
+    let spin = Duration::from_nanos(SPIN_NS.load(Ordering::Relaxed));
     loop {
         let rep: Reply = card.w.read(OFF_REPLY);
         if rep.seq == seq {
@@ -618,7 +662,11 @@ fn wait(card: &Card, seq: u64, timeout: Duration) -> Result<Reply, String> {
         if start.elapsed() > timeout {
             return Err(format!("card {}: no answer within {timeout:?} (request {seq})", card.index));
         }
-        std::hint::spin_loop();
+        if start.elapsed() < spin {
+            std::hint::spin_loop();
+        } else {
+            std::thread::sleep(NAP);
+        }
     }
 }
 
