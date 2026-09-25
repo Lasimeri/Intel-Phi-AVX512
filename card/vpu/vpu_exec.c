@@ -402,17 +402,17 @@ static void *shadow_get(void)
 
 /* ---- write-back ------------------------------------------------------- */
 
-/* Ranges mode writes pages straight from the mapped chunks into the slot
- * (a range's pages are contiguous there, one DMA per chunk); demand mode
- * copies changed pages into the staging buffer first. Either way the
- * table is staged. */
-static int g_wb_direct;
+/* Both modes copy the pages to write back into the staging buffer (a huge
+ * page) after the table and write the slot in one go. Ranges mode used to
+ * write straight from the mapped chunk, but its chunks are 4 KiB pages,
+ * scattered, one block record each: staged, the same pages go at the huge
+ * page's rate (card/vpu/vpu_exec.md). */
 
 static int stage_flush(int n)
 {
     if (n == 0) return 0;
     uint32_t slot = g_wb_slot & 1;
-    size_t bytes = g_wb_direct ? VPU_WB_TABLE : VPU_WB_TABLE + (size_t)n * 4096;
+    size_t bytes = VPU_WB_TABLE + (size_t)n * 4096;
     if (pwrite(g_blk, g_stage, bytes, VPU_OFF_EXEC_WB + (off_t)slot * VPU_EXEC_CHUNK) != (ssize_t)bytes) return -1;
     /* Acked as soon as the host has it; the ack of the next one means this
      * one was applied, so the other slot is free to fill meanwhile. */
@@ -433,7 +433,8 @@ static int stage_direct(int *n, uint64_t addr, int npages, uint64_t first_mask, 
         struct vpu_wb_page *table = g_stage;
         int take = npages;
         if (*n + take > (int)VPU_WB_MAX_PAGES) take = (int)VPU_WB_MAX_PAGES - *n;
-        if (pwrite(g_blk, (const void *)addr, (size_t)take * 4096, VPU_OFF_EXEC_WB + (off_t)(g_wb_slot & 1) * VPU_EXEC_CHUNK + VPU_WB_TABLE + (off_t)*n * 4096) != (ssize_t)take * 4096) return -1;
+        unsigned char *pages = (unsigned char *)g_stage + VPU_WB_TABLE;
+        stage_copy(pages + (size_t)*n * 4096, (const void *)addr, (size_t)take * 4096);
         for (int i = 0; i < take; i++) {
             table[*n + i].addr = addr + (uint64_t)i * 4096;
             table[*n + i].lines = ~0ULL;
@@ -942,7 +943,6 @@ int vpu_exec_run(volatile unsigned char *ctrl, int blk_fd, int verbose)
     uint64_t w0 = now_ns();
     uint32_t pages = 0;
     int n = 0;
-    g_wb_direct = g_desc.mode == VPU_MODE_RANGES;
     if (g_desc.mode == VPU_MODE_RANGES) {
         for (uint32_t i = 0; i < g_desc.nranges; i++)
             if (g_desc.ranges[i].flags & VPU_RANGE_WRITE)

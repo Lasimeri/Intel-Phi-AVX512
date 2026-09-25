@@ -162,3 +162,9 @@ integers):
 A small fetch through the pool was slower (a prologue's few pages, 0.9 to
 1.5 ms: the pool's wake-up), so the pool copies only from 256 KiB. The
 review test, narrow, ground and the seamless test pass.
+
+And the write-back, staged the same way (ranges mode wrote straight from
+the scattered 4 KiB pages): at 1M the integers 23.1-23.8 to 18.1-18.3 ms
+and the polynomial 32-50 to 23-37; at 16 M the loop's 64 MiB goes back in
+34 ms. The dot product writes nothing back and is unchanged. The review
+test, narrow, ground and the emulator's conformance pass.

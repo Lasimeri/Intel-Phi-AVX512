@@ -166,3 +166,11 @@ ranges mode fetches only between runs anyway). Soundness is unchanged:
 the same pages are opened, before the copy. With `-v` the worker prints a
 phase's fetch split three ways (`exec: fetch: protect, mail, read`), which
 is how the read was found to be the cost.
+
+The write-back is staged the same way: ranges mode wrote straight from the
+mapped chunk, one block record per scattered 4 KiB page; now both modes
+copy the pages to write back into the staging huge page after the table
+(on the pool from 256 KiB) and write the slot in one go. The slot's layout
+is what the host always read (the table, then the pages). The seamless
+test's integers at 1M: 23 to 18 ms; a 16 M loop writes its 64 MiB back in
+34 ms.
