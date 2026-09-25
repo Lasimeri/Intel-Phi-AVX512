@@ -4,7 +4,7 @@
 .DEFAULT_GOAL := help
 HOST := host
 
-.PHONY: help build test fmt clippy docs-check layout-check check clean
+.PHONY: help build test fmt clippy docs-check layout-check mvex-check check clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-14s %s\n", $$1, $$2}'
@@ -27,7 +27,10 @@ docs-check: ## Enforce sibling .md files, the no-dash rule and relative links
 layout-check: ## Compare the C protocol layout with the Rust constants (tcc)
 	tcc -run tools/vpu-layout-check.c
 
-check: docs-check fmt clippy build test layout-check ## Everything CI would run
+mvex-check: ## The knc-mvex copy matches the stack's (skipped when the stack is not found)
+	scripts/mvex-sync.sh
+
+check: docs-check fmt clippy build test layout-check mvex-check ## Everything CI would run
 
 clean: ## Remove build outputs
 	cd $(HOST) && cargo clean

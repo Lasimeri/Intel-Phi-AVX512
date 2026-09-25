@@ -59,7 +59,11 @@ sections are the same in every repository of the family (see
 
 - A dependency is found in that order, as a checkout under its GitHub
   clone's name (`Intel-Phi-3120A`) or the spaced one (`Intel Phi 3120A`).
-  Nothing of a sibling is copied into another.
+  Nothing of a sibling is copied into another, with one exception: the
+  stack's `knc-mvex` library (`lib.rs`, `conv.rs`, `transc.rs`), carried
+  here byte for byte and compared with the stack's by `make check`
+  ([`scripts/mvex-sync.md`](scripts/mvex-sync.md)); a change to the
+  encoder is made in both in the same session.
 - The interfaces the others consume from this repository keep working
   across changes: `scripts/phi512.sh`, `scripts/phi-vpu.sh` and its verbs,
   `host/target/release/libggml_phi.so`, and the `PHI_GGML_*` and

@@ -4,8 +4,8 @@
 #   2. No em dash (U+2014) or en dash (U+2013) anywhere in tracked text.
 #   3. Every relative link in a Markdown file points at a file that exists.
 # Exit code 1 on any violation. The same script in every repository of the
-# family (Intel-Phi-AVX512, Intel-Phi-Jev, Mechanical-Jev); only
-# `code_dirs` differs. See check-docs.md.
+# family (Intel-Phi-3120A, Intel-Phi-AVX512, Intel-Phi-Jev, Mechanical-Jev);
+# only `code_dirs` differs. See check-docs.md.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 fail=0

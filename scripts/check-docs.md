@@ -1,8 +1,8 @@
 # check-docs.sh
 
 `make docs-check`, the first step of `make check`. The same script in every
-repository of the family (Intel-Phi-AVX512, Intel-Phi-Jev, Mechanical-Jev),
-line for line apart from `code_dirs`, the places that hold code; here
+repository of the family (Intel-Phi-3120A, Intel-Phi-AVX512, Intel-Phi-Jev,
+Mechanical-Jev), line for line apart from `code_dirs`, the places that hold code; here
 `host/crates`, `card`, `tools` and `scripts`. Three rules:
 
 1. **Sibling documentation.** Every `*.rs`, `*.c`, `*.h`, `*.S`, `*.sh`,

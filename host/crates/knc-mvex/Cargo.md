@@ -9,4 +9,5 @@ The `knc-mvex-gen` binary that writes hand-vectorised assembly and the
 card kernel's vector state header from this encoder stayed with the
 cards' stack when the repositories split
 ([Intel-Phi-3120A, `host/crates/knc-mvex/src/main.rs`](https://github.com/Lasimeri/Intel-Phi-3120A/blob/main/host/crates/knc-mvex/src/main.rs));
-this copy is the library alone.
+this copy is the library alone, kept identical to the stack's
+([`scripts/mvex-sync.md`](../../../scripts/mvex-sync.md)).

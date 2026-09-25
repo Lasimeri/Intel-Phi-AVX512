@@ -6,9 +6,11 @@ Read `CONTRIBUTING.md` first; it is the authority. The non-obvious rules:
   card worker, the `libggml_phi.so` ggml backend). It needs the cards'
   stack, Intel-Phi-3120A, found at run time (`PHI_STACK_ROOT`, `phi` on
   PATH, a checkout next to this one or in `$HOME`, under either name);
-  never copy the stack here. Intel-Phi-Jev consumes `scripts/phi512.sh`,
-  `scripts/phi-vpu.sh`, `host/target/release/libggml_phi.so` and the
-  `PHI_GGML_*` / `PHI_VPU_*` variables: add, do not rename.
+  never copy the stack here (the one copy: `knc-mvex`'s library, kept
+  identical to the stack's by `make mvex-check`). Intel-Phi-Jev consumes
+  `scripts/phi512.sh`, `scripts/phi-vpu.sh`,
+  `host/target/release/libggml_phi.so` and the `PHI_GGML_*` /
+  `PHI_VPU_*` variables: add, do not rename.
 - Rust first. C only for the card-side worker (`card/vpu`), the card
   kernels and examples, `tcc`-compiled layout helpers, and the glue a C
   interface of an upstream project requires (`host/crates/phi-ggml/csrc`).

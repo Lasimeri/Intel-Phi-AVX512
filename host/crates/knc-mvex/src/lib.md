@@ -109,5 +109,10 @@ them and produces results bit-identical to the host's FMA3 hardware over
 The encoder library only. Its generator binary, `knc-mvex-gen`, which
 writes the card kernel's vector-state header and the stack's own
 hand-vectorised kernels and pins them in tests, stays with the stack
-(Intel-Phi-3120A, [`host/crates/knc-mvex/src/main.rs`](https://github.com/Lasimeri/Intel-Phi-3120A/blob/main/host/crates/knc-mvex/src/main.rs)); the library was
-identical in both repositories at the split (stack commit 0f49eac).
+(Intel-Phi-3120A, [`host/crates/knc-mvex/src/main.rs`](https://github.com/Lasimeri/Intel-Phi-3120A/blob/main/host/crates/knc-mvex/src/main.rs)). The library
+was identical in both repositories at the split (stack commit 0f49eac);
+the conversions and transcendentals were then written here and reached
+the stack on 2026-09-25, and since then `make check` compares the two
+copies source file for source file
+([`scripts/mvex-sync.md`](../../../../scripts/mvex-sync.md)). A change to
+the encoder is made in both in the same session.
