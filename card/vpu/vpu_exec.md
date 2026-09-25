@@ -146,3 +146,7 @@ pool pre-faults, 256 by default and at most that. The worker's `-e N`
 passes it through: a worker that serves only matrix multiplies wants
 `-e 0`, because every huge page the pool does not take is card memory a
 slice of the model can sit in.
+
+A split loop uses `ceil(iters / per)` threads, not every thread it was
+offered: with 64 iterations on 57 threads, `per` is 2 and only 32 slices
+exist, and threads 32 to 56 used to start past the loop's end (2026-09-25).

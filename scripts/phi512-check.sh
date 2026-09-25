@@ -37,7 +37,11 @@ if grep -qw avx512f /proc/cpuinfo; then
 fi
 
 "$tmp/native" > "$tmp/want" 2>&1 || { echo "$0: the native build failed to run" >&2; exit 1; }
-if ! "$here/phi512.sh" "$tmp/avx512" > "$tmp/got" 2>"$tmp/err"; then
+# --emulate: this is the emulator's conformance check, and since the card
+# became phi512's default path the check had been running the card, which
+# does not carry every form the conformance programs use (vpmovsxdq). The
+# card's own checks are phi512-ground.sh and the tools/ tests.
+if ! "$here/phi512.sh" --emulate "$tmp/avx512" > "$tmp/got" 2>"$tmp/err"; then
     echo "FAIL: the AVX-512 build did not complete under phi512"
     sed 's/^/  /' "$tmp/err" | head -5
     exit 1

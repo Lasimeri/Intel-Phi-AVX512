@@ -6,7 +6,11 @@ and neither modified nor asked to cooperate, runs on the host; every
 AVX-512 instruction it reaches is carried, with the code around it, to
 the card's vector units and executed there as MVEX, the card's own
 encoding of the same operations. Nothing is interpreted. Results are
-bit-identical to what real AVX-512 hardware produces.
+bit-identical to what real AVX-512 hardware produces, on everything the
+tests here cover; a review of 2026-09-24 found cases that were not (masked
+stores and masked unaligned moves, fixed 2026-09-25) and others still open
+(listed under "Left" in
+[`docs/results/2026-09-25-review-transparent-path.md`](docs/results/2026-09-25-review-transparent-path.md)).
 
 ```
 scripts/phi512.sh ./my-avx512-program        # that is all of it
