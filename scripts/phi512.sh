@@ -93,7 +93,8 @@ else
             echo "phi512: no Intel-Phi-AVX512 checkout at '$root' to start the worker from; set PHI512_ROOT" >&2
             exit 1
         }
-        "$root/scripts/phi-vpu.sh" -c "$card" start >&2 || {
+        # Stdin is the program's: the start's ssh would read it.
+        "$root/scripts/phi-vpu.sh" -c "$card" start >&2 </dev/null || {
             echo "phi512: could not start the worker on card $card (is the card up? phi -c $card status)" >&2
             exit 1
         }
