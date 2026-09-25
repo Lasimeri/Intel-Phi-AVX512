@@ -104,3 +104,15 @@ mask rather than the write mask (fault suppression lost); `vmovdqu8` and
 `vmovdqu16` through the dword pair at any alignment; the thunk area not
 reserved on the host; allocation inside the SIGILL handler; the
 emulator's over-reads.
+
+## Later the same day: the thunk area
+
+Two of the items left above were one: the thunk area was a free stretch
+of address space that nothing reserved, inside a 2 MiB chunk the card
+maps without fetching. It is now a whole aligned chunk reserved on the
+host with no access (`host/crates/phi512/src/offload.md`), so no program
+memory can share the card's thunk chunk and nothing can be mapped into it
+later. The suite passes again on card 0 (review, seamless at 65536 and
+1M, narrow, ground; 1M 50.0 / 39.3 / 40.8 ms), and the regions' thunk
+areas sit at 2 MiB boundaries, one chunk each. Whether it was the flash
+attention failure's cause is still to be run.

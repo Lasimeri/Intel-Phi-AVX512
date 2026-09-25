@@ -610,10 +610,18 @@ fn analyze(id: u64, entry: u64, maps: &[Map], tg: &Target) -> Result<Region, Str
     // with code are sent, but data sharing them stays real.
     let mut code = vec![0u8; EXEC_CHUNK as usize];
     copy_out(maps, code_addr, &mut code);
-    // The thunk area: a free, page-aligned stretch of this process's
-    // address space beyond the code chunk, within reach of a rel32. Its
-    // first kilobyte is the card's: entry stubs, one per thread.
-    let thunk_addr = free_range(maps, (code_addr + EXEC_CHUNK).max(text.hi), EXEC_THUNK_MAX, lo)?;
+    // The thunk area: a free chunk of this process's address space beyond
+    // the code chunk, within reach of a rel32. Its first kilobyte is the
+    // card's: entry stubs, one per thread.
+    //
+    // A whole chunk (EXEC_CHUNK, the card's mapping unit), aligned, and
+    // reserved here. The card maps the thunk's chunk without fetching it,
+    // so any program memory sharing that chunk would read stale on the
+    // card; and a gap in the maps is free only until something (a
+    // malloc'd mapping, a thread's stack) is mapped into it, which the card
+    // would then take for thunk. Reserved, nothing of the program can be
+    // there, now or later.
+    let thunk_addr = reserve_thunk_chunk(maps, (code_addr + EXEC_CHUNK).max(text.hi), lo)?;
     if trace {
         eprintln!("phi512:     thunk area at {thunk_addr:#x}");
     }
@@ -780,8 +788,52 @@ fn analyze(id: u64, entry: u64, maps: &[Map], tg: &Target) -> Result<Region, Str
 
 /// A free page-aligned range of `len` bytes at or above `from`, within
 /// 2 GiB of `near`.
-fn free_range(maps: &[Map], from: u64, len: u64, near: u64) -> Result<u64, String> {
-    let mut at = (from + PAGE - 1) & !(PAGE - 1);
+/// A free, `EXEC_CHUNK`-aligned chunk from `from` on, within reach of
+/// `near`, reserved in this process (no access, no memory behind it) so
+/// nothing is mapped there later. A chunk something took between the
+/// reading of the maps and now is passed over.
+fn reserve_thunk_chunk(maps: &[Map], from: u64, near: u64) -> Result<u64, String> {
+    let mut from = from;
+    for _ in 0..64 {
+        let at = free_range(maps, from, EXEC_CHUNK, near, EXEC_CHUNK)?;
+        if reserve(at, EXEC_CHUNK) {
+            return Ok(at);
+        }
+        from = at + EXEC_CHUNK;
+    }
+    Err("no chunk for the thunk area could be reserved".into())
+}
+
+/// Map `[at, at+len)` with no access and no memory behind it, never over
+/// an existing mapping. False when anything is already there.
+fn reserve(at: u64, len: u64) -> bool {
+    // SAFETY: MAP_FIXED_NOREPLACE never replaces a mapping; the result is
+    // checked against the address asked for (kernels before 4.17 treat
+    // the flag as a hint).
+    let p = unsafe {
+        libc::mmap(
+            at as *mut libc::c_void,
+            len as usize,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE | libc::MAP_FIXED_NOREPLACE,
+            -1,
+            0,
+        )
+    };
+    if p == libc::MAP_FAILED {
+        return false;
+    }
+    if p as u64 != at {
+        // SAFETY: p is the mapping just made.
+        unsafe { libc::munmap(p, len as usize) };
+        return false;
+    }
+    true
+}
+
+fn free_range(maps: &[Map], from: u64, len: u64, near: u64, align: u64) -> Result<u64, String> {
+    let up = |x: u64| (x + align - 1) & !(align - 1);
+    let mut at = up(from);
     let mut sorted: Vec<&Map> = maps.iter().collect();
     sorted.sort_by_key(|m| m.lo);
     loop {
@@ -790,7 +842,7 @@ fn free_range(maps: &[Map], from: u64, len: u64, near: u64) -> Result<u64, Strin
         }
         match sorted.iter().find(|m| m.lo < at + len && m.hi > at) {
             None => return Ok(at),
-            Some(m) => at = (m.hi + PAGE - 1) & !(PAGE - 1),
+            Some(m) => at = up(m.hi),
         }
     }
 }
@@ -1380,3 +1432,58 @@ fn finish(
 
 #[allow(dead_code)]
 fn unused(_: Val) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map(lo: u64, hi: u64) -> Map {
+        Map {
+            lo,
+            hi,
+            r: true,
+            w: false,
+            x: false,
+            special: false,
+        }
+    }
+
+    #[test]
+    fn the_thunk_area_is_a_whole_aligned_chunk_clear_of_every_mapping() {
+        let c = EXEC_CHUNK;
+        // Mappings at 4 MiB + 4 KiB and 6 MiB + 8 KiB: the first whole free
+        // chunk from 4 MiB is at 8 MiB.
+        let maps = [
+            map(4 * (1 << 20) + 4096, 4 * (1 << 20) + 8192),
+            map(6 * (1 << 20) + 8192, 6 * (1 << 20) + 12288),
+        ];
+        let at = free_range(&maps, 4 << 20, c, 4 << 20, c).unwrap();
+        assert_eq!(at, 8 << 20);
+        assert_eq!(at % c, 0);
+    }
+
+    #[test]
+    fn a_reserved_chunk_cannot_be_reserved_twice() {
+        // A chunk of this process known free: map 4 MiB anywhere, keep the
+        // aligned 2 MiB inside it, give it back, then reserve it.
+        // SAFETY: an ordinary anonymous mapping, unmapped below.
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4 << 20,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(p, libc::MAP_FAILED);
+        let at = (p as u64 + EXEC_CHUNK - 1) & !(EXEC_CHUNK - 1);
+        // SAFETY: p..p+4 MiB is the mapping made above.
+        unsafe { libc::munmap(p, 4 << 20) };
+        assert!(reserve(at, EXEC_CHUNK));
+        assert!(!reserve(at, EXEC_CHUNK), "a second reservation must not replace the first");
+        // SAFETY: at..at+EXEC_CHUNK is the reservation made above.
+        unsafe { libc::munmap(at as *mut libc::c_void, EXEC_CHUNK as usize) };
+    }
+}

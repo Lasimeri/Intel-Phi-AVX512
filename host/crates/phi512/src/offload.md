@@ -111,3 +111,20 @@ With more than one thread, the region holding ggml's OpenMP barrier
 spins forever afterwards: the card's snapshot cannot see the other
 host threads' increments, and its write-back clobbers theirs, which is
 the concurrency limit stated above, met in practice.
+
+## The thunk area has a chunk of its own (2026-09-25)
+
+The thunk area used to be the first free page-aligned stretch past the
+code chunk, as `/proc/self/maps` showed it when the region was analysed,
+and nothing held it: the card maps the thunk's 2 MiB chunk without
+fetching it from the host, so program memory sharing that chunk read
+stale on the card, and a mapping made there later (a malloc'd block, a
+thread's stack) would have been taken by the card for thunk. Now the
+thunk area is a whole free chunk, aligned to `EXEC_CHUNK` (the card's
+mapping unit), reserved in this process with no access and no memory
+behind it (`reserve_thunk_chunk`, `MAP_FIXED_NOREPLACE | MAP_NORESERVE`);
+a chunk taken between the reading of the maps and the reservation is
+passed over. Each region analysed gets its own; they are 2 MiB of address
+space each, not memory. The review that found it named it a candidate
+cause of the avx512 site's flash-attention failure ("touched memory the
+process never mapped" in demand mode); that run has not been repeated.
