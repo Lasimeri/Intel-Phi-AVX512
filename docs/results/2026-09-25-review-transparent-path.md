@@ -176,3 +176,20 @@ zeroes every fresh page, and there it did so on one thread, where the
 staged copy's faults spread the same zeroing over the pool's 57 (the fetch
 396 ms in all against 284). What is left of the 16 M dot product's time
 is that zeroing and the host's copy into the window (52 ms for 128 MiB).
+
+## Still open at the end of the day
+
+Of the review's list, after the sections above:
+
+- a staged memory source loaded under the vector length's mask rather than
+  the write mask, so an x86 fault suppression by the mask is lost
+  (`rewrite.rs`);
+- `vmovdqu8` and `vmovdqu16` through the dword pair at any alignment;
+- allocation inside the SIGILL handler;
+- the byte compare for `kortest` still assumes nothing reads the mask
+  register itself after the branch;
+- whether the thunk chunk was the flash attention failure's cause: the
+  fix is in, the llama.cpp test that failed has not been re-run.
+
+A cost, not a defect: the 16 M dot product's time is now the kernel
+zeroing fresh 4 KiB pages and the host's copy into the window.

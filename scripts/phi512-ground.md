@@ -24,3 +24,9 @@ something other than what ships.
 
 Needs the card up and reachable as `ssh phi`, the host workspace built
 (`make build`), and `tcc`.
+
+The card's dropbear has no post-quantum key exchange, and OpenSSH 10
+warns about that on stderr, which the script collects into the card's
+output and reports the first line of; so `ssh` and `scp` get
+`-o WarnWeakCrypto=no-pq-kex` where this host's ssh knows the option
+(an older one would refuse it), as `phi-vpu.sh` does.

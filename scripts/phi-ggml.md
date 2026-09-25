@@ -48,9 +48,14 @@ repository's, so two builds can be compared interleaved),
 larger than its memory; needs `--load-mode mmap`, below),
 `PHI_GGML_HOST_THREADS` (the host's threads for its rows, 12: leave the
 card daemons a CPU each, and give the program the same `-t`),
-`PHI_GGML_THREADS` (card threads, 57). `--verbose`
+`PHI_GGML_THREADS` (card threads, 57),
+`PHI_GGML_ACT` (1: activations cross as float16; 0: float32),
+`PHI_GGML_MIN_BYTES` (below), `PHI_GGML_GRAPH=N` (print the first N
+sub-graphs the scheduler hands over, `host/crates/phi-ggml/csrc/ggml-phi.md`). `--verbose`
 (`PHI_GGML_VERBOSE=1`) prints every multiply with the host part, the wait
-and each card's timings, and every slice kept resident. The workers
+and each card's timings, and every slice kept resident. The script
+starts each card's worker with `PHI_VPU_HUGEPAGES` at 2400 unless set and
+`-e 0` ahead of any `PHI_VPU_ARGS` (`phi-vpu.md`) when its worker is not polling. The workers
 must know the matmul service and its formats (deploy from this tree:
 `scripts/phi-vpu.sh -c N deploy`, then `start`).
 

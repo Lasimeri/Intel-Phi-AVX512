@@ -174,3 +174,13 @@ copy the pages to write back into the staging huge page after the table
 is what the host always read (the table, then the pages). The seamless
 test's integers at 1M: 23 to 18 ms; a 16 M loop writes its 64 MiB back in
 34 ms.
+
+`open_pages` only changes protection; it does not populate. Tried and
+dropped (2026-09-25): `madvise(MADV_POPULATE_WRITE)` over an opened run,
+to take the page faults in one call. The 16 M dot product's 64 MiB ranges
+then spent 276 ms in the populate alone, the kernel zeroing every fresh
+page on the one calling thread, where the staged copy's faults spread the
+same zeroing over the pool's 57 (the fetch 396 ms in all against 284).
+That zeroing, and the host's copy into the window, are what is left of the
+16 M dot product's time
+([`docs/results/2026-09-25-review-transparent-path.md`](../../docs/results/2026-09-25-review-transparent-path.md)).

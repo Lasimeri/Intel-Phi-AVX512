@@ -50,8 +50,12 @@ the C glue answers by computing the block's four nodes itself.
 already holds the host's (the glue computes the host's runs first, or
 zeroes the result when it has none), then the block is judged the way
 the plain path judges a multiply (`FfnSplit::avoid`, per block, at one
-token and at a batch) and the batch share's estimator is fed
-(`pp_feed`), since the balance it learns is the machine's.
+token and at a batch) and, for a batch block, the batch share's estimator
+is fed (`pp_feed`), since the balance it learns is the machine's. The job
+records that as `adapts` (`Judged::adapts` in lib.md, set for the batch
+class): since 2026-09-24 the plain path's mixture multiplies do not teach
+the estimator, and the flag says which jobs do. The glue never takes the
+block under `PHI_GGML_OFFLOAD=1` (`../csrc/ggml-phi.md`).
 
 The intermediate's format on the card is float32 unless
 `PHI_GGML_FFN_H16=1`: float16 lets the card's down projection use its

@@ -161,3 +161,18 @@ fallback and a block extracted to memory; a masked float16 store
 ([`2026-09-25-review-transparent-path.md`](../../../../docs/results/2026-09-25-review-transparent-path.md)).
 The read-modify-write reads the whole span, so a masked store whose
 unselected lanes reach an unreadable page faults where x86 would not.
+
+## A byte compare for kortest (2026-09-25)
+
+`rewrite_bytecmp_for_kortest` is the one entry point besides `rewrite`: a
+byte or word compare for equality or inequality whose only consumer is
+`kortestq`/`kortestd` (a scan for a differing or a NUL byte, as compilers
+emit for memcmp-like loops) becomes the dword compare, since the card's
+masks are 16 bits, one per dword. That keeps one fact, not both: after
+equality, "every byte equal" (the mask all ones, CF) is "every dword
+equal", while "no byte equal" (ZF) is not "no dword equal"; after
+inequality, "no byte differs" (ZF) is "no dword differs", and CF is not
+kept. The region builder calls this instead of `rewrite` only when the
+branch after `kortest` reads the kept flag (phi512's `bytecmp_flag_kept`,
+`host/crates/phi512/src/offload.md`); anything else is refused. Still
+assumed: nothing reads the mask register itself after the branch.

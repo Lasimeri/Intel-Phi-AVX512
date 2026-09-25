@@ -3,11 +3,15 @@
 ```
 scripts/phi-vpu.sh [-c N] deploy        build the worker (host cross toolchain, else another card, else this card) and put it on the card
 scripts/phi-vpu.sh [-c N] start [T]     start the worker with T threads (default 57)
-scripts/phi-vpu.sh [-c N] stop
+scripts/phi-vpu.sh [-c N] stop          stop the worker and release the huge pages
 scripts/phi-vpu.sh [-c N] status        worker process on the card, control words on the host
 scripts/phi-vpu.sh [-c N] log           the worker's output
+scripts/phi-vpu.sh [-c N] config        the huge pages reserved and the running worker's arguments
 scripts/phi-vpu.sh [-c N] poly [args]   run the host driver; deploys and starts first if needed
 ```
+
+(`build-here DIR` is the verb `deploy` runs on another card; not for use
+by hand.)
 
 `-c N` picks the card (else `$PHI_CARD`, else 0). Each card has its own
 host-memory window (`/dev/shm/phi-hostmem` for card 0, `phi-hostmem-N`
@@ -20,7 +24,7 @@ so the script passes `WarnWeakCrypto=no-pq-kex` when the local ssh knows
 that option (checked with `ssh -G`; an older ssh would refuse it and the
 script then passes nothing). Needs the card up
 (`phi -c N status`) with the native toolchain on its disk (`cc` builds
-the worker on the card). The worker lives in `/opt/phi-vpu` on the card
+the worker on the card). The worker lives in `/opt/phi/vpu` on the card
 (`PHI_VPU_DIR` to change), which is on the card's persistent disk, so a
 deployed worker survives a reboot and only `start` is needed afterwards.
 

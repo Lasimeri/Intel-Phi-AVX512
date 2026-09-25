@@ -28,27 +28,21 @@ and every answer after that would be wrong with no indication. So anything
 unrecognised stops the program with a message naming the instruction,
 rather than being passed over.
 
-## What it costs today, and why that is not where it stays
+## What it cost, and where it went
 
-Measured on this host: **2101 ns per AVX-512 instruction**, of which the
-fault is 1909 ns. The arithmetic is under 200 ns; **91 percent of the cost
-is the processor telling us the instruction happened.**
+The first version (2026-09-21) emulated every AVX-512 instruction on a
+fault: **2101 ns per instruction**, of which the fault was 1909 ns and the
+arithmetic under 200; 91 percent of the cost was the processor saying the
+instruction happened. Two steps took that away, both built:
 
-That is the shape of the thing to fix, and it is fixable. An EVEX
-instruction is at least 6 bytes and a near jump is 5, so a site can be
-overwritten in place with a jump to its translation the first time it
-faults, and never fault again. Measured targets for the stages after that,
-from `docs/research/avx512-transparency.md`:
+| stage | where | cost |
+| --- | --- | --- |
+| fault on every execution, emulate | `handler`, `emulate` | 2158 ns per instruction |
+| rewrite each faulting site into a jump to its emulation | `patch` | 152 ns per instruction (2026-09-22) |
+| carry the whole region to the card and run it there | `offload` | per region, not per instruction: the README's table, `docs/results/2026-09-25-review-transparent-path.md` |
 
-| stage | cost against native AVX2 |
-| --- | --- |
-| today: fault on every execution | about 2000x |
-| patch each site, translate one instruction at a time | 6.54x |
-| patch each site, translate whole regions | 1.11x |
-| hot loops sent to the card's 57 vector units | see `docs/results/2026-09-21-avx512-translation.md` |
-
-The last two rows are measured, not estimated; what does not exist yet is
-the patcher and the region finder.
+The card path is the product; the first two rows are the fallback behind
+`PHI512_EMULATE` (`patch.md`, `offload.md`).
 
 ## Why the emulator is written in scalar Rust
 
@@ -66,15 +60,33 @@ twice and produce different bits from the hardware.
 - The imaginary register file is per thread, which is right, but it starts
   zeroed in each thread rather than being inherited, which matches how a
   thread's vector state actually begins.
-- The instruction table is a useful subset of AVX-512F, not all of it.
-  `emulate::supported` is the list.
-- Gather, scatter, and the mask-register instructions (`kmov` and friends)
-  are not implemented yet.
-- This is the host path. It does not use the card; `avx512-xlate` is the
-  piece that targets the card, and connecting the two is future work.
+- The emulator's instruction table is a useful subset of AVX-512F, not
+  all of it; `emulate::supported` is the list. The mask-register
+  instructions (`kmov` and friends) are in it; gather and scatter are not,
+  in the emulator or on the card.
+- The card path runs what `avx512-xlate`'s rewriter accepts
+  (`host/crates/avx512-xlate/src/rewrite.md`); a region stops at what it
+  refuses, and a refusal at the faulting instruction itself ends the
+  program with the reason.
 
 ## Modules (2026-09-22)
 
 `offload` is the seamless path to the card (the product); `emulate`,
 `patch` and `frame` are the software fallback behind `PHI512_EMULATE`;
 `state` is the vector register file both share; `handler` chooses.
+`plan` is the region planner `offload` uses (`plan.md`).
+
+## Environment
+
+| variable | effect |
+| --- | --- |
+| `PHI512_DISABLE` | the library does nothing at all (read before anything else; the rescue switch, `scripts/phi512-install.md`) |
+| `PHI512_CARD=N` | the card to use, default 0 (`scripts/phi512.sh --card`) |
+| `PHI512_EMULATE` | the software emulator instead of the card (`--emulate`) |
+| `PHI512_VERBOSE` | each region the card ran, its phases and times; the emulator's counts (`--verbose`) |
+| `PHI512_TRACE` | the emulator prints every instruction as it performs it |
+| `PHI512_TRACE_REGS` | the card path prints each fetch and the general registers a region changed |
+| `PHI512_NOPATCH` | the emulator leaves faulting sites unpatched (every execution faults) |
+
+`scripts/phi512.sh` also reads `PHI512_LIB` (the library to preload) and
+`PHI512_ROOT` (the checkout an installed copy uses).

@@ -9,7 +9,7 @@ encoding of the same operations. Nothing is interpreted. Results are
 bit-identical to what real AVX-512 hardware produces, on everything the
 tests here cover; a review of 2026-09-24 found cases that were not (masked
 stores and masked unaligned moves, fixed 2026-09-25) and others still open
-(listed under "Left" in
+(listed under "Still open at the end of the day" in
 [`docs/results/2026-09-25-review-transparent-path.md`](docs/results/2026-09-25-review-transparent-path.md)).
 
 ```
@@ -179,7 +179,11 @@ and 56.6 against 28.0 and 21.8 (`docs/results/2026-09-24-offload-past-memory.md`
 Re-measured that evening with less page cache free (about 21 GB): 4.98
 and 4.87 against 3.39 and 3.32 at generation, 46.5 and 58.8 against 24.0
 and 35.9 at pp512, each run re-reading 60 to 104 GB from the NVMe
-(`docs/results/2026-09-24-q8-remeasured-and-moe-stride.md`).
+(`docs/results/2026-09-24-q8-remeasured-and-moe-stride.md`). On the
+corrected backend the next morning (measured at bd166f4, which budgets
+uploads in whole 2 MiB pages): 4.91 and 4.77 at generation, within the day before's
+spread, and 60.8 and 46.2 at pp512, against a host alone that drifted
+from 3.52 to 2.68 inside the run (same record, "On the corrected backend").
 
 Token generation is bound by weight bandwidth, and the cards add theirs
 to the host's; what bounds it now is how much of the model they hold,
@@ -201,7 +205,7 @@ same ones).
 | `host/crates/phi-ggml` | `libggml_phi.so`, the ggml backend: matrix multiplies shared by rows between the host and the cards |
 | `card/vpu` | the card-side worker: the exec engine and the explicit path's thread pool; built on the card by `scripts/phi-vpu.sh deploy` |
 | `card/examples` | the AVX-512 kernel and its translation the explicit path and the ground-truth check use |
-| `tools` | the seamless test, the conformance programs, the protocol layout check |
+| `tools` | the seamless, narrow and review tests, the conformance programs, the protocol layout check |
 | `scripts` | `phi512.sh` (the wrapper), `phi-vpu.sh` (the worker), `phi512-check.sh` and `phi512-ground.sh` (conformance against hardware and against the card), `phi512-install.sh` (system-wide preload) |
 | `docs/research` | the precision audit that gates the translation, and the transparency design |
 | `docs/results` | dated records with every number |
