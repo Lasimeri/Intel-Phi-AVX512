@@ -150,3 +150,19 @@ slice of the model can sit in.
 A split loop uses `ceil(iters / per)` threads, not every thread it was
 offered: with 64 iterations on 57 threads, `per` is 2 and only 32 slices
 exist, and threads 32 to 56 used to start past the loop's end (2026-09-25).
+
+## A fetch into 4 KiB pages is staged (2026-09-25)
+
+In ranges mode a chunk is 4 KiB pages, only the declared ones accessible
+(the soundness fix). A fetch used to `pread` straight into them: fresh,
+scattered pages, each faulted in by the DMA and each its own block record,
+0.12 GB/s (the dot product's 512 KiB in 4.3 of its 4.6 ms of fetch). Now
+it reads into a 2 MiB huge page (`g_fetch_stage`, one record per 512 KiB)
+and copies into the opened pages: on the pool's threads for 256 KiB and
+more (`STAGE_POOL_MIN`; waking the parked pool costs about a millisecond,
+more than one thread's copy of a few pages), with `memcpy` below that and
+whenever a run is in progress (a pool thread cannot wait on the pool;
+ranges mode fetches only between runs anyway). Soundness is unchanged:
+the same pages are opened, before the copy. With `-v` the worker prints a
+phase's fetch split three ways (`exec: fetch: protect, mail, read`), which
+is how the read was found to be the cost.

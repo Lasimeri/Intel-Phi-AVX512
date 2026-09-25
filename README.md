@@ -25,12 +25,13 @@ code on this host, a software emulator:
 
 | elements | polynomial | dot product | integers | emulated polynomial |
 | --- | --- | --- | --- | --- |
-| 65536 | 12.5 to 13.5 ms | 8.1 to 9.0 ms | 10.2 to 10.9 ms | 22.5 ms |
-| 1048576 | 52 to 68 ms | 41 to 42 ms | 44 to 53 ms | 376 ms |
-| 16777216 | 356 to 493 ms | 574 to 580 ms | 370 to 398 ms | about 6 s |
+| 65536 | 10.8 to 12.0 ms | 5.3 ms | 8.8 to 9.4 ms | 22.5 ms |
+| 1048576 | 32 to 50 ms | 23.0 to 23.6 ms | 23.1 to 23.8 ms | 376 ms |
+| 16777216 | 216 to 383 ms | 411 to 416 ms | 347 to 350 ms | about 6 s |
 
-(Two runs each, 2026-09-25; the emulated column is 2026-09-22.) These are
-the numbers of the sound path. On 2026-09-22 the same test ran in 7.7,
+(Two runs each, 2026-09-25, with a fetch into 4 KiB pages staged through a
+huge page, `card/vpu/vpu_exec.md`; the emulated column is 2026-09-22.)
+These are the numbers of the sound path. On 2026-09-22 the same test ran in 7.7,
 3.3 and 5.5 ms at 65536 and 98, 139 and 91 ms at 16 M, before a phase's
 chunks became 4 KiB-page mappings in which only the declared pages are
 accessible: an access the planner did not declare now faults instead of

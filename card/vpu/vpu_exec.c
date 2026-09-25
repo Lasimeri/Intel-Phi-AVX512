@@ -102,6 +102,9 @@ static int g_nshadows, g_shadow_used;
 static void *g_stages[2];          /* the write-back slots staged here, one per slot */
 #define g_stage (g_stages[g_wb_slot & 1])
 static void *g_bundle;             /* the descriptor, thunk and code pages, read in one go */
+static void *g_fetch_stage;       /* a fetch into 4 KiB pages is read here first, then copied */
+#define STAGE_POOL_MIN (256u << 10) /* a staged copy this large or larger goes to the pool */
+static void stage_copy(void *dst, const void *src, size_t len);
 static struct ctx g_ctx[VPU_EXEC_MAX_THREADS];
 __thread struct ctx *vpu_exec_tctx;   /* this thread's run, while in the region; the trampoline reads it through fs */
 __thread uint64_t vpu_exec_scratch, vpu_exec_scratch2;
@@ -120,6 +123,10 @@ int64_t vpu_exec_scratch_tpoff(void)
 #define t_ctx vpu_exec_tctx
 static volatile int g_in_exec, g_lock;
 static uint64_t g_fetch_ns, g_faults;
+/* The fetch's three steps, for the verbose line: opening the pages (a
+ * change of protection, on 57 CPUs), the mail round trip (the host copies
+ * the pages into the window), and the read from the block device. */
+static uint64_t g_fetch_prot_ns, g_fetch_mail_ns, g_fetch_read_ns;
 static uint32_t g_fetch_slot, g_wb_slot;
 static uint64_t g_session;         /* the host process the mapped chunks belong to */
 
@@ -307,9 +314,24 @@ static int fetch_pages(struct chunk *c, uint64_t addr, uint64_t len)
         /* Alternate slots: the host fills the other one with the next piece
          * of the range while this one is read. */
         uint32_t slot = g_fetch_slot++ & 1;
+        uint64_t s0 = now_ns();
         open_pages(c, addr, n);
+        uint64_t s1 = now_ns();
         if (mail(VPU_MAIL_FETCH, addr, n, slot) != 0) return VPU_EXIT_FAULT;
-        if (pread(g_blk, (void *)addr, n, VPU_OFF_EXEC_FETCH + (off_t)slot * VPU_EXEC_CHUNK) != (ssize_t)n) return VPU_EXIT_FAULT;
+        uint64_t s2 = now_ns();
+        /* Into a 4 KiB-page chunk the read goes to a huge page first: read
+         * straight into the chunk's fresh, scattered pages, the DMA faulted
+         * each one in and took a block record per page (0.12 GB/s); into the
+         * huge page it is one record per 512 KiB, and the copy that follows
+         * faults the pages in on every thread of the pool at once. */
+        off_t from = VPU_OFF_EXEC_FETCH + (off_t)slot * VPU_EXEC_CHUNK;
+        if (c->fourk && g_fetch_stage) {
+            if (pread(g_blk, g_fetch_stage, n, from) != (ssize_t)n) return VPU_EXIT_FAULT;
+            stage_copy((void *)addr, g_fetch_stage, n);
+        } else if (pread(g_blk, (void *)addr, n, from) != (ssize_t)n) return VPU_EXIT_FAULT;
+        g_fetch_prot_ns += s1 - s0;
+        g_fetch_mail_ns += s2 - s1;
+        g_fetch_read_ns += now_ns() - s2;
         for (uint64_t a = addr; a < addr + n; a += 4096) {
             uint64_t q = (a - c->base) / 4096;
             c->filled[q / 64] |= 1ULL << (q % 64);
@@ -331,6 +353,19 @@ static void copy_slice(void *arg, int slice, int n)
     if (at >= j->len) return;
     size_t take = j->len - at < per ? j->len - at : per;
     memcpy((char *)j->dst + at, (const char *)j->src + at, take);
+}
+
+/* A staged fetch's copy into the chunk: on the pool's threads between runs
+ * (the ranges mode, where 4 KiB-page chunks live, fetches only then), with
+ * memcpy if ever called during one (a pool thread cannot wait on the pool). */
+static void stage_copy(void *dst, const void *src, size_t len)
+{
+    struct copy_job j = { src, dst, len };
+    /* Waking the parked pool costs about a millisecond, more than one
+     * thread's copy of a few pages (measured: a prologue's small fetch went
+     * from 0.9 to 1.5 ms through the pool). */
+    if (g_in_exec || len < STAGE_POOL_MIN) memcpy(dst, src, len);
+    else vpu_pool_map(copy_slice, &j, vpu_pool_threads() + 1);
 }
 
 struct diff_job { const uint64_t *now, *was; uint64_t *masks; };
@@ -584,6 +619,10 @@ int vpu_exec_init(void)
         if (g_stages[i] == MAP_FAILED) { perror("mmap"); return -1; }
         memset(g_stages[i], 0, VPU_EXEC_CHUNK);
     }
+    /* No huge page, no staging: the fetch reads into the chunk as before. */
+    g_fetch_stage = mmap(NULL, VPU_EXEC_CHUNK, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+    if (g_fetch_stage == MAP_FAILED) g_fetch_stage = NULL;
+    else memset(g_fetch_stage, 0, VPU_EXEC_CHUNK);
     g_bundle = mmap(NULL, VPU_EXEC_CHUNK, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
     if (g_bundle == MAP_FAILED) g_bundle = mmap(NULL, VPU_EXEC_CHUNK, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (g_bundle == MAP_FAILED) { perror("mmap"); return -1; }
@@ -706,6 +745,7 @@ int vpu_exec_run(volatile unsigned char *ctrl, int blk_fd, int verbose)
     g_desc.chunks = g_desc.dirty = g_desc.faults = g_desc.threads_ran = 0;
     g_desc.fetch_ns = g_desc.wb_ns = g_desc.run_ns = 0;
     g_fetch_ns = g_faults = 0;
+    g_fetch_prot_ns = g_fetch_mail_ns = g_fetch_read_ns = 0;
     int r = 0;
 
     if (g_desc.code_addr % VPU_EXEC_CHUNK || g_desc.thunk_len == 0 || g_desc.thunk_len > VPU_EXEC_THUNK_MAX ||
@@ -940,6 +980,7 @@ done:
         printf("exec: exit kind %u at %#llx (thread %u of %u), %u chunks, %u pages back, %u faults; fetch %.3f ms, run %.3f ms, wb %.3f ms\n",
                g_desc.exit_kind, (unsigned long long)g_desc.exit_rip, g_desc.exit_thread, g_desc.threads_ran,
                g_desc.chunks, g_desc.dirty, g_desc.faults, g_desc.fetch_ns / 1e6, g_desc.run_ns / 1e6, g_desc.wb_ns / 1e6);
+        printf("exec: fetch: protect %.3f ms, mail %.3f ms, read %.3f ms\n", g_fetch_prot_ns / 1e6, g_fetch_mail_ns / 1e6, g_fetch_read_ns / 1e6);
         fflush(stdout);
     }
     return VPU_OK;

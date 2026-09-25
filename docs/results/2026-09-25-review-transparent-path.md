@@ -143,3 +143,22 @@ is as fast as it was. The README's headline table now shows the sound
 path's numbers (65536: 12.5 to 13.5, 8.1 to 9.0, 10.2 to 10.9 ms; 16 M:
 356 to 493, 574 to 580, 370 to 398 ms), with 2026-09-22's beside them in
 the text.
+
+## Then: the fetch, staged
+
+With the fetch split three ways in the worker's verbose line (protect,
+mail, read), the read was nearly all of it: the dot product's 512 KiB took
+4.27 of 4.61 ms, a `pread` into fresh 4 KiB pages. Read into a huge page
+and copied on the pool's threads (`card/vpu/vpu_exec.md`), the same fetch
+takes 1.59 ms. The seamless test, two runs each (ms, polynomial / dot /
+integers):
+
+| elements | before | staged |
+| --- | --- | --- |
+| 65536 | 12.5 to 13.5 / 8.1 to 9.0 / 10.2 to 10.9 | 10.8 to 12.0 / 5.3 / 8.8 to 9.4 |
+| 1048576 | 52 to 68 / 41 to 42 / 44 to 53 | 32 to 50 / 23.0 to 23.6 / 23.1 to 23.8 |
+| 16777216 | 356 to 493 / 574 to 580 / 370 to 398 | 216 to 383 / 411 to 416 / 347 to 350 |
+
+A small fetch through the pool was slower (a prologue's few pages, 0.9 to
+1.5 ms: the pool's wake-up), so the pool copies only from 256 KiB. The
+review test, narrow, ground and the seamless test pass.
