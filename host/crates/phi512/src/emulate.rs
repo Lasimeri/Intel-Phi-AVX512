@@ -130,7 +130,12 @@ fn source_bytes(insn: &Instruction, op: u32, st: &VState, cpu: &dyn Cpu, lanes: 
                         out[lane * elem..lane * elem + elem].copy_from_slice(&one[..elem]);
                     }
                 } else {
-                    std::ptr::copy_nonoverlapping(addr, out.as_mut_ptr(), 64);
+                    // The operand's own size (a `vbroadcastss m32` reads 4
+                    // bytes, an xmm form 16): 64 read past the end of a
+                    // mapping the program only reads to its last byte, and
+                    // faulted inside the SIGILL handler.
+                    let size = insn.memory_size().size().clamp(1, 64);
+                    std::ptr::copy_nonoverlapping(addr, out.as_mut_ptr(), size);
                 }
             }
         }
@@ -417,12 +422,14 @@ fn do_move(insn: &Instruction, st: &mut VState, cpu: &dyn Cpu) -> Result<(), Uns
             let dst = zmm_index(insn.op0_register()).ok_or_else(|| Unsupported("move destination".into()))?;
             let width = dest_width(insn);
             let addr = effective_address(insn, cpu) as *const u8;
-            let mut buf = [0u8; 64];
-            // SAFETY: see source_bytes.
-            unsafe { std::ptr::copy_nonoverlapping(addr, buf.as_mut_ptr(), width) };
             for lane in 0..(width / elem) {
                 if st.lane_enabled(k, lane) {
-                    st.zmm[dst][lane * elem..lane * elem + elem].copy_from_slice(&buf[lane * elem..lane * elem + elem]);
+                    // Lane by lane, the enabled ones only: a masked load
+                    // does not touch the memory of its masked-off lanes
+                    // (a loop's tail up to the end of a mapping).
+                    // SAFETY: see source_bytes; this lane is one the
+                    // program's own load reads.
+                    unsafe { std::ptr::copy_nonoverlapping(addr.add(lane * elem), st.zmm[dst][lane * elem..].as_mut_ptr(), elem) };
                 } else if zeroing {
                     st.zmm[dst][lane * elem..lane * elem + elem].fill(0);
                 }
@@ -1777,6 +1784,56 @@ mod tests {
         for l in 0..16 {
             st.set_f32_lane(reg, l, v);
         }
+    }
+
+    /// A float at the very end of a readable page, with no access after
+    /// it: an emulated access that reads a byte past what the program
+    /// reads faults (and the test process dies).
+    fn last_float_before_a_guard(v: f32) -> (*mut u8, u64) {
+        // SAFETY: a fresh anonymous mapping of two pages, the second made
+        // inaccessible; leaked (a test process).
+        unsafe {
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                8192,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            assert_ne!(p, libc::MAP_FAILED);
+            libc::mprotect((p as *mut u8).add(4096) as *mut libc::c_void, 4096, libc::PROT_NONE);
+            let at = (p as *mut u8).add(4096 - 4);
+            std::ptr::write(at as *mut f32, v);
+            (p as *mut u8, at as u64)
+        }
+    }
+
+    #[test]
+    fn a_broadcast_of_the_last_float_reads_four_bytes() {
+        let (_, at) = last_float_before_a_guard(2.5);
+        let mut st = VState::new();
+        let mut cpu = TestCpu::default();
+        cpu.set(Register::RAX, at);
+        // vbroadcastss zmm0, [rax]
+        run_cpu(&[0x62, 0xf2, 0x7d, 0x48, 0x18, 0x00], &mut st, &mut cpu).unwrap();
+        for l in 0..16 {
+            assert_eq!(st.f32_lane(0, l), 2.5, "lane {l}");
+        }
+    }
+
+    #[test]
+    fn a_masked_load_reads_only_its_enabled_lanes() {
+        let (_, at) = last_float_before_a_guard(7.0);
+        let mut st = VState::new();
+        st.k[1] = 1;
+        let mut cpu = TestCpu::default();
+        cpu.set(Register::RAX, at);
+        // vmovups zmm0{k1}{z}, [rax]: lane 0 is the last float; lanes 1..15
+        // would be past the guard.
+        run_cpu(&[0x62, 0xf1, 0x7c, 0xc9, 0x10, 0x00], &mut st, &mut cpu).unwrap();
+        assert_eq!(st.f32_lane(0, 0), 7.0);
+        assert_eq!(st.f32_lane(0, 1), 0.0);
     }
 
     #[test]

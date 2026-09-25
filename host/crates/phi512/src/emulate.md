@@ -60,3 +60,15 @@ file disagreeing with what the program believes it computed, and every
 answer afterwards would be wrong with nothing to indicate it. A program
 that stops with "no emulation for Vpconflictd" is a program whose author
 can do something about it.
+
+## Reads no more than the program reads (2026-09-25)
+
+A memory source is read at its own size (`memory_size`: 4 bytes for
+`vbroadcastss m32`, 16 for an xmm form), where every non-broadcast source
+used to be read as 64 bytes; and a masked load reads only its enabled
+lanes, as the hardware does (a loop's tail up to the end of a mapping).
+Both over-reads faulted inside the SIGILL handler when the program's own
+access ended at a mapping's last byte. The tests put a float at the end of
+a page with an inaccessible page after it; the broadcast test dies with
+SIGSEGV on the old read. The emulator's conformance (`phi512-check.sh`,
+both programs) and the review and seamless tests under `--emulate` pass.

@@ -116,3 +116,7 @@ later. The suite passes again on card 0 (review, seamless at 65536 and
 1M, narrow, ground; 1M 50.0 / 39.3 / 40.8 ms), and the regions' thunk
 areas sit at 2 MiB boundaries, one chunk each. Whether it was the flash
 attention failure's cause is still to be run.
+
+And the emulator's over-reads: a memory source is read at its own size and
+a masked load reads only its enabled lanes (`host/crates/phi512/src/emulate.md`);
+a guard-page test dies with SIGSEGV on the old read and passes on the new.
