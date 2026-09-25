@@ -18,19 +18,27 @@ scripts/phi512.sh --verbose ./my-avx512-program   # each region the card ran, it
 ```
 
 The host here is a Ryzen 7 5800X (AVX2 and FMA3, no AVX-512) with two
-cards. Measured 2026-09-22 on card 0 with `tools/avx512-seamless-test.c`
-(a polynomial, a dot product and an integer kernel, each checked lane
-for lane against a scalar reference), against the only other way to run
-that code on this host, a software emulator:
+cards. Measured on card 0 with `tools/avx512-seamless-test.c` (a
+polynomial, a dot product and an integer kernel, each checked lane for
+lane against a scalar reference), against the only other way to run that
+code on this host, a software emulator:
 
 | elements | polynomial | dot product | integers | emulated polynomial |
 | --- | --- | --- | --- | --- |
-| 65536 | 7.7 ms | 3.3 ms | 5.5 ms | 22.5 ms |
-| 1048576 | 16 ms | 11 ms | 11 ms | 376 ms |
-| 16777216 | 98 ms | 139 ms | 91 ms | about 6 s |
+| 65536 | 12.5 to 13.5 ms | 8.1 to 9.0 ms | 10.2 to 10.9 ms | 22.5 ms |
+| 1048576 | 52 to 68 ms | 41 to 42 ms | 44 to 53 ms | 376 ms |
+| 16777216 | 356 to 493 ms | 574 to 580 ms | 370 to 398 ms | about 6 s |
 
-At 16 M elements the loop itself runs in 4.4 ms on the card's 57 cores;
-the rest is moving 64 MiB each way over the card's Gen2 x8 link.
+(Two runs each, 2026-09-25; the emulated column is 2026-09-22.) These are
+the numbers of the sound path. On 2026-09-22 the same test ran in 7.7,
+3.3 and 5.5 ms at 65536 and 98, 139 and 91 ms at 16 M, before a phase's
+chunks became 4 KiB-page mappings in which only the declared pages are
+accessible: an access the planner did not declare now faults instead of
+reading whatever the card held, and every fetch pays for scattered pages
+and a change of protection on 57 threads
+([`docs/results/2026-09-22-ggml-backend.md`](docs/results/2026-09-22-ggml-backend.md),
+"the price of soundness"; the transport itself is unchanged,
+`card/vpu/blkbench.md`).
 
 ## What you need
 

@@ -127,3 +127,19 @@ dword compare keeps (CF after equality, ZF after inequality); the
 rewriter's comment claimed both. Unit test on decoded compares and
 branches. Still assumed: nothing reads the mask register itself after
 the branch.
+
+## The four times, answered
+
+The seamless timings above were about four times 2026-09-22's on every
+build. Not a regression: on 2026-09-22 after that measurement a phase's
+chunks became 4 KiB-page mappings with only the declared pages accessible
+(`2026-09-22-ggml-backend.md`, "the price of soundness": the polynomial's
+split loop 1.3 to 6.4 ms at 65536). The worker's own stages show it:
+the dot product's two 256 KiB fetches took 4.5 ms, where the block path
+moves 512 KiB in 0.23 ms into huge-page buffers (`blkbench ... huge`, today
+234 us, 2026-09-22's reference 244 us) and in 1.8 ms into scattered 4 KiB
+pages, plus a change of protection per fetch on 57 threads. The transport
+is as fast as it was. The README's headline table now shows the sound
+path's numbers (65536: 12.5 to 13.5, 8.1 to 9.0, 10.2 to 10.9 ms; 16 M:
+356 to 493, 574 to 580, 370 to 398 ms), with 2026-09-22's beside them in
+the text.
