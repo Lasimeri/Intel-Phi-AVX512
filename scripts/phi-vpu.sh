@@ -8,6 +8,7 @@
 #   scripts/phi-vpu.sh [-c N] stop
 #   scripts/phi-vpu.sh [-c N] status        worker process on the card, control words on the host
 #   scripts/phi-vpu.sh [-c N] log           the worker's output
+#   scripts/phi-vpu.sh [-c N] config        the huge pages reserved and the running worker's arguments
 #   scripts/phi-vpu.sh [-c N] poly [args]   run the host driver; deploys and starts first if needed
 #
 # N is the card index (default $PHI_CARD, else 0). Each card has its own
@@ -186,6 +187,17 @@ case "$cmd" in
     log)
         ssh_ "cat '$dir/worker.log'"
         ;;
+    config)
+        # What the card holds now, whoever started it: the huge pages
+        # reserved, and the running worker's arguments ("none" without
+        # one). For a program that started a worker and must know it is
+        # still the one it started (Intel-Phi-Jev's xks).
+        echo "hugepages $(ssh_ "cat /proc/sys/vm/nr_hugepages")"
+        args=$(ssh_ "for p in \$(pgrep -f '$pat'); do tr '\\0' ' ' < /proc/\$p/cmdline; echo; done" | head -1)
+        args=${args#*phi-vpu-worker}
+        args=$(echo "$args" | xargs)
+        echo "worker ${args:-none}"
+        ;;
     poly)
         if ! running; then
             ssh_ "test -x '$dir/phi-vpu-worker'" || "$0" -c "$PHI_CARD" deploy
@@ -194,7 +206,7 @@ case "$cmd" in
         exec "$(driver)" --card "$PHI_CARD" poly "$@"
         ;;
     *)
-        sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
         exit 2
         ;;
 esac

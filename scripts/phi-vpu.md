@@ -108,3 +108,8 @@ pages, and a reservation made while it still had them was only partly
 granted, so the new worker's uploads went to 4 KiB pages (before
 2026-09-24 the order was the other way round, with a fixed half-second
 wait).
+
+`config` prints what the card holds now, whoever started it: `hugepages N`
+(the reservation) and `worker ARGS` (the running worker's arguments after
+its name, or `none`). Read-only; Intel-Phi-Jev's xks reads it to know that
+a worker it started is still the one it started.
