@@ -119,7 +119,7 @@ case "$cmd" in
                 # The binary from the other card, through the host.
                 work=$(mktemp -d)
                 PHI_PORT_OTHER=$((2222 + other))
-                scp -O -q -P "$PHI_PORT_OTHER" -o IdentitiesOnly=yes -i "$HOME/.ssh/phi_ed25519" \
+                scp "${nopq[@]}" -O -q -P "$PHI_PORT_OTHER" -o IdentitiesOnly=yes -i "$HOME/.ssh/phi_ed25519" \
                     -o UserKnownHostsFile="$HOME/.ssh/known_hosts_phi" -o HostKeyAlias=phi -o StrictHostKeyChecking=accept-new \
                     "root@127.0.0.1:$dir/phi-vpu-worker" "$work/phi-vpu-worker"
                 scp_ "$work/phi-vpu-worker" "root@127.0.0.1:$dir/phi-vpu-worker.new"

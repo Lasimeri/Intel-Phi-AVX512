@@ -52,7 +52,7 @@ while [ $# -gt 0 ]; do
         *) break ;;
     esac
 done
-[ $# -ge 1 ] || { echo "usage: $0 [--verbose] PROGRAM [args...]" >&2; exit 2; }
+[ $# -ge 1 ] || { echo "usage: $0 [--verbose] [--card N] [--emulate] PROGRAM [args...] | --check" >&2; exit 2; }
 # Where the library is. Three places, in order: an explicit override, the
 # build tree when this script is being run from a clone, and the installed
 # copy. The build tree wins during development so a fresh build is picked
