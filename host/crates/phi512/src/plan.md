@@ -87,3 +87,25 @@ phase to write the rest whole) is only a written range nothing reads;
 phase read the card's stale pages of that range: `tools/avx512-narrow-test.c`
 saw the expected values of one check computed from stale inputs, in
 some runs and not others (the merge depends on where the stack landed).
+
+## Corrections of 2026-09-25
+
+From a review, checked on card 0
+([`2026-09-25-review-transparent-path.md`](../../../../docs/results/2026-09-25-review-transparent-path.md)):
+
+- **Dense means written whole.** A range is dense (the card opens its
+  interior pages without a fetch) only for writes every lane of which
+  lands: not masked (iced's `CondWrite`), not in an interval a branch can
+  skip. A merge across a gap is not dense. A masked store over 256 KiB had
+  come back with 21,504 of its unwritten lanes zeroed.
+- **Flags by what set them.** `Loop` records whether an `add` or a `sub`
+  stepped the register (`from_add`) and the width of the instruction that
+  set the flags. `sub $N` is `cmp $N` on the value before the step; `add`
+  of either sign is its result against zero, and an unsigned condition
+  after an `add` reads its carry, so is not planned. Comparisons are cut
+  to that width, signed or not as the condition says.
+- **Every back edge accounted for.** Each backward branch in a phase is
+  matched against only the instructions it closes over (given the whole
+  phase, `find_loop` preferred the enclosing loop through a nested one's
+  head); one that is not the phase's own and not a recognised loop leaves
+  the phase unresolved rather than walked once.

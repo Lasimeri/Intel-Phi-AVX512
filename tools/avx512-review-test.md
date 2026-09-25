@@ -21,4 +21,9 @@ scripts/phi512.sh /tmp/avx512-review-test
 | masked unaligned load and store, k=0xAAAA | the card's unaligned moves are unpack and pack pairs, which expand and compress through a mask rather than masking by lane; x86 moves lane j to and from address + 4j |
 
 The results, and which of the three the card actually got wrong, are in
-`docs/results/2026-09-24-review-transparent-path.md`.
+[`docs/results/2026-09-25-review-transparent-path.md`](../docs/results/2026-09-25-review-transparent-path.md).
+
+The references are `noinline` as well as `target("no-avx512f")`, and so is
+`main`: gcc inlined the first version's references into an AVX-512 `main`
+and vectorized them there with `vpaddq zmm`, which the card does not have,
+so the test stopped before its first case.

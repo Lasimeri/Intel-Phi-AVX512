@@ -452,15 +452,7 @@ impl Tracker {
 
     /// `whole`: a write whose every byte lands (not masked, not skippable);
     /// a range can be dense only then.
-    fn note(
-        &mut self,
-        addr: Val,
-        size: u64,
-        write: bool,
-        whole: bool,
-        form: (Register, Register, u32, u64),
-        from_ind: Option<usize>,
-    ) {
+    fn note(&mut self, addr: Val, size: u64, write: bool, whole: bool, form: (Register, Register, u32, u64), from_ind: Option<usize>) {
         match addr {
             Val::Known(a) => self.ranges.push(MemRange {
                 addr: a,
@@ -533,8 +525,16 @@ impl Tracker {
             ) {
                 let t = insn.near_branch_target();
                 if t <= addr {
-                    let found = find_loop(&insns.range(from..to).map(|(a, i)| (*a, *i)).collect(), t, &[])
-                        .filter(|lp| lp.head == t && lp.back == addr);
+                    // Only the instructions this edge closes over: given the
+                    // whole phase, find_loop prefers the largest loop through
+                    // `t`, which in a nest is the enclosing one, and the inner
+                    // loop (a Horner kernel's coefficients) went unrecognised.
+                    let closed: Insns = if t >= from {
+                        insns.range(t..insn.next_ip()).map(|(a, i)| (*a, *i)).collect()
+                    } else {
+                        Insns::new()
+                    };
+                    let found = find_loop(&closed, t, &[]).filter(|lp| lp.head == t && lp.back == addr);
                     match found {
                         Some(lp) => inner.push(lp),
                         // The phase's own back edge, which the caller found.
@@ -899,6 +899,43 @@ mod tests {
         None
     }
 
+    /// A stack slot that holds the output pointer.
+    fn output_at_0x90000(_: u64, _: usize) -> Option<u64> {
+        Some(0x90000)
+    }
+
+    #[test]
+    fn a_count_down_loop_nested_in_the_phase_is_recognised() {
+        // tools/avx512-seamless-test.c's Horner kernel as gcc -O2 builds it:
+        // L: vmovaps (%r14,%rdx,4),%zmm1; vmovaps %zmm2,%zmm0; mov $0x1d,%eax;
+        //    M: vfmadd213ps (%r9,%rax,4){1to16},%zmm1,%zmm0; sub $1,%rax; jae M
+        //    mov -0x88(%rbp),%rax; vmovaps %zmm0,(%rax,%rdx,4); add $0x10,%rdx;
+        //    cmp %r12,%rdx; jl L
+        // Given the whole phase, find_loop found the enclosing loop through
+        // M, the inner one went unrecognised, and the phase (correctly, then)
+        // fell to demand mode.
+        let bytes = [
+            0x62, 0xd1, 0x7c, 0x48, 0x28, 0x0c, 0x96, 0x62, 0xf1, 0x7c, 0x48, 0x28, 0xc2, 0xb8, 0x1d, 0x00, 0x00, 0x00, 0x62, 0xd2, 0x75,
+            0x58, 0xa8, 0x04, 0x81, 0x48, 0x83, 0xe8, 0x01, 0x73, 0xf3, 0x48, 0x8b, 0x85, 0x78, 0xff, 0xff, 0xff, 0x62, 0xf1, 0x7c, 0x48,
+            0x29, 0x04, 0x90, 0x48, 0x83, 0xc2, 0x10, 0x4c, 0x39, 0xe2, 0x7c, 0xca, 0x90,
+        ];
+        let insns = decode(&bytes, 0x1438);
+        let lp = find_loop(&insns, 0x1438, &[]).expect("the outer loop");
+        assert_eq!((lp.head, lp.ind), (0x1438, 2), "rdx");
+        let mut gpr = [0u64; 16];
+        gpr[9] = 0x50000;
+        gpr[14] = 0x60000;
+        gpr[12] = 65536;
+        let mut t = Tracker::new(gpr, output_at_0x90000);
+        t.run(&insns, lp.head, lp.exit, Some((2, 0, 65536 - 16, 16)));
+        assert!(t.resolved, "{:?}", t.ranges);
+        assert!(
+            t.merged().contains(&(0x50000, 30 * 4, false, true, false)),
+            "the thirty coefficients: {:?}",
+            t.merged()
+        );
+    }
+
     /// gcc's integer loop from the seamless test: vmovdqa64 (%r10,%rax,4),%zmm1
     /// ... vmovdqa32 %zmm0,(%r11,%rax,4); add $0x10,%rax; cmp %r12,%rax; jl head
     const INTS: &[u8] = &[
@@ -1036,7 +1073,18 @@ mod tests {
     }
 
     fn looped(step: i64, cc: ConditionCode, via_cmp: bool, from_add: bool, width: u32) -> Loop {
-        Loop { head: 0, back: 0, exit: 0, ind: 1, step, bound: Bound::Imm(0), cc, via_cmp, from_add, width }
+        Loop {
+            head: 0,
+            back: 0,
+            exit: 0,
+            ind: 1,
+            step,
+            bound: Bound::Imm(0),
+            cc,
+            via_cmp,
+            from_add,
+            width,
+        }
     }
 
     #[test]

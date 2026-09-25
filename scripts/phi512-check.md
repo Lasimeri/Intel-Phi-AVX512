@@ -38,3 +38,8 @@ mask and a shift, and a widening one that converts float32 to float64.
 Between them they exercised, and caught, both of the bugs that mattered:
 the low 256 bits of every register being real hardware, and a VEX write
 zeroing the upper half of a register the emulator owns.
+
+It runs `phi512.sh --emulate`. Until 2026-09-25 it ran the default path,
+which since the card became the default is the card, not the emulator, and
+failed on a form the card does not carry (`vpmovsxdq`); the card's checks
+are `phi512-ground.sh` and the programs under `tools/`.

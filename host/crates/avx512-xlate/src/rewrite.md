@@ -144,3 +144,20 @@ bits), `vrndscale` to fractional bits or with the MXCSR mode, unsigned
 Checked on the card: `tools/avx512-narrow-test.c` (66 forms, each
 against plain C, bit-exact, 2026-09-22) and `tools/avx512-seamless-test.c`
 through `scripts/phi512.sh`.
+
+## Masked unaligned moves (2026-09-25)
+
+The card's unaligned moves are the unpack and pack pairs, which expand
+and compress through their mask: the next element in memory goes to the
+next enabled lane, which equals masking by lane only for a prefix of
+lanes. The pairs carry only the vector length's lanes now, and a program
+mask is applied by lane with an aligned register move: a masked load
+reads the span into a temporary and merges it into the destination (then
+zeroes for `{z}`); a masked store reads the span, merges the source into
+it under the mask and writes the span back. The same for the narrow store
+fallback and a block extracted to memory; a masked float16 store
+(`vcvtps2ph` to memory under a mask) is refused. With `k = 0xAAAA`, 20 of
+32 lanes were wrong before; none after
+([`2026-09-25-review-transparent-path.md`](../../../../docs/results/2026-09-25-review-transparent-path.md)).
+The read-modify-write reads the whole span, so a masked store whose
+unselected lanes reach an unreadable page faults where x86 would not.

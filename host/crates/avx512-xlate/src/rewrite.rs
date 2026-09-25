@@ -1523,10 +1523,7 @@ fn cvt_ps2ph(insn: &Instruction, ev: &Ev, tg: &Target) -> Result<Rewrite, Unsupp
             // The pack store compresses through its mask; merging a program
             // mask by lane would need the float16 in memory read back first.
             if ev.aaa != 0 {
-                return Err(refuse(
-                    insn,
-                    "a masked float16 store: the pack store compresses through the mask",
-                ));
+                return Err(refuse(insn, "a masked float16 store: the pack store compresses through the mask"));
             }
             em.store_unaligned(m, s, k, 0, true, 3);
         }

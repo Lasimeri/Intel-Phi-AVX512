@@ -34,7 +34,7 @@ __attribute__((noinline)) static void add_one(float *a, long n)
         _mm512_storeu_ps(a + i, _mm512_add_ps(_mm512_loadu_ps(a + i), one));
 }
 
-__attribute__((target("no-avx512f"))) static long check_add_one(void)
+__attribute__((noinline, target("no-avx512f"))) static long check_add_one(void)
 {
     long bad = 0;
     for (long v = 40; v <= 200; v++) {
@@ -62,7 +62,7 @@ __attribute__((noinline)) static void store_positive(float *out, const float *x,
     }
 }
 
-__attribute__((target("no-avx512f"))) static long check_store_positive(void)
+__attribute__((noinline, target("no-avx512f"))) static long check_store_positive(void)
 {
     long n = 65536, bad = 0;
     float *x = aligned_alloc(64, (size_t)n * sizeof(float));
@@ -91,7 +91,7 @@ __attribute__((noinline)) static void masked_unaligned(float *dst, const float *
     _mm512_mask_storeu_ps(dst, k, _mm512_loadu_ps(src));
 }
 
-__attribute__((target("no-avx512f"))) static long check_masked_unaligned(long *nlanes)
+__attribute__((noinline, target("no-avx512f"))) static long check_masked_unaligned(long *nlanes)
 {
     float *buf = aligned_alloc(64, 256 * sizeof(float));
     float *src = buf + 1, *dst = buf + 65, loaded[16];
@@ -110,7 +110,7 @@ __attribute__((target("no-avx512f"))) static long check_masked_unaligned(long *n
     return bad;
 }
 
-int main(void)
+__attribute__((target("no-avx512f"))) int main(void)
 {
     long lanes = 0;
     report("split loops of 40 to 200 vectors", check_add_one(), 161);
