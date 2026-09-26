@@ -406,3 +406,20 @@ CPU each, serving the transfers) is the stack's and is not changed here.
 - **No card, no device**: when the cards do not open, the registry reports
   no device (ggml-phi.md), and llama.cpp runs on the CPU instead of
   stopping with "failed to initialize".
+
+## A split that repeats (2026-09-26)
+
+The judgement above (`Split::avoid`) and the batch share's adaptation
+both act on measured times, and each moves rows between the host and the
+cards, whose rounding differs (the host's quantized kernels round the
+activations to 8 bits). So the default split's output is not a function
+of its input alone: over four identical greedy requests to llama-server
+the judge made 30, 16, 1 and 4 decisions and the text changed with them,
+where the host alone and the offloaded split (neither judges) repeat
+exactly. `PHI_GGML_JUDGE=0` turns the judgement off (the field `judge`;
+the static rules still apply), and with `PHI_GGML_PP_ADAPT=0` nothing
+depends on timing. On the 35B-A3B it costs about 5 percent at the prompt
+and at generation with the share set to where the adaptation settles
+(`PHI_GGML_PP_SHARE=0.58`), and computes what the default does
+(perplexity and KL divergence within error):
+`docs/results/2026-09-26-repacking-and-determinism.md`.

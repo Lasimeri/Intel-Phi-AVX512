@@ -50,6 +50,8 @@ larger than its memory; needs `--load-mode mmap`, below),
 the host none, for a model that fits them),
 `PHI_GGML_SPIN_US` (the wait for a card spins this many microseconds,
 then sleeps between looks; unset, it spins throughout),
+`PHI_GGML_JUDGE` (0: no tensor is moved by its timings; with
+`PHI_GGML_PP_ADAPT=0` the same request gives the same output),
 `PHI_GGML_HOST_THREADS` (the host's threads for its rows, 12: leave the
 card daemons a CPU each, and give the program the same `-t`),
 `PHI_GGML_THREADS` (card threads, 57),

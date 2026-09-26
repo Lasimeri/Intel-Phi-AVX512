@@ -167,7 +167,15 @@ against 84.99 and 85.88 on 12, 88.12 and 92.16 on 16). Offloaded it
 generates at 8.69: its use there is the host's memory. Interleaved on
 2026-09-25 (`docs/results/2026-09-25-35b-q4km-remeasured.md`), replacing
 the 2026-09-23 figures (+26 and about -8 percent), whose prompt side was
-measured with the stride defect live and whose host ran on 16 threads. A
+measured with the stride defect live and whose host ran on 16 threads.
+Verified: perplexity and KL divergence against the host alone within
+error, and in llama-server over two rounds (84 and 8.8 against 83.4 and
+7.8). Its experts stay repacked on the host: on the cards unrepacked they
+make the split 11 and 12 percent slower, and the default split does not
+repeat a greedy output between identical requests (its judge moves
+tensors by their timings); `PHI_GGML_JUDGE=0 PHI_GGML_PP_ADAPT=0` repeats
+exactly at about 5 percent of speed
+(`docs/results/2026-09-26-repacking-and-determinism.md`). A
 card costs about 0.45 ms to involve and an MoE layer's multiply at one
 token is a few megabytes, so the backend times
 both sides on each weight tensor and leaves with the host what the

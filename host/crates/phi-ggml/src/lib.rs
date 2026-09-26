@@ -163,6 +163,11 @@ struct Ctx {
     /// host's memory needs only the host's part of it resident. Off, the
     /// rows are a copy and the host falls back on them freely.
     offload: bool,
+    /// Whether a tensor is judged by its timings (`PHI_GGML_JUDGE`, on by
+    /// default): off, the split is the static rules and the share alone,
+    /// so which side computes a row never depends on timing, and with
+    /// `PHI_GGML_PP_ADAPT=0` the same request gives the same output.
+    judge: bool,
     /// The cards may keep every row (`PHI_GGML_ALL_ROWS=1`, offloaded
     /// only): `share_cap`.
     all_rows: bool,
@@ -295,6 +300,10 @@ pub extern "C" fn phi_ggml_open() -> i32 {
     if all_rows {
         say("all rows: the cards may keep every row of a matrix, the host none (a model that fits them leaves the host no weight arithmetic)");
     }
+    let judge = env_or("PHI_GGML_JUDGE", 1u32) != 0;
+    if !judge && !offload {
+        say("judge off: a tensor goes where the static rules put it, whatever its timings (with PHI_GGML_PP_ADAPT=0, the same request gives the same output)");
+    }
     let n = cards.len() as i32;
     *CTX.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ctx {
         cards,
@@ -322,6 +331,7 @@ pub extern "C" fn phi_ggml_open() -> i32 {
         ffn_judged: None,
         ffn_h16: env_or("PHI_GGML_FFN_H16", 0u32) != 0,
         offload,
+        judge,
         all_rows,
         host_read: 0,
         file_maps: Vec::new(),
@@ -1258,7 +1268,7 @@ pub unsafe extern "C" fn phi_ggml_end_id(d: *mut u8, nb_d: u64, nb_d2: u64) -> i
         let took = t_host + wait;
         let alone = t_host.as_secs_f64() / (1.0 - j.share).max(0.05);
         // Offloaded, nothing is judged: the host could not take the rows back.
-        if let Some(split) = ctx.splits.get_mut(&j.key).filter(|_| !ctx.offload) {
+        if let Some(split) = ctx.splits.get_mut(&j.key).filter(|_| !ctx.offload && ctx.judge) {
             if took.as_secs_f64() > alone {
                 // Plainly worse (a third again or more) settles it at
                 // once; a hair worse twice running also does.
