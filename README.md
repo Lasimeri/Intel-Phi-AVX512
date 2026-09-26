@@ -159,11 +159,15 @@ prompt's outputs were wrong while its speed was measured; fixed, and
 checked on a 1,800-token prompt, in
 `docs/results/2026-09-24-q8-remeasured-and-moe-stride.md`. The offloaded
 split was never affected.) It is worth less so far: Qwen3.8-35B-A3B-Distill
-(Q4_K_M, 20.2 GiB, 256 experts with 8 used per token) gains 26 percent
-at generation (9.53 and 9.51 tokens per second against 7.54) and loses
-about 8 at pp512 (87.98 and 88.45 against 93.39 and 97.32), interleaved
-against the host alone on 2026-09-23 night
-(`docs/results/2026-09-23-redundancy-and-transport.md`). A
+(Q4_K_M, 20.2 GiB, 256 experts with 8 used per token) generates at 9.06
+and 9.06 tokens per second with both cards against 7.89 and 7.99 for the
+host alone at its best thread count (12), 14 percent faster, and 6.90 and
+6.85 on 16; its pp512 is within 3 percent of the host's (87.34 and 87.10
+against 84.99 and 85.88 on 12, 88.12 and 92.16 on 16). Offloaded it
+generates at 8.69: its use there is the host's memory. Interleaved on
+2026-09-25 (`docs/results/2026-09-25-35b-q4km-remeasured.md`), replacing
+the 2026-09-23 figures (+26 and about -8 percent), whose prompt side was
+measured with the stride defect live and whose host ran on 16 threads. A
 card costs about 0.45 ms to involve and an MoE layer's multiply at one
 token is a few megabytes, so the backend times
 both sides on each weight tensor and leaves with the host what the
