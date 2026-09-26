@@ -143,10 +143,11 @@ rows in `t_host`, so alone it would have taken `t_host / (1 - share)`;
 a multiply that took longer than that with the cards, plainly longer
 once or barely longer twice, stops going to them at that batch size
 (`Split::avoid`, counted in `too_small`). This is what keeps a mixture's
-small multiplies on the host at generation and its batched ones there
-too, for now: the card computes a mixture one column at a time where
-ggml groups the tokens that chose the same expert
-(`docs/results/2026-09-23-mixture-of-experts.md`).
+small multiplies on the host at generation, and any batched one the host
+still finishes sooner. (The card groups a batch's columns by expert, as
+ggml does, reading an expert's rows once per group of eight, four or one:
+20.4 against 39.2 ms one column at a time, `groups_mixture` in
+`card/vpu/vpu_matmul.c`, `docs/results/2026-09-23-mixture-of-experts.md`.)
 
 Note when measuring: the host's own best thread count is not the same
 for every model, and the comparison must use it. An MoE at one token is

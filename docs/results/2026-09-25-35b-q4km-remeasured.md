@@ -65,3 +65,41 @@ configuration's two rounds agree within 5 percent.
 
 Nothing else in the README was re-measured today: the 27B, the Q8_0 past
 this host's memory and the MTP figures stand as dated.
+
+## Verified (the same evening)
+
+Speed alone says nothing of what was computed, so each configuration was
+checked against the host alone. `llama-perplexity` (llama.cpp's own tool,
+built as the `build-native` target it is, llama.cpp unchanged) over three
+512-token chunks of this repository's 2026-09-23 records, `-b 512 -t 12`
+(the batch path the stride defect lived on), each card configuration's
+logits against the host's saved with `--kl-divergence-base`; and a greedy
+48-token completion of the first 7,000 bytes of the same text
+(`llama-completion ... -n 48 --temp 0 --seed 1 -no-cnv -b 512 -ub 512 -t
+12`):
+
+| | perplexity | mean KL divergence from the host | same top token |
+| --- | --- | --- | --- |
+| host alone | 8.5816 | | |
+| default split | 8.5855 | 0.0075 (largest 0.108) | 94.4 % |
+| offloaded | 8.6107 | 0.0068 (largest 0.101) | 93.7 % |
+| default split, float32 activations (`PHI_GGML_ACT=0`) | 8.6599 | 0.0069 | 93.7 % |
+
+The perplexities agree within their error (log-ratio 0.000 to 0.009
+against a standard error of 0.005), so the model's quality is intact;
+the stride defect, for comparison, parted from the host at the first
+token. The remaining difference is not the float16 transport, since
+float32 activations leave it where it is: the host's own Q4_K kernels
+round the activations to 8 bits (`q8_K`) where the cards keep them
+float, so the two sides round differently and neither is the exact
+product. The greedy completions part after about six tokens ("... to make
+the model smaller." on the host, "... to make the card hold more." with
+the split): the prompt stops mid-sentence at a near tie, where a
+difference that small decides it (the 2026-09-24 check agreed for 33).
+
+How much the cards did, from the split's `PHI_GGML_VERBOSE=1` log totalled
+with Intel-Phi-Jev's `xks ledger`: 135 of the 561 multiplies the backend
+saw went to the cards, each card computing for 2.3 s of a run of about
+70 s. That is the repacking above: the experts (15.8 of 20.9 GB) never
+reach the backend on this host, so the cards hold only the 5.1 GB of the
+rest, a third each, and the generation gain comes from that alone.

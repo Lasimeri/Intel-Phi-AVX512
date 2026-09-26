@@ -106,9 +106,9 @@ n_used` multiplies expert `ids[p]` by b's row `(j % b_rows) + t *
 b_rows`. An id that would read past the slice is refused before any
 thread runs. `rows_slice_id` walks the columns and calls the ordinary
 row slicing for each, so a column is one activation row: right for
-generation, where every column of a token is a different expert, and
-not yet grouped by expert for a batch
-(`docs/results/2026-09-23-mixture-of-experts.md`).
+generation, where every column of a token is a different expert; a
+batch's columns are grouped by expert first (below,
+`docs/results/2026-09-23-mixture-of-experts.md`).
 
 ## Grouping a mixture's columns by expert
 
