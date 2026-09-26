@@ -418,7 +418,9 @@ the judge made 30, 16, 1 and 4 decisions and the text changed with them,
 where the host alone and the offloaded split (neither judges) repeat
 exactly. `PHI_GGML_JUDGE=0` turns the judgement off (the field `judge`;
 the static rules still apply), and with `PHI_GGML_PP_ADAPT=0` nothing
-depends on timing. On the 35B-A3B it costs about 5 percent at the prompt
+depends on timing: the same request gives the same output, within a
+server and across separate runs (compared byte for byte). On the 35B-A3B
+it costs about 5 percent at the prompt
 and at generation with the share set to where the adaptation settles
 (`PHI_GGML_PP_SHARE=0.58`), and computes what the default does
 (perplexity and KL divergence within error):
