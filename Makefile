@@ -3,23 +3,31 @@
 
 .DEFAULT_GOAL := help
 HOST := host
+# phi-pld links a llama.cpp build (headers here, libraries in
+# build-native/bin) and needs libclang; it joins the build where the
+# headers are found, and is skipped with a note where not.
+LLAMA_CPP_DIR ?= $(HOME)/llama.cpp
+export LLAMA_CPP_DIR
+PLD := $(if $(wildcard $(LLAMA_CPP_DIR)/include/llama.h),--workspace,)
+PLD_NOTE = $(if $(PLD),,@echo "phi-pld skipped: no $(LLAMA_CPP_DIR)/include/llama.h (set LLAMA_CPP_DIR)")
 
 .PHONY: help build test fmt clippy docs-check layout-check mvex-check check clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-14s %s\n", $$1, $$2}'
 
-build: ## Build the host workspace (libphi512.so, libggml_phi.so, phi-vpu, the translator, the encoder)
-	cd $(HOST) && cargo build && cargo build --release
+build: ## Build the host workspace (libphi512.so, libggml_phi.so, phi-vpu, the translator, the encoder; phi-pld where llama.cpp is found)
+	cd $(HOST) && cargo build $(PLD) && cargo build --release $(PLD)
+	$(PLD_NOTE)
 
 test: ## Run host tests that do not need the card
-	cd $(HOST) && cargo test
+	cd $(HOST) && cargo test $(PLD)
 
 fmt: ## Check formatting
 	cd $(HOST) && cargo fmt --all -- --check
 
 clippy: ## Lint
-	cd $(HOST) && cargo clippy --all-targets -- -D warnings
+	cd $(HOST) && cargo clippy $(PLD) --all-targets -- -D warnings
 
 docs-check: ## Enforce sibling .md files, the no-dash rule and relative links
 	scripts/check-docs.sh

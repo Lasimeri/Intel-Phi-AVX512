@@ -1,0 +1,20 @@
+[package]
+name = "phi-pld"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "phi-pld"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+serde_json = "1"
+tiny_http = "0.12"
+
+[build-dependencies]
+bindgen = "0.72"

@@ -212,6 +212,24 @@ memory) processes prompts offloaded at 72 tokens per second against 57.8
 and generates at 8.3 against 7.8, the text unchanged
 (`docs/results/2026-09-27-two-threads-per-core.md`).
 
+Prompt lookup decoding (a draft copied from earlier in the context,
+verified by the model in one batch) adds to that where the output repeats
+its input. llama-server's own n-gram drafters with the cards make a
+copy-heavy code edit 4.6 times faster, but on a mixture of experts a
+rejected draft costs a pass, so they lose where drafts are loose
+(`docs/results/2026-09-27-prompt-lookup-llama-server.md`). `phi-pld`
+(`host/crates/phi-pld`) is this repository's own engine over libllama,
+llama.cpp unchanged: the drafter of Apoorv Saxena's prompt lookup
+decoding on flat hash tables as Hayder Tirmazi's post describes, a
+rollback that checkpoints the hybrid model's recurrent state and carries
+the kept tokens into the next batch instead of decoding them again, and
+options chosen by a simulator that runs the engine against the model's
+own output. On the 35B-A3B with the cards it matches llama-server's best
+on the code edit (about 40 tokens per second against 9.4), is **1.32
+times plain and 43 percent past llama-server's best** on an extraction
+(13.1), and is 3 percent under plain on a free answer, where
+llama-server's drafters draft nothing (`docs/results/2026-09-27-phi-pld.md`).
+
 A model larger than this host's 31 GiB runs from its file, the page
 cache holding what it can. By default the cards' rows are a copy, so
 they save the host no memory; with `PHI_GGML_OFFLOAD=1` they leave the
@@ -246,6 +264,7 @@ same ones).
 | `host/crates/knc-mvex` | the MVEX encoder the translator builds on |
 | `host/crates/phi-vpu` | the protocol with the card worker, the shared window, the explicit driver |
 | `host/crates/phi-ggml` | `libggml_phi.so`, the ggml backend: matrix multiplies shared by rows between the host and the cards |
+| `host/crates/phi-pld` | `phi-pld`, prompt lookup decoding over libllama (llama.cpp unchanged), served as llama-server serves; its simulator; built where llama.cpp is found |
 | `card/vpu` | the card-side worker: the exec engine and the explicit path's thread pool; built on the card by `scripts/phi-vpu.sh deploy` |
 | `card/examples` | the AVX-512 kernel and its translation the explicit path and the ground-truth check use |
 | `tools` | the seamless, narrow and review tests, the conformance programs, the protocol layout check |
