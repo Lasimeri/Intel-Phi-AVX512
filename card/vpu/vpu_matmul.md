@@ -408,3 +408,10 @@ the larger ones (the dense share 16 percent, the pair 6), where before
 they lost everywhere. End to end in `docs/results/2026-09-27-two-threads-per-core.md`.
 Every case of `matmul-check` passes at 57 and at 114 threads, the latter
 with 128-row cases that reach the two-thread splits (61 rows never do).
+
+Since the same day's prompt lookup measurements, a request of up to 512
+columns (`OWN_GROUPS_MAX`: a speculative decoder's verification batch of
+64 tokens of eight experts) is grouped by its threads, each in its own
+region of a buffer the dispatcher sizes for the request (`own_region`),
+with `groups_mixture`'s counting sort past 32 columns
+(`docs/results/2026-09-27-prompt-lookup-llama-server.md`).

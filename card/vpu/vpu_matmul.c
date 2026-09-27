@@ -424,10 +424,33 @@ struct job {
     /* The activations are still arriving (`struct fused`, its pull in this
      * dispatch): wait for them before reading them. */
     struct fused *fused;
+    /* With own_groups: each slice's region for its groups and its sort
+     * scratch, `own_stride` bytes apart from `own_base` (the dispatcher
+     * sizes it for the request, `own_region`). */
+    unsigned char *own_base;
+    size_t own_stride;
 };
 
-#define OWN_GROUPS_MAX 64
-static uint64_t groups_own(struct group *gs, const struct job *j);
+/* The most columns a request's threads group themselves: a speculative
+ * decoder's verification batch of 64 tokens of eight experts each. */
+#define OWN_GROUPS_MAX 512
+static uint64_t groups_own(struct group *gs, const struct job *j, uint32_t *scratch);
+
+/* The regions threads group a request's columns in (`own_groups`): for
+ * each of `nslices`, `pieces` tables of n groups and a counting sort's
+ * scratch over `experts` ids, in one buffer kept between requests. */
+static struct { struct mapping m; size_t cap; } g_ownbuf;
+static int grow(void *slot, size_t bytes);
+static int own_region(struct job *jobs, int pieces, uint64_t n, uint64_t experts, int nslices)
+{
+    size_t stride = ((size_t)pieces * n * sizeof(struct group) + (experts + n) * sizeof(uint32_t) + 63) & ~(size_t)63;
+    if (grow(&g_ownbuf, stride * (size_t)nslices) != 0) return -1;
+    for (int x = 0; x < pieces; x++) {
+        jobs[x].own_base = g_ownbuf.m.p;
+        jobs[x].own_stride = stride;
+    }
+    return 0;
+}
 
 /* A small request's pull, done inside its compute dispatch rather than as
  * a dispatch of its own before it: the first `cores` cores' threads copy
@@ -677,16 +700,19 @@ static void fused_setup(struct fused *f, unsigned char *dst, const unsigned char
 static void run_pieces(const struct job *const *jobs, const uint64_t (*rng)[2], int count, int slice, int nslices,
                        int core, int mate, int nmates)
 {
-    struct group own[VPU_MORE_MAX + 1][OWN_GROUPS_MAX];
     struct job local[VPU_MORE_MAX + 1];
     const struct job *use[VPU_MORE_MAX + 1];
     struct fused *f = count > 0 ? jobs[0]->fused : NULL;
     for (int x = 0; x < count; x++) {
         use[x] = jobs[x];
         if (jobs[x]->own_groups && rng[x][1] > rng[x][0]) {
+            /* this slice's region: a table of n groups a piece, then the scratch */
+            unsigned char *mine = jobs[x]->own_base + (size_t)slice * jobs[x]->own_stride;
+            struct group *gs = (struct group *)mine + (size_t)x * jobs[x]->n;
+            uint32_t *scratch = (uint32_t *)((struct group *)mine + (size_t)count * jobs[x]->n);
             local[x] = *jobs[x];
-            local[x].groups = own[x];
-            local[x].ngroups = groups_own(own[x], &local[x]);
+            local[x].groups = gs;
+            local[x].ngroups = groups_own(gs, &local[x], scratch);
             use[x] = &local[x];
         }
         warm_slice(use[x], rng[x][0], rng[x][1], core, mate, nmates, f ? WARM_WEIGHTS : WARM_ACTS | WARM_WEIGHTS);
@@ -810,11 +836,19 @@ static uint64_t groups_mixture(struct group *gs, const struct job *j, uint64_t e
  * columns in order of the expert they chose, a stable insertion sort in
  * place of the counting sort, then runs of eight, four or one), so the
  * same columns meet in the same kernels either way. */
-static uint64_t groups_own(struct group *gs, const struct job *j)
+static uint64_t groups_own(struct group *gs, const struct job *j, uint32_t *scratch)
 {
     if (j->n_used == 0) return groups_plain(gs, j);
-    uint32_t order[OWN_GROUPS_MAX];
     uint64_t n = j->n;
+    if (n > 32) {
+        /* A verification batch's columns: the counting sort, over the ids
+         * this request uses, in this thread's own scratch. */
+        int32_t top = 0;
+        for (uint64_t p = 0; p < n; p++)
+            if (j->ids[p] > top) top = j->ids[p];
+        return groups_mixture(gs, j, (uint64_t)top + 1, scratch);
+    }
+    uint32_t order[32];
     for (uint64_t p = 0; p < n; p++) {
         uint64_t q = p;
         while (q > 0 && j->ids[order[q - 1]] > j->ids[p]) {
@@ -1530,6 +1564,7 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
         }
         mj.at[mo.count + 1] = total;
         if ((uint64_t)threads > total) threads = (int)total;
+        if (own && own_region(jobs, (int)mo.count + 1, mm.n, most, threads) != 0) return VPU_E_ALLOC;
         if (win) {
             fused_setup(&g_fused, (unsigned char *)g_b.m.p + mm.ids_bytes, win + mm.ids_bytes, act64, threads);
             for (uint32_t x = 0; x <= mo.count; x++) jobs[x].fused = &g_fused;
@@ -1566,6 +1601,7 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
         if (mm.n <= OWN_GROUPS_MAX) {
             /* A few columns: every thread groups them itself (`own_groups`). */
             j.own_groups = 1;
+            if (own_region(&j, 1, mm.n, experts, threads) != 0) return VPU_E_ALLOC;
         } else {
             if (grow(&g_groups, mm.n * sizeof(struct group)) != 0) return VPU_E_ALLOC;
             if (mixture && grow(&g_order, (experts + mm.n) * sizeof(uint32_t)) != 0) return VPU_E_ALLOC;
