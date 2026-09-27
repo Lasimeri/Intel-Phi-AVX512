@@ -73,7 +73,7 @@ enum Cmd {
     /// Check the matrix-multiply service: every weight format against a
     /// host reference, then the weight rate at a model-sized shape.
     MatmulCheck {
-        /// Card threads (1 to 57).
+        /// Card threads (1 to 114: 57 is one a core, 114 two, the backend's).
         #[arg(long, default_value_t = 57)]
         threads: u32,
         /// One type only (f32, f16, q4_K, q5_K, q6_K, q8_0, iq4_xs).

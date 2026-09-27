@@ -1,7 +1,7 @@
 # phi-ggml.sh: llama.cpp with the cards beside the host
 
 ```
-scripts/phi-ggml.sh [--card N] [--verbose] <command> [args...]
+scripts/phi-ggml.sh [--card N[,M...]] [--verbose] <command> [args...]   # also -c N, --card=N, -v
 ```
 
 Runs an ordinary build of a ggml program (llama.cpp, unmodified, built
@@ -26,7 +26,7 @@ than instead of it.
 
 Settings, all environment variables (`host/crates/phi-ggml/src/lib.md`):
 `PHI_GGML_CARDS` (which cards; default every card whose window exists;
-`--card N` sets it to one), `PHI_GGML_FRACTION` (rows per card; unset,
+`--card N[,M...]`, also `-c` or `--card=`, names the cards, one or a comma-separated list), `PHI_GGML_FRACTION` (rows per card; unset,
 the backend sizes it to fill the budget, below; either way at most an
 equal split with the host, a third on two cards),
 `PHI_GGML_CARD_BYTES` (resident bytes per card, 4.4 GB),

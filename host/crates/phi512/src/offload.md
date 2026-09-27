@@ -14,8 +14,12 @@ return, an indirect jump, a system call; a VEX or SSE instruction (the
 host executes those natively when it resumes); an instruction with a
 segment prefix (thread-local storage lives elsewhere on the card); a
 legacy instruction outside the card's x86-64 subset (`card_can_run`:
-no CMOV, no BMI, no LZCNT, per ISA 327364-001 appendix B.2); an AVX-512
-instruction the rewriter refuses. A refusal at the faulting instruction
+no CMOV, no BMI, no LZCNT, per ISA 327364-001 appendix B.2); an atomic
+read-modify-write (a `lock` prefix, or `xchg` with memory: other threads
+of the program keep running on the host, and the card's copy would lose
+their writes); an instruction that does not decode; an AVX-512
+instruction the rewriter refuses. The walk also stops at 4096
+instructions (`MAX_INSNS`). A refusal at the faulting instruction
 itself is an error: the program cannot continue and says why.
 
 The 2 MiB chunk of the program around the region is copied whole
@@ -39,17 +43,23 @@ planner tries to resolve every address the phase will touch from its
 register file:
 
 - **ranges**: it can. The card fetches exactly those pages and writes
-  exactly the stored ranges back; no faults, no protection changes.
+  exactly the stored ranges back. A range that is written, not read, and
+  written whole (`RANGE_DENSE`) is not fetched: the card opens its
+  interior pages without a fetch and the host does not prefetch it.
 - **split**: ranges, and the loop's iterations run on up to 57 threads,
   the trip count coming from the induction register's value at the head
   and the bound.
 - **demand**: it cannot (an address through an unknown register, a phase
-  starting after the region's first instruction with no loop). The card
+  starting after the region's first instruction with no loop, more than
+  64 ranges after merging, `EXEC_MAX_RANGES`, or, for the loop phase, no
+  trip count from `plan::iterations`). The card
   pages the program's memory in as the code touches it and returns the
   lines that changed.
 - **demand after the planner missed an address**: a ranges-mode phase
   touched something undeclared; the card said so without writing
-  anything back, and the same phase ran again in demand mode.
+  anything back, and the same phase ran again in demand mode. So does a
+  split phase whose thread left somewhere other than the loop's exit
+  (`EXIT_SPLIT`): it reruns in demand mode on one thread.
 
 ## The dispatch
 
@@ -59,12 +69,20 @@ the same way the emulator does). The descriptor, the thunk area and the
 code pages go to the window as one bundle (`proto::Exec`); while the
 card runs, `run` serves the mailbox: a fetch copies a piece of a range
 from this process straight into a fetch slot (and the next piece into
-the other slot ahead of time, so the copy overlaps the card's DMA); a
-write-back is acknowledged on receipt and its pages applied after, only
-the lines their masks name, through `process_vm_writev`. On exit the
+the other slot ahead of time, so the copy overlaps the card's DMA), and each
+fetched page is kept as it was sent (the stash, cleared every run); a
+write-back is acknowledged on receipt and its pages applied after,
+through `process_vm_writev`: on a stashed page only the bytes that
+differ from what was sent, within the lines the mask names, so another
+thread's write to the same line survives unless it hit a byte the card
+also changed; on a page never fetched (a dense range's interior) the
+whole lines the mask names. On exit the
 frame gets the card's integer registers, flags and rip, and the vector
 state goes back through `VState`. A session id stamps every descriptor,
-so the card drops another program's chunks.
+so the card drops another program's chunks. The mask registers cross as
+16 bits each way (`Regs.k` is `[u16; 8]`): bits 16 to 63 of every k
+register are dropped at each region, which the card, with no 64-bit
+masks, never produces anyway.
 
 The handler runs on an alternate stack: the card writes the program's
 stack back, and the handler's frame must not be on it. A thread of the
@@ -74,9 +92,23 @@ it.
 ## Limits, for now
 
 One region at a time (a mutex); other threads keep running on the host
-meanwhile, and a write they make to a line the region also writes is
-lost. A reduction loop runs on one thread. A loop bounded by an
-immediate is not split (each thread needs its own bound in a register).
+meanwhile. Their writes survive a region's write-back (the stash, above)
+unless they hit a byte the region also changed, or a line of a page the
+card did not fetch; their atomic updates are safe because an atomic
+instruction ends the region and runs on the host. A reduction loop runs
+on one thread. A loop bounded by an immediate is not split (each thread
+needs its own bound in a register).
+
+Other bounds: 64 cached regions, the oldest evicted (`MAX_REGIONS`); a
+region fits one 2 MiB chunk; its thunk at most 256 KiB
+(`EXEC_THUNK_MAX`); at most 64 code pages a phase (`EXEC_MAX_PAGES`); 60
+s a phase; `init` waits 2 s for a live worker.
+
+`PHI512_CARD` names the card (else 0; anything but an index is an
+error). `PHI512_TRACE_REGS` prints each fetch, and each phase's changed
+registers and exit kind. `PHI512_VERBOSE` prints each new region's
+analysis, each phase's first 12 ranges, and every write-back page with
+the mapping it lands in.
 
 ## Since the full instruction set (2026-09-22 night)
 
@@ -86,8 +118,10 @@ immediate is not split (each thread needs its own bound in a register).
 - A site shorter than the 5-byte jump that replaces it (the 4-byte mask
   instructions) takes the instructions after it into its thunk, as long
   as they fall through, nothing branches into them, they are not
-  RIP-relative and have no thunk of their own; otherwise the region is
-  refused with the reason.
+  RIP-relative, have no thunk of their own, and none is the region's
+  entry; one direct near branch (not `jrcxz`, `jecxz` or `loop*`) may be
+  the last instruction taken, re-encoded with a rel32 in the thunk.
+  Otherwise the region is refused with the reason.
 - A byte or word compare whose only consumer is `kortestq`/`kortestd`
   on its result (a scan for a differing byte) becomes the dword compare
   (`bytecmp_pair`): the card has no 64-bit masks, and the dword result
@@ -108,9 +142,11 @@ still repacking its weights, at about 0.5 ms per region. That is the
 per-region floor, not the translator: the instruction-level path is
 correct for this program and far too slow for it (`docs/results/`).
 With more than one thread, the region holding ggml's OpenMP barrier
-spins forever afterwards: the card's snapshot cannot see the other
-host threads' increments, and its write-back clobbers theirs, which is
-the concurrency limit stated above, met in practice.
+spun forever afterwards: the card's snapshot could not see the other
+host threads' increments, and its write-back clobbered theirs. Two fixes
+came of it: an atomic read-modify-write now ends a region and runs on
+the host, and a write-back applies only the bytes the card changed (the
+stash, above).
 
 ## The thunk area has a chunk of its own (2026-09-25)
 

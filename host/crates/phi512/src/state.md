@@ -21,3 +21,31 @@ invented here: `k0` cannot be used as a write-mask, so the encoding is free
 to mean "unmasked". Getting this backwards would disable every lane of
 every unmasked instruction, which is the sort of thing that fails loudly
 and immediately, but it is worth saying why the check reads the way it does.
+
+## What a VEX write did to the upper bits (`last_low`, `upper_is_stale`)
+
+Only bits 0 to 255 of zmm0 to zmm15 exist in this processor (its ymm
+registers); bits 256 to 511, and all of zmm16 to zmm31, live here. Real
+AVX-512 hardware zeroes bits 256 to 511 whenever a VEX instruction
+writes the register, and the program runs VEX instructions natively
+between AVX-512 ones. `last_low` keeps the low 256 bits of each register
+as this library last left them (`note_write` records them); when the
+live low bits differ, something else wrote the register, and
+`upper_is_stale` says the upper bits are to be taken as zero. Two blind
+spots, stated in the code: a legacy SSE write (which leaves the upper
+bits alone on real hardware) is treated as a VEX one and zeroes them
+too, and a VEX write that happens to produce the same 256 bits again is
+not noticed.
+
+## Syncing with the live registers, and one state a thread
+
+`sync_in` and `sync_out` copy the low 256 bits of the live registers in
+and out, applying the rule above; `sync_in_masked` and
+`sync_out_masked` do the same for only the registers an instruction
+names, and update `last_low` only for those (`frame.md`). The fault
+handler applies the same rule through its own `pull_live_registers`
+(`handler.md`).
+
+`tls` holds one `VState` per thread, shared by the fault handler and the
+rewritten sites; it is `const`-initialised, so the first touch inside a
+signal handler does not allocate, and `tls::with` is the one accessor.

@@ -24,8 +24,8 @@ the offsets. `K_EXEC` is the request kind.
 ## The matrix-multiply service (2026-09-23)
 
 `Matmul` mirrors `struct vpu_matmul` in `card/vpu/vpu_matmul.h`, 128
-bytes at `OFF_MATMUL` in the control area, and four request kinds use
-it:
+bytes at `OFF_MATMUL` in the control area, and five request kinds use
+it (`K_FFN`, 7, has its own descriptor, `Ffn`, below):
 
 | kind | number | what it does |
 | --- | --- | --- |
@@ -33,6 +33,7 @@ it:
 | `K_MATMUL` | 4 | `d = a . b^T`, `a` cached by id or streamed from the window |
 | `K_FREE` | 5 | drop `a_id`, or everything when it is 0 |
 | `K_MATMUL_ID` | 6 | the same with one expert per column, ggml's MUL_MAT_ID |
+| `K_MATMUL_MORE` | 8 | this descriptor's multiply and up to three more by the same activations (and ids), `More` at `OFF_MORE` (below) |
 
 The descriptor's last five words are `chunk` (rows per chunk the card
 works in, 0 for its own default) and the four a mixture needs (`n_used`,

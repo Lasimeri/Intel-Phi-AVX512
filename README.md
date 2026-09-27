@@ -56,10 +56,12 @@ stack's block-path timer shows,
   ([`scripts/stack.md`](scripts/stack.md)).
 - `make build` here: `libphi512.so` (the library the wrapper preloads),
   `libggml_phi.so` (the ggml backend), `phi-vpu` (the explicit driver),
-  the translator and the encoder.
-- The card's worker is deployed and started by the wrapper itself the
-  first time (`scripts/phi-vpu.sh -c N deploy|start` by hand); it lives
-  on the card's persistent disk after that.
+  the translator and the encoder; and `phi-pld` where llama.cpp's
+  headers are found (`LLAMA_CPP_DIR`, default `~/llama.cpp`; skipped with
+  a note otherwise; it also needs libclang).
+- The card's worker deployed once (`scripts/phi-vpu.sh -c N deploy`); it
+  lives on the card's persistent disk after that, and the wrapper starts
+  it when it is not running (`scripts/phi-vpu.sh -c N start` by hand).
 
 ## How it works
 
@@ -114,7 +116,7 @@ every matrix multiply it accepts (`MUL_MAT` and `MUL_MAT_ID`, the
 mixture-of-experts one, with float16, float32 and llama.cpp's Q4_K,
 Q5_K, Q6_K, Q8_0 and IQ4_XS weights), and the backend shares each
 one by rows: every card keeps a share of the weight matrix resident and
-multiplies it on its 57 threads with the kernels of
+multiplies it on its 114 threads (two on each of its 57 cores) with the kernels of
 `card/vpu/vpu_matmul_kernel.S` (the quantized formats decoded on the
 vector unit, `host/crates/phi-vpu/src/bin/kernelgen/quant.md`), while
 the host computes the rest with ggml's own CPU kernels; the results are
@@ -129,9 +131,11 @@ scripts/phi-ggml.sh ./llama-cli -m model.gguf -p "..." -t 12   # the host and ev
 scripts/phi-ggml.sh --verbose ...                              # each multiply, the host part and each card's times
 ```
 
-Qwen3.8-27B (UD-Q4_K_XL, 17.6 GB) on the 5800X alone and with both
-cards, each keeping 31 percent of every weight matrix it is offered (as
-much as its 4.4 GB holds), llama-bench, 2026-09-23 night
+History, not the current figures (those are the table at the top of this
+section; the 27B is no longer used here): Qwen3.8-27B (UD-Q4_K_XL, 17.6
+GB) on the 5800X alone and with both cards, each keeping 31 percent of
+every weight matrix it is offered (as much as its 4.4 GB holds),
+llama-bench, 2026-09-23 night, the cards' workers then on 57 threads
 (`docs/results/2026-09-23-redundancy-and-transport.md`):
 
 | | pp512 tok/s | tg32 tok/s |
@@ -288,15 +292,16 @@ same ones).
 | `host/crates/phi-vpu` | the protocol with the card worker, the shared window, the explicit driver |
 | `host/crates/phi-ggml` | `libggml_phi.so`, the ggml backend: matrix multiplies shared by rows between the host and the cards |
 | `host/crates/phi-pld` | `phi-pld`, prompt lookup decoding over libllama (llama.cpp unchanged), served as llama-server serves; its simulator; built where llama.cpp is found |
-| `card/vpu` | the card-side worker: the exec engine and the explicit path's thread pool; built on the card by `scripts/phi-vpu.sh deploy` |
+| `card/vpu` | the card-side worker: the exec engine, the explicit path's thread pool and the matrix-multiply service; built by `scripts/phi-vpu.sh deploy`, on the host with the stack's cross toolchain when it has one (`card/vpu/build.md`) |
 | `card/examples` | the AVX-512 kernel and its translation the explicit path and the ground-truth check use |
 | `tools` | the seamless, narrow and review tests, the conformance programs, the protocol layout check |
 | `scripts` | `phi512.sh` (the wrapper), `phi-vpu.sh` (the worker), `phi512-check.sh` and `phi512-ground.sh` (conformance against hardware and against the card), `phi512-install.sh` (system-wide preload) |
 | `docs/research` | the precision audit that gates the translation, and the transparency design |
 | `docs/results` | dated records with every number |
 
-`make check` runs the documentation rules, formatting, lints, tests and
-the protocol layout check; `CONTRIBUTING.md` has the rules.
+`make check` runs the documentation rules, formatting, lints, the build,
+tests, the protocol layout check, and the comparison of `knc-mvex` with
+the stack's copy (`mvex-check`); `CONTRIBUTING.md` has the rules.
 
 ## The repositories
 

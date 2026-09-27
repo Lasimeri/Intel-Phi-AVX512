@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# phi512-ground.sh: check one computation against three independent
-# executions of it, one of them on the card.
+# phi512-ground.sh: check one computation against three executions of it,
+# two of them on the card by different paths.
 #
 #   scripts/phi512-ground.sh
 #
@@ -8,8 +8,9 @@
 #
 #   1. the host's own FMA3 hardware, through fmaf(), which is what real
 #      fused-multiply-add silicon produces
-#   2. AVX-512 machine code, executed on the host by phi512, which has no
-#      AVX-512 hardware at all
+#   2. AVX-512 machine code on a host with no AVX-512 hardware, under
+#      phi512.sh: since 2026-09-22 its regions run on card 0 (the
+#      seamless path); phi512.sh --emulate would run them in software
 #   3. AVX-512 machine code translated to the card's MVEX instruction set
 #      by avx512-xlate and executed on the Xeon Phi's vector units
 #
@@ -70,7 +71,7 @@ fi
 echo
 if grep -q "bit-identical" host.out && grep -q "bit-identical" card.out; then
     echo "${green}${bold}All three agree to the bit.${off}"
-    echo "  host FMA3 hardware, host software emulation, and the card's vector units"
+    echo "  host FMA3 hardware, the seamless path on the card, and the translated kernel on the card"
     echo "  produce identical results for the same AVX-512 program."
 else
     echo "${red}${bold}They do not all agree.${off}"

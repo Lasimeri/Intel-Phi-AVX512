@@ -22,9 +22,10 @@ on every connection that does not use a post-quantum key exchange, which
 the card's dropbear lacks; the forward is loopback to the card over PCIe,
 so the script passes `WarnWeakCrypto=no-pq-kex` when the local ssh knows
 that option (checked with `ssh -G`; an older ssh would refuse it and the
-script then passes nothing). Needs the card up
-(`phi -c N status`) with the native toolchain on its disk (`cc` builds
-the worker on the card). The worker lives in `/opt/phi/vpu` on the card
+script then passes nothing). Needs the card up (`phi -c N status`); the
+card's own toolchain (`cc` on its disk) only when the host has no stack
+cross toolchain and no other card is up (below, "Where the worker is
+built"). The worker lives in `/opt/phi/vpu` on the card
 (`PHI_VPU_DIR` to change), which is on the card's persistent disk, so a
 deployed worker survives a reboot and only `start` is needed afterwards.
 
@@ -53,11 +54,13 @@ worker then falls back to 4 KiB pages for buffers that do not fit.
 
 ## Two refusals
 
-- **`start` refuses while `/dev/phiblk1` is a swap device on the card.**
+- **`start` refuses while swap on `/dev/phiblk1` has pages in use.**
   The window the worker uses is the same memory that backs that device,
   and the card's `init` puts swap on it at boot. Offloading over live
-  swap would corrupt whichever side wrote second. Run
-  `ssh phi swapoff /dev/phiblk1` first; `swapon` puts it back.
+  swap would corrupt whichever side wrote second. Swap with nothing on
+  it is turned off by `start` itself (and says so); with pages in use it
+  refuses: run `phi -c N run swapoff /dev/phiblk1` first; `swapon` puts
+  it back.
 - **`stop` uses `pkill -f 'phi-vpu-worke[r]'`.** The bracket class keeps
   the pattern from matching the ssh command line that carries it, which
   is what happens with the plain name and kills the ssh session instead
@@ -97,7 +100,7 @@ buffers.
 
 `deploy` no longer builds on the card it deploys to unless it must. In
 order: on the host with the stack's cross toolchain (`toolchain/env.sh`
-puts `knc-cc` on PATH; the three files compile in parallel and link
+puts `knc-cc` on PATH; the five sources (vpu_worker.c, vpu_exec.c, vpu_matmul.c, vpu_matmul_kernel.S and the examples' avx512_poly.S) compile in parallel and link
 statically, under a second, and the binary is pushed), else on another
 card that is up (`PHI_VPU_BUILD_CARD`, default the first other index;
 `build-here` is the verb it uses there, and the binary comes back

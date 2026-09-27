@@ -14,13 +14,15 @@ kernel, which the tests reproduce byte for byte):
 | --- | --- | --- |
 | 62H | | MVEX escape |
 | P0 | `R X B R' 0 0 m m` | register extensions, stored inverted (R and R' extend ModRM.reg, X and B extend r/m); `mm` = 01 for 0F, 10 for 0F38, 11 for 0F3A |
-| P1 | `W v v v v 0 p p` | `vvvv` = first source register, inverted; bit 2 is 0 (EVEX has 1 here); `pp` = 00 none, 01 66H |
+| P1 | `W v v v v 0 p p` | `vvvv` = first source register, inverted; bit 2 is 0 (EVEX has 1 here); `pp` = 00 none, 01 66H, 11 F2H (the no-read stores) |
 | P2 | `E S S S V' a a a` | eviction hint, swizzle/conversion, `vvvv` bit 4 inverted, write mask `k` |
 
 Then the opcode, ModRM, an optional disp32 and an optional imm8. A vector
 register in ModRM.reg is extended by R and R', one in ModRM.r/m by X and
-B. Only the plain forms are produced: `E = 0`, `SSS = 000` (no swizzle,
-no conversion, round to nearest), memory operands as `[base + disp32]`
+B. The plain forms are the default: `E = 0`, `SSS = 000` (no swizzle,
+no conversion, round to nearest); `E = 1` only in `vmovnrngoaps`, and
+`SSS` other than 000 in the float16 load (`vmovaps_load_f16`, 011) and
+in any memory source given as `Src::MemConv` (`conv.md`). Memory operands as `[base + disp32]`
 with mod = 10 so the disp8*N compression never applies. `Mem::new`
 refuses `rsp` and `r12` as a base (they need a SIB byte, which the
 encoder does not emit); `rbp` and `r13` are fine, since only mod = 00
@@ -32,7 +34,7 @@ Instructions covered:
 
 | family | forms |
 | --- | --- |
-| move | `vmovaps` load/store (the form Intel's kernel uses), `vmovapd` load/store/move |
+| move | `vmovaps` load/store (the form Intel's kernel uses), `vmovapd` load/store/move, `vmovaps_load_f16` (float16 up-converted on the load), the no-read stores `vmovnraps` and `vmovnrngoaps` (a line written without reading it first; the second also not globally ordered), the unaligned pairs `vloadunpackld`/`hd` and `vpackstoreld`/`hd`, `vpbroadcastd` from memory |
 | float64 | `vaddpd`, `vsubpd`, `vmulpd`, `vfmadd213pd`, `vfmadd231pd`, `vcmppd` (its write mask acts as an AND on the result: a clear mask bit clears the result bit, table 6.3 and the note under it) |
 | int32 | `vpaddd`, `vpsubd`, `vpandd`, `vpandnd` (note the order: `(!zmm2) & src`), `vpord`, `vpxord`, `vpslld`, `vpsrld`, `vpsrad`, `vpsllvd`, `vpsrlvd` |
 | mask | `kmov` in all three directions, `kortest` |
@@ -52,7 +54,7 @@ right), so `vpslld`, `vpsrld` and `vpsrad` share one encoder path and one
 opcode byte. Everything else here is `NDS`: destination in ModRM.reg,
 first source in `vvvv`, second source in r/m.
 
-Each function returns an `Insn` with the bytes and the Intel-syntax text
+`Mem::offset` moves a memory operand by a displacement (`None` when the displacement would overflow), and `Cmp` names the compare predicates. Each function returns an `Insn` with the bytes and the Intel-syntax text
 (`[rbp-64]` for a negative displacement); `gas()` renders a `.byte` line
 with the text as a comment, `c_string()` a C string literal for inline
 assembly.
@@ -69,16 +71,20 @@ Three sources pin the bytes, in decreasing strength:
    failing ([`docs/results/2026-09-20-mvex-integer.md`](https://github.com/Lasimeri/Intel-Phi-3120A/blob/main/docs/results/2026-09-20-mvex-integer.md)). The integer set
    has no Intel macro to reproduce, so hardware is its only reference,
    which is why the probe covers a memory second source, the `NDD` form
-   with a register above `zmm15`, and merge masking.
-2. Intel's macros: the `vmovaps` load and store for all 32 registers and
+   with a register above `zmm15`, and merge masking. And
+   `no_read_store_bytes_verified_on_the_card` holds the no-read stores'
+   bytes, which zeroed memory on the card on 2026-09-21 (`knc_memset64`).
+2. Intel's macros: the `vmovaps` store for all 32 registers, the load for nine (0, 1, 7, 8, 15, 16, 23, 24, 31), and
    the `kmov` r32 forms for all 8 masks reproduce `mic_ni.h` byte for byte.
 3. The document: the extension bits for registers 8 to 31, memory bases
    above `rdi`, `kmov k, k` and `vfmadd231pd` (the one form no generated
    file uses) follow section 3.3 and the opcode column of chapter 6, and
    have not run on the card.
 
-The generator's tests (`main.md`) compare its output with the committed
-files, so an encoder change is visible until they are regenerated.
+The generator's tests (the stack's
+[`knc-mvex/src/main.rs`](https://github.com/Lasimeri/Intel-Phi-3120A/blob/main/host/crates/knc-mvex/src/main.rs),
+below) compare its output with the committed files, so an encoder change
+is visible there until they are regenerated.
 
 ## The float32 and unaligned-store forms (2026-09-21)
 
@@ -100,9 +106,15 @@ half (`vloadunpackld`, `vloadunpackhd`) was already here. Same opcodes as
 the loads, `D0` and `D4`, and the same `0F38` map, but the stores carry a
 `66` prefix and the loads must not have one.
 
-All of these are verified by execution: `card/examples/avx512_poly.S` uses
-them and produces results bit-identical to the host's FMA3 hardware over
-65536 lanes. No assembler for this vector ISA exists to check them against.
+They are verified by execution, not by an assembler (none exists for
+this vector ISA): `card/examples/avx512_poly.S` runs `vmovaps` and
+`vfmadd213ps` and `card/examples/avx512_fma.S` runs `vfmadd231ps` and the
+unaligned pairs, both bit-identical to the host's FMA3 hardware. `vaddps`,
+`vsubps`, `vmulps` and `vcmpps` are in no generated example and have not
+run on the card from this crate: only the command's table (`avx512-xlate`,
+`translate`) emits them, and the seamless path's rewriter has an encoder
+of its own (`Em`, `rewrite.md`) and does not use this crate. Their bytes
+rest on the document (source 3 under Tests).
 
 ## In this repository (2026-09-22)
 

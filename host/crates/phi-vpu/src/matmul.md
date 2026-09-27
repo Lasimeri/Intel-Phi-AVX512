@@ -1,7 +1,8 @@
 # matmul.rs: the matrix-multiply service, host side
 
-The window areas and the four requests of the card's matrix-multiply
-service (`card/vpu/vpu_matmul.md`), shared by the ggml backend
+The window areas and the six request kinds of the card's matrix-multiply
+service (`K_UPLOAD`, `K_MATMUL`, `K_MATMUL_ID`, `K_FREE`, `K_FFN`,
+`K_MATMUL_MORE`; `card/vpu/vpu_matmul.md`), shared by the ggml backend
 (`host/crates/phi-ggml`) and the driver's `matmul-check`:
 
 | item | what |
@@ -11,7 +12,11 @@ service (`card/vpu/vpu_matmul.md`), shared by the ggml backend
 | `OFF_D`, `D_MAX` (704 MiB, 64 MiB) | the result, n rows of m floats |
 | `request` | write the descriptor, ring, wait; a non-zero status becomes an error with `status_name` |
 | `row_bytes`, `shape_ok`, `type_name` | ggml's row size per type and what the card takes (`shape_ok` mirrors the worker's check) |
+| `WINDOW_LEN` (768 MiB, `OFF_D + D_MAX`) | how much of the window the service needs mapped |
+| `round_up` | a length rounded up to the 4096-byte blocks the areas are laid out in |
+| `request_ffn` | a feed-forward request (`K_FFN`): its descriptor at `OFF_FFN`, then the doorbell |
 | `check` | the conformance and rate run below |
+| `check_swiglu`, `moe_check`, `probe` | the SwiGLU check, the one-token mixture rate (`--moe`) and the probe (`--probe`), below |
 
 `check` builds random weights in every type the card takes (f32, f16,
 Q4_K, Q5_K, Q6_K, Q8_0, IQ4_XS: any byte pattern is a valid block, the
@@ -23,8 +28,11 @@ of `4e-6` times the sum of the terms' magnitudes plus `1e-6`: the card
 sums 16 lanes in a different order from the host, and both round each
 product once. Shapes: 61 rows (an odd split across 57 threads), k 512
 (two superblocks; Q8_0 also 544, a tail of one block), n 1, 4, 8 and 13
-(the kernels' one-, four- and eight-row variants and a mix), then a
-model-sized 4096 x 5120 at n 1, 8 and 64 for the weight rate. Run:
+(the kernels' one-, four- and eight-row variants and a mix); with
+`--threads` above 57 also 128 rows at n 1, 8 and 13 and a 128-row
+mixture, rows enough for a core's two threads to share them (61 rows
+never reach the second thread of a core); then a model-sized 4096 x 5120
+at n 1, 8 and 64 for the weight rate. Run:
 
 ```
 phi-vpu -c 0 matmul-check
@@ -44,7 +52,7 @@ therefore uploads the weights once and times the multiply `--repeat`
 times (7), printing the best and the median; nothing between the repeats
 touches the host, so the pool stays spinning.
 
-`--chunk N` puts N in the descriptor's `reserved[0]`, which the card
+`--chunk N` puts N in the descriptor's `chunk` field, which the card
 takes as the rows per chunk (its default is 32): the loop shape is
 measured rather than argued.
 
@@ -70,10 +78,13 @@ note), not because the weights are slow to fetch.
 L1 set conflict above was found and sized; the backend's own padding
 (`phi-ggml`, `B_PAD`) is 256.
 
-`check_id` does the same for a mixture (`K_MATMUL_ID`): eight experts of
-the same rows, columns picking experts at random, with the activations
-shared between a token's columns and then one per column, against the
-host's own dot products. `matmul-check` runs it for every type.
+`check_id` does the same for a mixture (`K_MATMUL_ID`), six cases for
+every type: eight experts of 61 rows, three or eight used per token, the
+activations shared between a token's columns and then one per column;
+and two with few experts (2 experts, both used, 32 tokens; 3 experts, 4 picks each, 9 tokens), which put
+many columns on one expert so the card groups them eight and four at a
+time with their activation rows scattered; all against the host's own
+dot products.
 
 `--act 1` sends the activation rows as float16 (`act_bytes`,
 `act_row_bytes`, `act_round`), which is what the backend does by default
@@ -109,7 +120,10 @@ kernel and request.
 The default shapes are one card's share of a 35B-A3B's experts: 128 of
 512 gate or up rows against k 2048 with one activation row for all eight
 experts, and 448 of 2048 down rows against k 512 with a row each.
-`--moe-shape M,K,ROWS` times others. This is how the slow one-token
+`--moe-shape M,K,ROWS` times others; ROWS 0 times a plain one-column
+multiply (`K_MATMUL`, a dense matrix at one token) cold over sixteen
+tensors instead. `--moe` takes a quantized type only (`--only`, default
+q4_K). This is how the slow one-token
 requests of 2026-09-27 were taken apart (`card/vpu/vpu_matmul.md`, "One
 token's multiply, and whose lines the pool reads").
 

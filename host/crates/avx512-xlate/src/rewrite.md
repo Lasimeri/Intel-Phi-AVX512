@@ -2,24 +2,35 @@
 
 EVEX to MVEX rewriting for the seamless path: every AVX-512 instruction
 of a region becomes something the card executes, either in place or as
-an out-of-line sequence. Since 2026-09-22 (the llama.cpp work) this
-covers the full instruction set a compiler emits for AVX512F, CD, VL,
-DQ and BW code, not only the 512-bit forms the card has one to one.
+an out-of-line sequence (`Rewrite::InPlace`, or `Rewrite::Thunk` with
+its `Thunk { seq, fixups, consts }`: the bytes, the `Fixup`s of kind
+`FixupKind` to patch once placed, and the constants; `Target` carries
+what the card worker provides, such as the scratch displacement). Since
+2026-09-22 (the llama.cpp work) this covers what a compiler emits for
+AVX512F, VL and DQ code, not only the 512-bit forms the card has one to
+one; of AVX512BW only the unmasked `vmovdqu8`/`vmovdqu16`, the mask
+instructions, and the byte compare feeding `kortest` (below); no AVX512CD
+instruction (`vpconflict*`, `vplzcnt*`, `vpbroadcastm*`) is in the
+tables, so those are refused.
 
 ## In place
 
 The card's MVEX prefix and AVX-512's EVEX prefix share the four-byte
 shape, the opcode maps, and the ModRM, SIB and displacement bytes,
 including the disp8*N scaling. For a 512-bit instruction the card has
-one to one, with no zeroing, whose memory operand (if any) is an
-embedded broadcast, an aligned move or a block broadcast, the rewrite is
-the prefix payload: P1 bit 2 clears, P2's `z L'L b V' aaa` becomes
-`E SSS V' aaa`, SSS 001 for a memory broadcast. The instruction keeps
-its length. The whitelist `canon` names each card instruction by its
-opcode line in the ISA reference 327364-001, and maps the AVX-512
-spellings the card lacks onto the ones it has (`vxorps` to `vpxord`,
-`vpermilps` to `vpshufd`, `vmovshdup` to `vpshufd 0xf5`, `vcvtdq2ps` to
-`vcvtfxpntdq2ps 0`).
+one to one and spells the same way (`same_shape`: the same map, prefix,
+W and opcode), with no zeroing, whose memory operand (if any) is an
+embedded broadcast, an aligned move, a block broadcast or a scalar
+broadcast load (`vbroadcastss`/`sd`, `vpbroadcastd`/`q` and the block
+forms), the rewrite is the prefix payload: P1 bit 2 clears, P2's `z L'L b
+V' aaa` becomes `E SSS V' aaa`, SSS 001 for a memory broadcast. The
+instruction keeps its length. The whitelist `canon` names each card
+instruction by its opcode line in the ISA reference 327364-001, and maps
+the AVX-512 spellings the card lacks onto the ones it has (`vxorps` to
+`vpxord`, `vpermilps` and `vpermps` to `vpshufd`/`vpermd`, `vmovshdup`
+to `vpshufd 0xf5`, `vcvtdq2ps` to `vcvtfxpntdq2ps 0`, and `vcvtudq2ps`
+and `vcvtps2pd`); a remapped spelling is never in place, since its
+bytes differ: it goes through a sequence (`generic`).
 
 ## Sequences
 
@@ -82,7 +93,9 @@ What the card cannot do directly, and how each is expressed:
   f(0,b,c)`), each an and/or/xor/andn, with the all-ones, zero and
   xor-of-three idioms shortened.
 - **Conversions**: `vcvttps2dq` and `vcvtps2dq` are `vcvtfxpntps2dq`
-  with truncation or MXCSR rounding, then every lane not less than 2^31
+  with truncation or with immediate 0 (which this file calls MXCSR
+  rounding and `knc-mvex`'s `conv.rs` calls round to nearest: to be
+  settled against 327364-001, open), then every lane not less than 2^31
   (NaN included) made the integer indefinite 0x80000000, which AVX-512
   produces and the card does not (NaN gives 0, overflow INT_MAX).
   `vcvtph2ps` is the card's float16 up-conversion, from memory through
@@ -98,7 +111,9 @@ What the card cannot do directly, and how each is expressed:
   where an ordered compare holds, which is AVX-512's choice for NaN and
   signed zeros (the card's `vgmaxps` is IEEE maxNum, which differs).
 - **Compare predicates 8 to 31**: the card's eight, with the operands
-  swapped or two compares joined by `kor`.
+  swapped or two compares joined by `kor`; 16 to 23 are 0 to 7 directly,
+  and 11/27 (FALSE) and 15/31 (TRUE) give constant masks. `vpcmpd` and
+  `vpcmpud` with FALSE or TRUE likewise.
 - **Mask instructions the program encodes with VEX** (`kmovw`, `kandw`,
   `korw`, `kxorw`, `knotw`, `kortestw`, `kunpckbw`, `kshiftlw`, ...):
   the host cannot run these either, so the region builder sends them
@@ -117,9 +132,10 @@ What the card cannot do directly, and how each is expressed:
   and `vgetmantps` are the same opcodes.
 - **Scalar conversions with general registers** (`vcvtsi2sd`,
   `vcvtusi2ss`, `vcvttss2si`, ...): integer to float through x87 (`fild`,
-  `fstp`: one rounding of an exact value), float to a 32-bit integer
-  through the card's fixed-point conversion with the indefinite fix-up,
-  float to a 64-bit integer through x87 with the control word set to
+  `fstp`: one rounding of an exact value), float to a signed 32-bit
+  integer through the card's fixed-point conversion with the indefinite
+  fix-up, float to an unsigned 32-bit or a 64-bit integer through x87
+  with the control word set to
   truncate when the instruction truncates; `vcvtss2sd` and `vcvtsd2ss`
   through `vcvtps2pd` and `vcvtpd2ps` in lane 0.
 - **Permutes composed from `vpermd`** (indices are 4 bits) and
@@ -130,16 +146,38 @@ What the card cannot do directly, and how each is expressed:
   (fewer index bits).
 - **A byte or word compare feeding only `kortestq`/`kortestd`**: the
   dword compare, whose result is zero exactly when the byte one is.
+- Also: `vcvtpd2ps` (`cvt_pd2ps`); a broadcast from a vector or general
+  register (`broadcast_reg`); `vpslld`/`vpsrld`/`vpsrad` by an xmm or
+  memory count, as the variable shifts (`shift_by_xmm`); `vmovss`/`vmovsd`;
+  `vmaxss`/`vminss`/`sd`; the unmasked `vmovdqu8`/`vmovdqu16`;
+  `vpternlogq` through the same `ternlog` sequence; `kmov` to or from memory through eax.
+- **The 64-bit and 32-bit mask forms** (`kmovq`/`d`/`b`, `kandq`, `korq`,
+  `kxorq`, `knotq`, `kortestq`, `kshiftlq`/`rq`, ...): computed on the
+  16-bit mask the card has, which is right while no bit above 15 is set
+  (the card's compares never set one); unlisted ones (`kaddw`, `ktestw`,
+  `kunpckwd`, `kunpckdq`) are refused.
 
 Still refused (a reason is returned, and the region builder treats a
 refusal as a region boundary, except at the faulting instruction
 itself, where the program cannot continue): byte and word lane
 arithmetic (`vpmaddwd`, `vpshufb`, `vpaddw`, ...), gathers and scatters,
-embedded rounding on a register operand, `vshufpd` with a different
-selection per block, masked scalar operations with zeroing, byte shifts
-that are not whole dwords, 64-bit masks in general (the card's are 16
-bits), `vrndscale` to fractional bits or with the MXCSR mode, unsigned
-64-bit integer to float.
+AVX512CD, `vshufpd` with a different selection per block, a masked
+scalar minimum, maximum, divide, square root or `vrndscaless`/`sd` (under
+any mask), `vcvtps2ph` with a rounding other than to nearest, a byte or
+word mask on `vmovdqu8`/`16`, byte shifts that are not whole dwords,
+`vrndscale` to fractional bits or with the MXCSR mode, and a sequence
+that would need more temporaries than the 6 scratch slots.
+
+Two refusals are narrower than they should be, known defects, open:
+
+- **Embedded rounding or SAE on a register operand** (`{er}`, `{sae}`) is
+  refused by the generic path and by `scalar_op`, `scalar_cvt` and
+  `divsqrt`, but `special` returns before that check for `cvt_to_int`,
+  `cvt_pd2ps`, `scalef` and `minmax`, which never look at `b`: the
+  rounding override is dropped and `L'L` read as a vector length.
+- **Unsigned 64-bit integer to float** is refused for a register source
+  only; from memory the value is loaded and converted with the signed
+  `fild`, wrong for values of 2^63 and up.
 
 Checked on the card: `tools/avx512-narrow-test.c` (66 forms, each
 against plain C, bit-exact, 2026-09-22) and `tools/avx512-seamless-test.c`

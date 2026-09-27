@@ -26,7 +26,8 @@ only the block's input and output cross.
 ## What the host side does
 
 `plan`, on a block's first sight (keyed by its gate tensor): the types
-must be ones the cards take, the intermediate whole superblocks, and
+must be quantized ones the cards take (Q4_K, Q5_K, Q6_K, Q8_0, IQ4_XS;
+not f32 or f16), the intermediate whole superblocks, and
 down's rows exactly their blocks (the column cut is made at superblock
 boundaries: `row_bytes(type, lo)` into each row). Each card with room
 takes `fraction` of the intermediate in whole superblocks, from the top
@@ -36,13 +37,19 @@ first. A tensor the plain path had already given the cards (a sub-graph
 where the block did not arrive whole) is freed there first
 (`drop_plain`), so the model is held once, and the three tensors are
 remembered as the block's (`Ctx::ffn_members`): the plain path then
-leaves them to the host, because it would want down by rows.
+leaves them to the host, because it would want down by rows. A card's
+room here is counted in raw bytes (`uploaded + bytes > budget`), not in
+the whole pages the plain path counts (`card_cost`), and the per-class
+sizing (`size_shares`, lib.md) does not include fused blocks.
 
 `phi_ggml_ffn_begin`: at a batch each card computes the first
 `pp_share` of its run in whole superblocks and the host the rest of it,
 the same measured share as the plain path (lib.md); the activations go
 into each card's window as float16 when the host can convert
-(`to_f16`), and one `K_FFN` descriptor per card. It returns the host's
+(`to_f16`), prepared once in the first card's window and copied to the
+others (`copy_window`); an input past a half's range (`F16_MAX`) goes as
+float32, and when float32 would not fit the window (`B_MAX`) the block
+is declined (-2). Then one `K_FFN` descriptor per card. It returns the host's
 runs (`phi_ggml_host_range`), or -2 when the cards take no part, which
 the C glue answers by computing the block's four nodes itself.
 
@@ -50,7 +57,8 @@ the C glue answers by computing the block's four nodes itself.
 already holds the host's (the glue computes the host's runs first, or
 zeroes the result when it has none), then the block is judged the way
 the plain path judges a multiply (`FfnSplit::avoid`, per block, at one
-token and at a batch) and, for a batch block, the batch share's estimator
+token and at a batch; `PHI_GGML_JUDGE=0` does not reach this path) and,
+for a batch block, the batch share's estimator
 is fed (`pp_feed`), since the balance it learns is the machine's. The job
 records that as `adapts` (`Judged::adapts` in lib.md, set for the batch
 class): since 2026-09-24 the plain path's mixture multiplies do not teach

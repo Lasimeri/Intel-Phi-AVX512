@@ -3,8 +3,11 @@
 What it costs to execute AVX-512 on a host that has none.
 
 ```sh
-gcc -O3 -march=native -o shadow-cost tools/shadow-cost.c && ./shadow-cost
+gcc -O3 -march=native -o shadow-cost tools/shadow-cost.c && ./shadow-cost [N] [reps]
 ```
+
+`N` elements (default 1048576, rounded down to a multiple of 16) and
+`reps` repetitions (default 20).
 
 The host has no `zmm` registers, so any layer running AVX-512 on its behalf
 keeps the program's 32 vector registers in memory (a shadow register file)

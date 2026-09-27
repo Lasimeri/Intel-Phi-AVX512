@@ -3,16 +3,22 @@
 Generated: `cargo run -p phi-vpu --bin kernelgen > card/vpu/vpu_matmul_kernel.S`
 ([`host/crates/phi-vpu/src/bin/kernelgen/main.md`](../../host/crates/phi-vpu/src/bin/kernelgen/main.md)). Do not edit by hand.
 
-Two functions with the C calling convention, `phi_dot_f16(a, b, k16,
-out)` and `phi_dot_f32(a, b, k16, out)`: the 16 partial sums of
+Four float kernels with the C calling convention. `phi_dot_f16(a, b,
+k16, out)` and `phi_dot_f32(a, b, k16, out)`: the 16 partial sums of
 `a[0..16*k16) . b[0..16*k16)` into `out[16]` (64-byte aligned). Four
 accumulators cover the vector unit's result latency; the loop takes four
 vectors per iteration and a one-vector tail. `a` is 16 halfs per vector
 (the card's `{float16}` up-conversion on the load, which needs 32-byte
 alignment: ggml's tensors have it) or 16 floats at any alignment;
-`b` is 16 floats at any alignment (the unpack pair). The MVEX
+`b` is 16 floats at any alignment (the unpack pair). `phi_dot4_f16(a, b,
+k16, out, nb)` and `phi_dot4_f32` take one weight row against four
+activation rows `nb` bytes apart, 64 sums into `out`. The MVEX
 instructions are bytes from `knc-mvex`; the rest is x86-64 the card
 runs as is.
+
+`phi_copy64(dst, src, count)` copies `count` 64-byte lines with vector
+loads and stores, one transaction a line: the worker's and the service's
+copies through the uncached window (`kernelgen/copy.md`).
 
 ## The quantized kernels and the diagnostics
 

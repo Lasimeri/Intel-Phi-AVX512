@@ -6,6 +6,10 @@ avx512-xlate <input.s> [--name FN] [--out OUT.S]
 
 Assembles an AVX-512 function, rewrites every EVEX instruction into Knights
 Corner MVEX, and writes assembly the card's compiler will accept.
+`--name` is the function's symbol (default `kernel`); without `--out` the
+result goes to stdout. It needs `llvm-mc` on PATH (it assembles the input
+with `-triple=x86_64 -mattr=+avx512f`), and it uses the translation table
+(`translate`, `lib.md`), not the seamless path's rewriter.
 
 ```
 avx512-xlate kernel.avx512.s --name my_kernel --out my_kernel.S
@@ -29,8 +33,9 @@ can *run* is the whole reason this tool exists.
 
 An unaligned AVX-512 load becomes two card instructions, so instruction
 lengths change during the rewrite and every relative branch displacement in
-the original would be wrong. So the tool decodes twice: once to collect the
-address of every branch target, and once to emit, planting a label at each
+the original would be wrong. So the tool decodes once and makes two passes
+over the instructions: one to collect the address of every branch
+target, and one to emit, planting a label at each
 target and emitting branches as text against those labels. The card's
 assembler resolves them.
 

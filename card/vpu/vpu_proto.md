@@ -6,8 +6,8 @@ which one to use for what is a measurement, not a preference:
 
 | path | measured | used for |
 | --- | --- | --- |
-| `/dev/phihost`, mapped, uncached | 2.36 us doorbell round trip (2026-09-22); 11 MB/s reading and 73 MB/s writing a 16 KiB block by `memcpy` (2026-09-23) | control words |
-| `/dev/phiblk1`, DMA block device | 1.2 GB/s at 16 MiB reads, 553 MB/s at 4 MiB, 184 MB/s at 1 MiB (2026-09-22); 109 us reading and 95 us writing 16 KiB, nearly all of it fixed cost (2026-09-23) | bulk data, at every size |
+| `/dev/phihost`, mapped, uncached | 2.36 us doorbell round trip (2026-09-22); 11 MB/s reading and 73 MB/s writing a 16 KiB block by `memcpy` (2026-09-23); 64-byte vector copies split across the pool 2.6 GB/s by 1 MiB (`kernelgen/copy.md`) | control words; and, with the worker's `-m 1` (the default), a matrix multiply's activations and results up to 2 MiB (`MAP_POOL_MAX`) |
+| `/dev/phiblk1`, DMA block device | 1.2 GB/s at 16 MiB reads, 553 MB/s at 4 MiB, 184 MB/s at 1 MiB (2026-09-22); 109 us reading and 95 us writing 16 KiB, nearly all of it fixed cost (2026-09-23) | everything else: uploads, weights streamed from the window, larger transfers, the exec engine's pages |
 
 That the two paths address the same bytes at the same offsets was
 verified with a marker: written by the host at window offset 1 MiB, read
@@ -71,3 +71,12 @@ only) carries the `fs`-relative displacement of the worker's per-thread
 scratch area for the seamless path's sequences (`vpu_exec.h`,
 `VPU_EXEC_SCRATCH`). The worker writes it before `VPU_MAGIC`; a host
 that reads zero refuses to use the worker.
+
+## Request kinds
+
+The request's `kernel` word says what the card does: `VPU_K_POLY30` (1,
+the degree-30 polynomial of the explicit driver) and `VPU_K_EXEC` (2, a
+region of the host program, `vpu_exec.h`) are defined here; 3 to 8 are
+the matrix-multiply service's, in `vpu_matmul.h` (`VPU_K_UPLOAD`,
+`VPU_K_MATMUL`, `VPU_K_FREE`, `VPU_K_MATMUL_ID`, `VPU_K_FFN`,
+`VPU_K_MATMUL_MORE`; `vpu_matmul.md`).

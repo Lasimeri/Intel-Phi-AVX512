@@ -12,7 +12,8 @@
 #   --verbose   report every region the card ran, with its phases and times
 #   --check     say whether this host needs the library at all, and exit
 #
-# The card's worker is started (and deployed) if it is not running.
+# The card's worker is started if it is not running (deployed once first
+# with `scripts/phi-vpu.sh -c N deploy`; this wrapper does not deploy).
 #
 # See phi512.md.
 set -euo pipefail
@@ -82,7 +83,8 @@ if [ -n "$emulate" ]; then
     export PHI512_EMULATE=1
 else
     # The card executes the program's AVX-512: its worker must be polling.
-    # A missing worker is started here, deployed first if the card has none.
+    # A missing worker is started here; one never deployed to this card
+    # needs `scripts/phi-vpu.sh -c N deploy` first, and the start fails.
     driver=""
     for cand in "$root/host/target/release/phi-vpu" "$root/host/target/debug/phi-vpu"; do
         [ -x "$cand" ] && { driver=$cand; break; }

@@ -3,7 +3,8 @@
 Does the emulator agree with the hardware?
 
 ```sh
-scripts/phi512-check.sh            # the built-in conformance programs
+scripts/phi512-check.sh            # the built-in conformance program (tools/avx512-conformance.c)
+scripts/phi512-check.sh tools/avx512-conformance-float.c   # the float one
 scripts/phi512-check.sh my.c       # any C file that prints its results
 ```
 
@@ -24,7 +25,7 @@ AVX-512F, which is the subset the emulator implements. Without them the
 compiler reaches for byte and word instructions that are genuinely not
 covered, and the failure is a gap rather than a disagreement.
 
-## What the two programs cover
+## What the two conformance programs cover
 
 `tools/avx512-conformance.c` runs twelve integer kernels: bitwise and,
 or, xor, add, subtract, multiply, three shifts, a masked select, a

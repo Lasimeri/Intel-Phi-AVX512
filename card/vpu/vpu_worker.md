@@ -33,25 +33,33 @@ the result was a compute time that **grew** with the thread count:
 | 57 | 34.865 ms | |
 | 57 | **0.088 ms** | 2026-09-22, persistent pool, warm |
 
-The pool is created once at start-up. Pool thread `t` is pinned to
-`knc_cpu(t % 57, t / 57)`: core-major, so one thread lands on every core
-before any core gets a second, which is what the two-cycle decoder wants
-(SSDG 328207-002 section 2.1.2). The dispatcher, the thread that polls the
-doorbell, is pinned to CPU 0, which is core 56's last hardware thread, so
-the pool never shares its core until all 227 other hardware threads are
-taken.
+The pool is created once at start-up. Pool thread `t` goes to core
+`t % 57`, on the hardware thread `pool_slot(core, t / 57)` names (a
+core's threads in the order 0, 3, 1, 2, because the block devices'
+pollers were seen on core 55's threads 1 and 2; core 56's in the order
+0, 1, 2, 3): core-major, so one thread lands on every core before any
+core gets a second, which is what the two-cycle decoder wants (SSDG
+328207-002 section 2.1.2). The dispatcher, the thread that polls the
+doorbell, is pinned to CPU 0, which is core 56's thread 3. With 57
+threads or fewer in all (a pool of 56) core 56 has the dispatcher to
+itself; above that, pool thread 56 (CPU 225, core 56's thread 0) shares
+it, as at the default of 114.
 
 Each request is one generation. The dispatcher writes every thread's job
 (a slice of whole 128-element chunks), bumps the generation word, runs
 the last slice itself rather than spinning on a core that has work, and
-waits for the done counter to reach the pool size. Every pool thread
-acknowledges every generation, even one that gave it nothing, so there is
-no per-request bookkeeping of who is expected.
+waits for `pool.done` to reach the number of cores with pool threads
+(`busy_cores`): a core's threads count themselves on a line of the
+core's own (`cores[core]`), and the one that completes the core's count
+reports the core, one locked add on the shared counter a core rather
+than a thread. Every pool thread acknowledges every generation, even one
+that gave it nothing, so there is no per-request bookkeeping of who is
+expected.
 
 ## Waiting without a syscall, and parking without a busy card
 
 A pool thread spins on the generation word for `-s` milliseconds after
-its last job (default 20), then parks in a futex. The spin is what makes
+its last job (default 200), then parks in a futex. The spin is what makes
 a request that follows another cost nothing but a cache-line transfer;
 the park is what keeps 56 cores from burning power while the host is
 doing something else. Measured 2026-09-22, 1048576 elements, 57 threads:
@@ -106,9 +114,11 @@ thread's results are visible before its acknowledgement.
 
 ## Moving the data
 
-Bulk data goes through `/dev/phiblk1`, the DMA path. The matrix
-multiplies' transfers up to 2 MiB do not (below, "Corrected the same
-night"). The worker maps
+Bulk data goes through `/dev/phiblk1`, the DMA path. A multiply's
+activations and results up to 2 MiB (`MAP_POOL_MAX`) do not: they cross
+the mapping (below, "Corrected the same night"); uploads, a weight
+streamed from the window (`a_id` 0) and the SwiGLU and probe
+diagnostics always use the block device. The worker maps
 the whole window as well (`WIN_BYTES`, `vpu_window(off, len)`, which
 returns NULL when the mapping failed and the block device then serves
 everything), and the two were measured against each other at the size a
@@ -131,9 +141,10 @@ flight. The mapping is uncached, so the width of an access is the width
 of its transaction: 64-byte vector stores write 16 KiB in 29 us (557
 MB/s), and the same copy split across the pool, one load in flight per
 core, reads and writes at 2.6 GB/s by 1 MiB, ahead of the block device
-(`kernelgen/copy.md`, `vpu_matmul.md`). The matrix multiplies now move
-everything up to 2 MiB that way; `-m 0` puts them back on the block
-device.
+(`kernelgen/copy.md`, `vpu_matmul.md`). A multiply's activations and
+results up to 2 MiB now go that way (`pull_data`, `push_data`, and the
+pull inside a small request's dispatch); uploads and window-resident
+weights stay on the block device; `-m 0` puts everything back on it.
 
 Two rules follow from opening the block device with `O_DIRECT`, which is
 required because the host changes this memory behind the card's back and
@@ -218,7 +229,9 @@ nothing of its own to them but the timing in the reply.
 ## What a dispatch costs (`-t N`, 2026-09-27)
 
 `-t N` stamps every dispatch through `vpu_pool_map` (the matrix multiplies'
-and their copies; the polynomial's own dispatch is not summed) with the
+and their copies; the polynomial's own dispatch is not summed; sums are
+kept for the first 8 distinct slice functions seen, `TRACE_FNS`, and
+later ones are not traced) with the
 time stamp counter (`rdtsc`;
 its rate is measured against the kernel's clock at start-up and printed):
 when each thread saw the generation, when its slice began and ended, and
@@ -309,3 +322,16 @@ the whole pool, and a core's copies over the link go one at a time
 however many of its threads issue them, so they now take one slice per
 core (`vpu_pool_cores`): 28.4, 25.4 and 20.3 against 25.8, 24.4 and 18.4
 in the next pair of runs. `scripts/phi512.sh` starts its worker at 57.
+
+## What the other card files call
+
+`vpu_exec.c` and `vpu_matmul.c` reach the worker through these
+(declared in `vpu_exec.h` and `vpu_matmul.h`):
+
+| function | what |
+| --- | --- |
+| `vpu_pool_map(fn, arg, nslices)` | run `fn` in `nslices` slices across the pool, the caller's thread the last one, and wait for all |
+| `vpu_pool_threads()` | the pool's threads, the dispatcher not counted |
+| `vpu_pool_cores()` | the most slices with at most one a core: for copies through the uncached window, which go one at a time per core |
+| `vpu_window(off, len)` | a pointer into the mapped window, or NULL when the mapping failed or the range is past it |
+| `vpu_pull(dst, len, off)`, `vpu_push(src, len, off)` | the block device's transfers, window offset to card memory and back |

@@ -1,9 +1,12 @@
 # vpu_matmul.c and vpu_matmul.h: the card as a matrix-multiply engine
 
-The service behind the ggml backend (`host/crates/phi-ggml`): four
+The service behind the ggml backend (`host/crates/phi-ggml`): six
 request kinds on the worker's doorbell, with a descriptor
 (`struct vpu_matmul`, 128 bytes) in the control area at
-`VPU_OFF_MATMUL`.
+`VPU_OFF_MATMUL`: the four below, `VPU_K_FFN` (7, a feed-forward block,
+its own descriptor at `VPU_OFF_FFN`: "A feed-forward block in one
+request") and `VPU_K_MATMUL_MORE` (8, further matrices by the same
+activations at `VPU_OFF_MORE`: "A layer's gate and up in one request").
 
 - `VPU_K_UPLOAD`: the host has put a tensor's rows in the window; the
   card copies them into its own memory (huge pages while it has them,
@@ -16,7 +19,8 @@ request kinds on the worker's doorbell, with a descriptor
 - `VPU_K_MATMUL`: `d[n][m] = a[m][k] . b[n][k]`, ggml's `MUL_MAT`
   (the result transposed, as ggml lays it out). `a` is a resident tensor
   (`a_id`) or, for a tensor the host does not keep, in the window; `b`
-  (float32, n rows) comes through the window every time; `d` (n rows of
+  (n rows, float32, or float16 with `b_type` 1 for the quantized weights)
+  comes through the window every time; `d` (n rows of
   m floats, contiguous) goes back through it. The rows of `a` are split
   across the pool's threads (`vpu_pool_map`).
 - `VPU_K_FREE`: drop a tensor, or all of them.
@@ -32,16 +36,20 @@ reproduces is ggml-quants.c's `dequantize_row_<fmt>`; `phi-vpu
 matmul-check` compares the card with it for every type and row count.
 
 The quantized loop (`rows_slice_q`): the activation rows go in groups
-of 8, 4 or 1 (the kernels' variants), the group outermost; within a
-group the thread's rows go in chunks of 16 and the superblock index is
-the outer loop of the chunk, so the 1 KiB activation block per
-superblock and the chunk's accumulators stay in L1 while the weights
-stream (the kernels prefetch two and four rows ahead; the seventh
-argument carries the stride). With 114 or 228 pool threads the threads
-of one core work on the same chunk at the same superblock, alternating
-rows (`slice_rows`), sharing the activation block in the one L1; in
-practice 57 threads, one per core, is fastest for every shape measured
-(`docs/results/2026-09-23-quantized-kernels.md`). A Q8_0 row whose
+of 8, 4 or 1 (the kernels' variants). The thread's rows go in chunks of
+`ROW_CHUNK` (32) rows; within a chunk each group in turn, and within a
+group the superblock index is the outer loop, so the 1 KiB activation
+block per superblock and the chunk's accumulators stay in L1 while the
+weights stream (the kernels prefetch two and four rows ahead; the
+seventh argument carries the stride). A multiply is cut into at most
+114 slices (`POOL_SLOTS`), two a core: the threads of one core work on
+the same chunk at the same superblock, alternating rows (`slice_rows`),
+or, for a group of eight columns, each taking four of its columns over
+every row, sharing the activation block in the one L1. Measured on
+2026-09-23 one thread a core was faster; with the pool rebuilt on
+2026-09-27 two a core matches or beats it, and 114 is the default
+("Two threads per core, built for" below,
+`docs/results/2026-09-27-two-threads-per-core.md`). A Q8_0 row whose
 length is not a multiple of 256 finishes with a scalar tail.
 
 `VPU_MM_PROBE` (99) is a diagnostic: `phi_probe` writes what the
@@ -63,7 +71,7 @@ buffer unmapped the pool threads' stacks with it.
 
 Limits (the host checks them before offering an op to ggml): a tensor
 slice up to 512 MiB, activations and results up to 64 MiB per multiply,
-4096 resident tensors, k up to 65536 for the quantized formats. The
+4096 resident tensors (nothing bounds k beyond those sizes). The
 card's memory is the limit for residency, about 3.5 GB of weights per
 card beside the worker.
 
@@ -76,7 +84,8 @@ implementations do).
 ## The rows per chunk, and the diagnostics
 
 `ROW_CHUNK` is 32 rows, measured rather than argued: the host can
-override it per request (`reserved[0]`, `phi-vpu matmul-check --chunk`),
+override it per request (the descriptor's `chunk`, `phi-vpu matmul-check
+--chunk`; 0 or anything outside 1 to 64 means 32),
 and at 4096 x 5120 Q4_K the sweep was 0.780, 0.604, 0.570, **0.552**,
 0.605 ms at n 1 for 4, 8, 16, 32 and 64 rows, and 33.6, 31.2, 22.4,
 **20.9**, 20.9 ms at n 64. `ROW_CHUNK_MAX` (64) sizes the accumulator
@@ -104,10 +113,14 @@ columns each name an expert in the int32 array at `b_off` (`ids_bytes`
 of them, the activation rows following), and column `p = j + t *
 n_used` multiplies expert `ids[p]` by b's row `(j % b_rows) + t *
 b_rows`. An id that would read past the slice is refused before any
-thread runs. `rows_slice_id` walks the columns and calls the ordinary
-row slicing for each, so a column is one activation row: right for
-generation, where every column of a token is a different expert; a
-batch's columns are grouped by expert first (below,
+thread runs, as is a mixture whose `n_used`, `b_rows` or `n_tokens` is
+0, whose `n` is not `n_used * n_tokens`, whose `ids_bytes` is not a
+multiple of 64, or whose weights are not resident (`a_id` 0). For float
+weights `rows_slice_id` walks the columns and calls the ordinary row
+slicing for each, a column one activation row. A quantized mixture's
+columns are always grouped by expert, a token's too: by every thread
+for itself up to 512 columns (`OWN_GROUPS_MAX`, `groups_own`), in the
+one shared table above that (`groups_mixture`; below,
 `docs/results/2026-09-23-mixture-of-experts.md`).
 
 ## Grouping a mixture's columns by expert
@@ -341,12 +354,14 @@ The request is checked as the base is, matrix by matrix: resident, a
 quantized type, its shape (`shape_ok` with its own type and row stride),
 for a plain multiply its rows within its slice, for a mixture every id
 within its own slice's count of experts. Then one pull, every matrix a
-`struct job` of its own sharing the activations (their groups one after
-another in the one table, their results each in their own run of card
+`struct job` of its own sharing the activations (their groups built by
+each thread for itself up to 512 columns, `own_groups`, else one after
+another in the one table; their results each in their own run of card
 memory, a line apart), and one dispatch whose slices cut the
 concatenated rows of all of them as one range (`rows_slice_multi`, each
 piece computed and warmed as its own job's rows), and one push per
-result. One thread per core, as everywhere else here. Float weight
+result. The slices are those of any multiply, up to 114, two a core
+(`slice_rows`). Float weight
 types are refused (their path takes one column at a time and uses no
 groups); the host then sends the matrices one at a time.
 
@@ -368,14 +383,19 @@ latency bound, and what stood in its way was fixed cost that grew with
 the thread count:
 
 - **Each thread builds its own groups** for a request of up to
-  `OWN_GROUPS_MAX` (64) columns (`own_groups`, `groups_own`, the same
-  groups `groups_mixture` builds, by a stable insertion sort), where the
+  `OWN_GROUPS_MAX` columns (64 when built, 512 since the same evening,
+  below; `own_groups`, `groups_own`, the same groups `groups_mixture`
+  builds, by a stable insertion sort up to 32 columns and a counting sort
+  above), where the
   dispatcher wrote one table for all: the table's lines had been read by
   every core the request before, so each write first invalidated every
   copy, 12 to 27 us a request (the `-t` stage trace), and then every
   thread read the table from the dispatcher's L2.
 - **A small request's pull rides in its compute dispatch** (`struct
-  fused`): the dispatcher reads the ids itself (one vector load), wakes
+  fused`; a small request is a quantized weight, `n` within
+  `OWN_GROUPS_MAX`, the mapping on, `-m 1`, and ids and activations
+  within `MAP_POOL_MAX`): the dispatcher reads the ids itself (a vector
+  load per 16 ids), wakes
   the pool once, the first cores' threads copy the activations (at least
   `PULL_LINES` lines a core, both threads of it), and every thread builds
   its groups and asks for its weight rows before waiting for the copy
@@ -415,3 +435,12 @@ columns (`OWN_GROUPS_MAX`: a speculative decoder's verification batch of
 region of a buffer the dispatcher sizes for the request (`own_region`),
 with `groups_mixture`'s counting sort past 32 columns
 (`docs/results/2026-09-27-prompt-lookup-llama-server.md`).
+
+## What the worker reaches in here
+
+Besides `vpu_matmul_run` (a request of any of the six kinds), two
+exports serve the worker's options: `vpu_matmul_map_small(on)`, which
+the worker's `-m` sets (activations and results up to 2 MiB through the
+mapping, 1, the default; or all on the block device, 0), and
+`vpu_marks[8]`, the time stamps a request's stages leave (`MARK(i)`: 1
+to 5 here, 0, 6 and 7 the worker's own) for its `-t` trace.

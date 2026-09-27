@@ -23,7 +23,7 @@ after the original.
 
 The exception is the mask register family: `kmovw` and its relatives
 are AVX-512F but **VEX** encoded and four bytes long. No jump fits. They
-keep faulting, counted in `TOO_SHORT` and named under `PHI512_VERBOSE`.
+keep faulting, counted in `TOO_SHORT` (the first three named under `PHI512_VERBOSE`).
 In mask-heavy code they were 99.8 percent of the remaining faults
 (819200 of 821105 in a 16-thread test), which is the cost still on the
 table.
@@ -31,7 +31,13 @@ table.
 ## The trampoline
 
 One copy, hand-assembled at the start of an executable arena mapped
-within jump range of the first faulting site. It pushes the fifteen
+within jump range of the first faulting site: 4096 bytes and 32 a site
+for up to 8192 sites (`MAX_SITES`) of read-write-execute memory, placed
+by trying hints 64 MiB and then 512 MiB either side of the site, then
+anywhere, and checking the reach. If the system refuses such memory,
+nothing is rewritten for the rest of the process (`ARENA_FAILED`); a site
+out of a rel32 jump's reach of its stub, or past the 8192th, stays a
+fault. It pushes the fifteen
 general purpose registers (`push` does not touch the flags), then
 `pushfq`, then makes room and saves `ymm0` to `ymm15`. Every stack
 adjustment before `pushfq` is `lea`, never `sub`, because an AVX-512
@@ -74,13 +80,21 @@ A site that was published and then could not be made writable is marked
 spin for the rest of the process's life. Its instruction is still the
 original and keeps faulting, which is slower and correct.
 
+## When it runs
+
+Only under the emulator (`PHI512_EMULATE`): in card mode a region runs
+whole on the card and no site is rewritten. It is also off with
+`PHI512_NOPATCH`, and when the SIGTRAP handler (which catches a thread
+reaching a site mid-rewrite, `handler.md`) could not be installed.
+
 ## No heap in the handler
 
 The stub builder runs inside the `SIGILL` handler, and the thread that
 faulted may have been inside the allocator holding its lock. Code is
 assembled into a fixed 512-byte buffer (`Code`), the site table and the
 decoded-instruction cache are statics, and the per-thread register file
-is `const`-initialised.
+is `const`-initialised. One exception: under `PHI512_VERBOSE` the message
+naming a too-short site is built with `format!` (`report_short`).
 
 ## What a site costs per execution
 

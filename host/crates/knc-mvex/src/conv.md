@@ -8,14 +8,14 @@ as they load, and one float becomes sixteen. That is what makes the
 quantized weight formats of llama.cpp (4-, 5-, 6- and 8-bit integers
 under a float16 scale) workable on the card: the bytes load as floats,
 the nibbles are split with a multiply, a floor and a fused subtract, the
-scales apply as broadcast operands. lib.rs encodes the plain forms only;
+scales apply as broadcast operands. lib.rs encodes the plain forms, plus the float16 load and the no-read stores;
 this file adds the conversions and the handful of instructions the
 quantized kernels need on top.
 
 | item | what |
 | --- | --- |
-| `Conv` | the SSS values: `Bcast1` (`{1to16}`), `Bcast4`, `F16`, `U8`, `S8`, `U16`, `S16`; the values are Intel's `_MM_UPCONV_*` enumerations, and `F16` reproduces the float16 load lib.rs already had |
-| `Src::MemConv` | a memory source with a conversion, accepted by every three-operand instruction of lib.rs (`arith`, `arith_ps`) and by the forms here |
+| `Conv` | the SSS values: `None` (000, the plain form, which the load and store here also take), `Bcast1` (`{1to16}`), `Bcast4`, `F16`, `U8`, `S8`, `U16`, `S16`; the values are Intel's `_MM_UPCONV_*` enumerations, and `F16` reproduces the float16 load lib.rs already had |
+| `Src::MemConv` | a memory source with a conversion, honoured by lib.rs's `arith` and `arith_ps` users and by the forms here. Not by `vcmppd`/`vcmpps` or the immediate shifts (`shift_imm`), which take a `Src` but encode it as a plain memory operand, the conversion dropped: a known defect, open |
 | `vmovaps_load_conv`, `vmovdqa32_load_conv` | aligned loads through a conversion, float32 and int32 |
 | `vloadunpacklps_conv`, `vloadunpackhps_conv` | the unaligned pair into float32 lanes through a conversion (D1 / D5; a converted source is aligned only to its element size, so sixteen bytes load from any address) |
 | `vloadunpackld_conv`, `vloadunpackhd_conv` | the same into int32 lanes (D0 / D4): the bytes arrive as integers |
@@ -44,3 +44,8 @@ adjustment is the plain conversion byte for byte), and the SwiGLU built
 on them is checked on the card lane by lane, in float32 and float16,
 including ranges whose partial vectors are masked
 (`host/crates/phi-vpu/src/matmul.rs`, `check_swiglu`).
+
+Refused by panic, since the hardware has no such form: `vloadunpackld_conv`
+and `vloadunpackhd_conv` with a broadcast (`Bcast1`, `Bcast4`), and
+`vmovaps_store_conv` with one (a store has no broadcast). The float32
+pair, `vloadunpacklps_conv` and `vloadunpackhps_conv`, has no such check.

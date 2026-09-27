@@ -2,8 +2,12 @@
 
 The co-processor runs on cards the sibling repository brings up
 (Intel-Phi-3120A: the daemon, the kernel, the boot, the `phi` CLI). The
-scripts here that need it source this file, which finds it. In order, the
-first that exists:
+scripts here that need it source this file, which finds it. In order,
+the first that is set or present is used (3 and 4 are searched only when
+there is no `phi` on PATH); if the one found holds no
+`scripts/phi-env.sh`, the script stops (exit 1) and names the remedies:
+set `PHI_STACK_ROOT`, clone the stack next to this one, or `phi.sh
+install-cli`.
 
 1. `PHI_STACK_ROOT`.
 2. The `phi` command on PATH (a symlink into the stack's `scripts/`, which

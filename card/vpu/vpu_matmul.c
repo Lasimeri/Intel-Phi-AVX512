@@ -537,8 +537,10 @@ static void rows_range_q(const struct job *j, uint64_t i0, uint64_t i1, int mate
              * superblock in L1, goes from 413 to 668 GFLOP/s across the
              * pool) and what stops the loop reaching it is the
              * activation blocks arriving from L2, which the second
-             * thread doubles. The pool is started with one thread per
-             * core for that reason; this path runs only if it is not. */
+             * thread doubles. Since 2026-09-27 the pool runs two threads
+             * a core by default (114), with the fixed costs per request
+             * cut, and this is the path every such group takes
+             * (vpu_matmul.md, "Two threads per core, built for"). */
             int T = g->n, c0 = 0;
             uint64_t r0 = mate, rstep = nmates;
             if (nmates == 2 && T == 8) {

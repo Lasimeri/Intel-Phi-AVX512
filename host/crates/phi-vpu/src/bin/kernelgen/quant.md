@@ -37,8 +37,9 @@ apart (the core is in order, the vector unit's result latency is four
 cycles), and the one-row kernels rotate over four accumulators.
 
 Calling convention (System V): `rdi` the superblock, `rsi` the first
-activation row (256 floats, 64-byte aligned), `rdx` the bytes between
-activation rows, `rcx` a 128-byte scratch (the sixteen scales at 0, the
+activation row (256 floats, 64-byte aligned), `rdx` an array of T
+pointers, one per activation row (entry 0 is `rsi` again), `rcx` a
+128-byte scratch (the sixteen scales at 0, the
 sixteen minuends at 64), `r8` the accumulators (T x 16 floats), `r9` the
 constants (`C_*`: 16, 4, 2, the powers 2^-1..2^-8, the IQ4_XS values, the
 index and shift vectors of the scale decoding, a few integers; the C

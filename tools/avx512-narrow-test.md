@@ -22,7 +22,7 @@ What is covered, in order: 256-bit and 128-bit forms with the upper
 lanes zeroed, merging and zeroing masks, `vinserti64x2` (the
 instruction llama.cpp first died on), extracts to a register and to
 memory, `vpternlogd` (xor-of-three, an arbitrary table, all ones),
-scalar `vaddss`/`vmulss`, `vmovd`/`vmovq` in every direction, float16
+scalar `vaddss`/`vmulss`, `vmovd` eax to xmm, `vmovq` xmm to rax and `vmovq` m64 to xmm, float16
 conversions from 2-byte-aligned memory and from a register and back,
 `vcvttps2dq` with NaN and overflow (the integer indefinite),
 `vcvtdq2ps`, byte and word widening, 64-bit shifts, `valignq` and
@@ -36,8 +36,10 @@ shift by a register count, `vpalignr`, division and square root in
 float and double (Newton-Raphson from the card's estimates: the checks
 demand the correctly rounded result), `vscalefps`, `vrndscaleps`
 (floor) and `vrndscalesd` (truncate), `vgetexpps`, the scalar
-conversions with general registers (signed and unsigned, 32 and 64
-bit, both directions), `vcvtss2sd`, and the permutes composed from
+conversions with general registers (integer to float from eax only:
+`vcvtsi2sd`, `vcvtusi2sd`, `vcvtsi2ss`; float to integer `vcvttss2si` to
+eax and rax and `vcvtsd2si` to rax; no 64-bit source, no unsigned float
+to integer), `vcvtss2sd`, and the permutes composed from
 `vpermd` (`vpermi2ps`, `vpermt2d`, `vpermq` by immediate, a 256-bit
 `vpermd` whose indices use three bits).
 

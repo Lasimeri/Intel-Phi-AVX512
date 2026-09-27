@@ -34,6 +34,7 @@ memory operand in the emulated instruction computes with.
 The `ymm` half of the frame is not a copy of anything: on this host the
 low 256 bits of what the program believes are `zmm` registers are the
 real `ymm` registers. They are read into the emulator's view before the
-instruction and written back after, through the same `sync_in_masked`
-and `sync_out_masked` the fault handler uses, restricted to the
-registers the instruction names.
+instruction and written back after, through `state.rs`'s
+`sync_in_masked` and `sync_out_masked`, restricted to the registers the
+instruction names; these apply the same VEX-zeroing rule the fault
+handler applies in its own `pull_live_registers` (`handler.md`).

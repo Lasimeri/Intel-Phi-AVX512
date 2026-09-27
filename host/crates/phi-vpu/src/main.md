@@ -7,7 +7,14 @@ reply, and reads the answer back.
 ```
 phi-vpu status
 phi-vpu poly --n 1048576 --threads 57 --repeat 5
+phi-vpu matmul-check --threads 114
+phi-vpu -c 1 status                 # card 1
 ```
+
+Two options apply to every command: `-c`/`--card N` (0 to 15; default
+`$PHI_CARD`, else 0), which picks that card's window
+(`/dev/shm/phi-hostmem`, or `phi-hostmem-N`, `cards.md`), and `--window
+PATH`, which names the window file outright.
 
 `poly` evaluates a degree-30 polynomial on the card (the translated
 AVX-512 kernel in `card/examples/avx512_poly.S`) and compares **every
@@ -75,7 +82,7 @@ eight experts (`K_MATMUL_ID`). The rate part times a model-sized shape.
 
 | flag | what it is for |
 | --- | --- |
-| `--threads N` | card threads (57, one per core, is the setting) |
+| `--threads N` | card threads, 1 to 114 (default 57, one a core; 114, two a core, is what the backend uses since 2026-09-27); above 57 the conformance part adds 128-row cases (`matmul.md`) |
 | `--only TYPE` | one weight type |
 | `--m`, `--k` | the rate shape (4096 x 5120) |
 | `--repeat N` | time each rate shape N times and report the best (7): one timed request is not a measurement, since the first after an idle gap pays the pool's wake |

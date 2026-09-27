@@ -24,12 +24,17 @@ $ ./avx512-demo
 calling an AVX-512 kernel on a CPU with no AVX-512...
 Illegal instruction (core dumped)
 
-$ scripts/phi512.sh --verbose ./avx512-demo
+$ scripts/phi512.sh --emulate --verbose ./avx512-demo
 phi512: AVX-512 will be performed in software on this host
 calling an AVX-512 kernel on a CPU with no AVX-512...
 phi512: performed 135168 AVX-512 instructions
 all 65536 lanes bit-identical to AVX-512 hardware
 ```
+
+That transcript is the emulator's (2026-09-21, then the default; today
+`--emulate`). Without `--emulate` the same command runs the kernel on
+card 0 through the seamless path, and `--verbose` prints each region the
+card ran with its phases and times instead (`scripts/phi512.md`).
 
 The comparison is against `poly_expected.bin`, which was produced by
 `fmaf()` on this host's FMA3 hardware, so "bit-identical" means identical

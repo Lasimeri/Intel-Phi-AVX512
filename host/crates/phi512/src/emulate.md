@@ -10,11 +10,14 @@ These are IEEE operations with the same rounding as the hardware, so lane
 by lane in scalar arithmetic gives the same bits as a vector unit would,
 and it is much easier to read and to be sure of.
 
-The performance answer is that this code is not meant to be the fast path.
-The plan is to stop reaching it, by rewriting each call site once its
-translation exists, rather than to make the fallback clever. A vectorised
-fallback would be maybe 6x faster and considerably harder to trust, and it
-would still be 300x off the target.
+The performance answer is that this code is not the fast path. It runs
+only under `PHI512_EMULATE`, the software fallback; the card path
+(`offload.rs`) is what avoids it. Under the emulator a site is reached
+per fault, or, once `patch.rs` has rewritten it, per execution of the
+rewritten site, which still calls `emulate::step` each time (the rewrite
+saves the fault, not the emulation). A vectorised fallback would be
+maybe 6x faster and considerably harder to trust, and it would still be
+300x off the card.
 
 One choice here is not free. The fused multiply-adds use `mul_add`, which
 is a single rounding, because that is what the hardware FMA does. Writing
@@ -48,6 +51,13 @@ what happens to a register's lanes.
 and 256-bit EVEX forms write 16 or 32 bytes and clear the rest of the
 512-bit register. Ignoring that would leave stale data in the upper lanes,
 which the next full-width instruction would then read as if it were real.
+The rule is applied (`dest_width`) in `step`'s arithmetic and in
+`do_move`, `do_ternlog`, `do_blend`, `do_shift`, `do_misc_int` and
+`do_lane_move`. It is not yet in `do_convert` (a fixed 16 or 8 lanes),
+`do_permute` (every lane, the upper ones not cleared), `do_extend`, or
+the insert half of `do_extract_insert` (which copies all 64 bytes of its
+first source): a narrow form of those leaves the upper lanes wrong. A
+known defect, open.
 
 **Masking is merging unless `{z}` is present.** A disabled lane keeps the
 destination's previous value; it is not zero and it is not undefined.
@@ -64,7 +74,10 @@ can do something about it.
 ## Reads no more than the program reads (2026-09-25)
 
 A memory source is read at its own size (`memory_size`: 4 bytes for
-`vbroadcastss m32`, 16 for an xmm form), where every non-broadcast source
+`vbroadcastss m32`, 16 for an xmm form; except `do_extend`, which reads
+the full-width source's bytes, `64 / dw * sw`, whatever the destination
+width, so a narrow `vpmovzx*`/`vpmovsx*` from memory reads past its
+operand: open), where every non-broadcast source
 used to be read as 64 bytes; and a masked load reads only its enabled
 lanes, as the hardware does (a loop's tail up to the end of a mapping).
 Both over-reads faulted inside the SIGILL handler when the program's own
@@ -72,3 +85,28 @@ access ended at a mapping's last byte. The tests put a float at the end of
 a page with an inaccessible page after it; the broadcast test dies with
 SIGSEGV on the old read. The emulator's conformance (`phi512-check.sh`,
 both programs) and the review and seamless tests under `--emulate` pass.
+
+## The other families, and their rules
+
+`step` does the two-source arithmetic, the fused multiply-adds and the
+moves; `step_uncommon` hands the rest to one function per family, each
+with a rule that is easy to get wrong:
+
+| family | function | the rule |
+| --- | --- | --- |
+| mask instructions | `do_mask` | `kortest`/`ktest` set CF and ZF and clear the other four arithmetic flags |
+| compares | `do_compare` | write a mask register without merging; predicates 16 to 31 are 0 to 15 with the other signalling behaviour, folded together |
+| ternary logic | `do_ternlog` | the immediate is the truth table |
+| blends | `do_blend` | the mask selects the source per lane |
+| conversions | `do_convert` | an out-of-range result is the integer indefinite (the lowest integer), not a saturation |
+| shifts | `do_shift` | a count at or above the lane width gives zero, or the sign for an arithmetic shift |
+| permutes | `do_permute` | indices from a register, across the whole register |
+| integer misc | `do_misc_int` | `vpmuldq`/`vpmuludq` read the even lanes |
+| shuffles, unpacks | `do_lane_move` | within each 128-bit group |
+| extract, insert | `do_extract_insert` | a 128- or 256-bit block by immediate |
+| scalar forms | `do_scalar` | the upper lanes come from the first source |
+| extend, narrow | `do_extend` | `vpmov*` widening and narrowing |
+
+And in `step`: `vmaxps`/`vminps` return the second source when either is
+NaN, and when both are zero, which is not IEEE maxNum. `supported` is the
+list of mnemonics all of this covers; `step` is the one entry point.

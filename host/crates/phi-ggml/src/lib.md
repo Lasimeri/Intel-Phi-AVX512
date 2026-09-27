@@ -20,7 +20,15 @@ the weight's shares on first sight; copy the activations into each
 card's window; ring the doorbells; report the host's row ranges through
 `phi_ggml_host_range`), the host's own rows (in C, while the cards
 work), and `phi_ggml_end` (wait for each card's reply, copy its rows
-into the result with the result's row stride). The card's per-call floor
+into the result with the result's row stride). A mixture's are
+`phi_ggml_begin_id` and `phi_ggml_end_id` (which takes the result's
+second stride, `nb_d2`); a layer's gate and up together (below) are
+`phi_ggml_begin_id_pair` and `phi_ggml_end_id_pair`, the host's ranges of
+each through `phi_ggml_host_range_of` (matrix 0 or 1). Around them:
+`phi_ggml_supports`, the shape and window check the glue's `supports_op`
+asks; `phi_ggml_note_weight`, the count of what is offered (below);
+`phi_ggml_open` and `phi_ggml_free_all`; and `phi_ggml_ffn_begin` and
+`phi_ggml_ffn_end` for a fused feed-forward block (`ffn.md`). The card's per-call floor
 (two DMA round trips, about 0.5 ms) hides under the host's part as long
 as the host's part is longer, which for a 27B model it is
 (`docs/results/2026-09-23-quantized-kernels.md`); for a 0.5B model it is
@@ -209,6 +217,12 @@ The card's row stride is `k * 2 + B_PAD` rather than `nb_b + B_PAD`; the
 padding is unchanged and for the same reason (`B_PAD`, the L1 set
 conflict).
 
+A half stops at 65504 (`F16_MAX`). `to_f16` returns the largest
+magnitude it converted, and a multiply with any activation past that
+goes as float32 instead, to every card (none has been rung yet); when
+float32 rows would not fit the activation area (`B_MAX`) it goes to the
+host whole.
+
 ## Feed-forward blocks, fused (ffn.rs)
 
 The backend also takes ggml's SwiGLU (the split form llama.cpp builds,
@@ -267,7 +281,7 @@ accepts (`phi_ggml_note_weight`, from `supports_op`, which the scheduler
 calls for every multiply of a graph before computing any of it) and
 declines outright a weight in a buffer it cannot read as ggml lays it
 out (`weight_readable`), so repacked weights are neither taken nor
-counted. At the first multiply `settle_fraction` sets the share to 97
+counted. Until 2026-09-27, at the first multiply `settle_fraction` set the share to 97
 percent of the smallest budget over that total (3 percent kept back for
 rows rounding up to 64 and for the output matrix, which comes last),
 never more than an equal split between the host and the cards
@@ -402,7 +416,8 @@ CPU each, serving the transfers) is the stack's and is not changed here.
   weight buffer freed.
 - **The budget counts what the card allocates**: each upload in whole
   2 MiB pages with the worker's 64 bytes of slack (`card_cost`), not raw
-  bytes.
+  bytes. The plain path only: the fused feed-forward path (`ffn.rs`)
+  still checks, adds and frees raw bytes.
 - **Each card once**: `PHI_GGML_CARDS=0,0` opens card 0 once.
 - **No card, no device**: when the cards do not open, the registry reports
   no device (ggml-phi.md), and llama.cpp runs on the CPU instead of
@@ -418,8 +433,10 @@ of its input alone: over four identical greedy requests to llama-server
 the judge made 30, 16, 1 and 4 decisions and the text changed with them,
 where the host alone and the offloaded split (neither judges) repeat
 exactly. `PHI_GGML_JUDGE=0` turns the judgement off (the field `judge`;
-the static rules still apply), and with `PHI_GGML_PP_ADAPT=0` nothing
-depends on timing: the same request gives the same output, within a
+the static rules still apply; the fused feed-forward path,
+`PHI_GGML_FFN=1`, judges its blocks regardless), and with
+`PHI_GGML_PP_ADAPT=0` nothing depends on timing: the same request gives
+the same output, within a
 server and across separate runs (compared byte for byte). On the 35B-A3B
 it costs about 5 percent at the prompt
 and at generation with the share set to where the adaptation settles

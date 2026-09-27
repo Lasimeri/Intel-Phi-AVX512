@@ -34,7 +34,7 @@ divided:
 | 0 to 1023 | ordinary | exponents near 1.0, the easy case |
 | 1024 to 2047 | wide range | operands far apart in magnitude, so the add has something to round |
 | 2048 to 3071 | denormal | inputs below the smallest normal, which `MXCSR.DAZ` and `MXCSR.FZ` govern on both machines |
-| 3072 to 4095 | specials | both infinities, a signalling NaN, both zeros, the smallest denormal, the largest finite |
+| 3072 to 4095 | specials | both infinities, a quiet NaN with a payload (0x7fc00001), both zeros, the smallest and the largest denormal, the smallest normal, the largest finite, and 1.0 |
 
 The specials region is the one that would catch a translator that quietly
 substituted an instruction with a different NaN or signed-zero rule, which

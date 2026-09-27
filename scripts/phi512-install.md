@@ -27,7 +27,9 @@ It is not `LD_PRELOAD`. The environment variable is ignored for setuid
 binaries; the file is not. **A fault in a library listed there takes `sudo`
 with it**, and with `sudo` goes the ordinary way of undoing the change.
 
-So the installer does this, in this order:
+So the installer does this, in this order (it installs the release
+build only, building it first, `cargo build --release -p phi512`, when
+`host/target/release/libphi512.so` is absent):
 
 1. Runs `true`, `echo`, `id` and `sudo --version` with the library forced
    in, from its build location, before anything is copied anywhere. A
@@ -35,9 +37,10 @@ So the installer does this, in this order:
 2. Copies the library and the command into place.
 3. Prints what the change is and every way to undo it, and asks.
 4. Keeps any existing `/etc/ld.so.preload` as `.before-phi512`.
-5. Writes the file, then **runs those programs again with the preload
-   live**, which is the check that matters, because step 1 used
-   `LD_PRELOAD` and setuid binaries ignore that.
+5. Writes the file, then **runs programs again with the preload live**
+   (`true`, `id -u` and the setuid `sudo --version`), which is the check
+   that matters, because step 1 used `LD_PRELOAD` and setuid binaries
+   ignore that.
 6. If anything is unhealthy, removes the entry immediately and reports,
    rather than leaving a broken system behind.
 

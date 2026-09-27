@@ -13,10 +13,14 @@ phi-pld -m MODEL simulate prompt.txt out.json   # the drafting options priced wi
 
 Under `scripts/phi-ggml.sh` the model's weight multiplies go to the
 cards as llama-server's do (`GGML_BACKEND_PATH`); without it the host
-does everything. The options are llama-server's where they match (`-t`,
-`-c`, `--batch`, `--ubatch`, `--repack`, which is off by default as the
-cards want), `--rs-seq`, the recurrent-state snapshots (0, `llm.md`), then
-the drafter's:
+does everything. The options are llama-server's where they match: `-m`
+(or `PHI_PLD_MODEL`), `-t` (12), `-c` (8192), `--batch` and `--ubatch`
+(512), `--repack` (off, as the cards want), `-v` (llama.cpp's own log);
+then `--rs-seq`, the recurrent-state snapshots (0, `llm.md`),
+`--backend-dir` (or `PHI_PLD_BACKEND_DIR`: where the CPU backend
+variants are, default the llama.cpp build it was linked against), `-n`
+(400 tokens at most, unless a request's `n_predict` or `max_tokens`
+says), `serve --bind` (127.0.0.1:8098), and the drafter's:
 
 | option | default | the original's |
 | --- | --- | --- |
@@ -40,11 +44,18 @@ explained), so for a request with a long prompt it can be slower as a
 whole even where its generation is faster
 ([the code generation record](../../../../docs/results/2026-09-27-code-generation-q8.md)).
 
-`verify-cost` decodes the prompt, then times a decode of 1 + k tokens
-with every row's choice read, for each k (`--ks`, default
-0,1,2,4,8,16,32,48), taking it back each time, and the checkpoint's save
-and the take-back: the cost curve a drafter's length has to be chosen
-against.
+`verify-cost` decodes the prompt but its last 64 tokens (the prompt must
+be longer), then times a decode of 1 + k of those tokens with every
+row's choice read, for each k (`--ks`, default 0,1,2,4,8,16,32,48; the
+median of `--reps`, 5), taking it back each time, and the checkpoint's
+save and the take-back: the cost curve a drafter's length has to be
+chosen against.
+
+`margin PROMPT TOKENS --at N` (hidden) decodes the prompt and the
+tokens (a JSON array, a run's output) one at a time up to position N, as
+plain generation does, and prints the five likeliest next tokens with
+their logits: whether two runs that part at N part at a near tie
+(rounding) or at a clear lead (a fault).
 
 `simulate` takes the rendered prompt and the tokens the model generated
 after it with drafting off (a JSON array, llama-server's `/completion`

@@ -9,7 +9,9 @@ re-assert it (a dead worker's stale word would otherwise satisfy a plain
 check); `submit` rings the doorbell and waits for the echoed sequence
 number. Moved out of `main.rs` on 2026-09-22 so that `libphi512`'s
 seamless path (`phi512/src/offload.rs`) uses the same code as the
-explicit driver. `Window` is `Send` (one sits behind a mutex there);
+explicit driver; `libggml_phi.so` (`host/crates/phi-ggml`) maps each
+card's window with it too (`Window`, `wait_ready`, `ptr`). `Window` is
+`Send` (one sits behind a mutex there);
 the pointer is to shared memory and every access through it is volatile
 or a plain copy.
 

@@ -7,9 +7,14 @@ per element against one load and one store.
 ```
 host/target/debug/avx512-xlate card/examples/avx512_poly.avx512.s \
     --name poly_kernel_x8 --out card/examples/avx512_poly.S
+tcc -o gen tools/gen-avx512-vectors.c -lm && ./gen            # on the host: coef.bin, x.bin, poly_expected.bin
+# copy the .bin files, the .c and the .S to the card, then
 cc -O2 -o avx512_poly avx512_poly.c avx512_poly.S -lpthread   # on the card
 ./avx512_poly 2097152 200
 ```
+
+The harness reads `coef.bin`, `x.bin` and `poly_expected.bin` from its
+working directory and stops without them.
 
 264 EVEX instructions translate, 7 scalar pass through. The harness checks
 the card's output against the host's FMA3 reference before it times

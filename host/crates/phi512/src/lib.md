@@ -60,8 +60,17 @@ twice and produce different bits from the hardware.
 - The imaginary register file is per thread, which is right, but it starts
   zeroed in each thread rather than being inherited, which matches how a
   thread's vector state actually begins.
-- The emulator's instruction table is a useful subset of AVX-512F, not
-  all of it; `emulate::supported` is the list. The mask-register
+- On a processor that has AVX-512 (CPUID leaf 7, EBX bit 16) the library
+  installs nothing, as with `PHI512_DISABLE`: the instructions run on the
+  processor.
+- An instruction is taken as AVX-512 by the processor feature it
+  requires (`is_avx512`: F, VL, BW, DQ, CD, VBMI, VNNI, IFMA, BF16,
+  FP16), not by its encoding, which is how the VEX-encoded mask
+  instructions (`kmovw` and the rest) are caught.
+- The emulator's instruction table is a subset of AVX-512F, VL and DQ
+  plus the BW mask instructions (`kmovd`, `kmovq`, `kunpckwd`,
+  `kortestd` and the like), not all of it; `emulate::supported` is the
+  list. The mask-register
   instructions (`kmov` and friends) are in it; gather and scatter are not,
   in the emulator or on the card.
 - The card path runs what `avx512-xlate`'s rewriter accepts
@@ -84,7 +93,7 @@ twice and produce different bits from the hardware.
 | `PHI512_CARD=N` | the card to use, default 0 (`scripts/phi512.sh --card`) |
 | `PHI512_EMULATE` | the software emulator instead of the card (`--emulate`) |
 | `PHI512_VERBOSE` | each region the card ran, its phases and times; the emulator's counts (`--verbose`) |
-| `PHI512_TRACE` | the emulator prints every instruction as it performs it |
+| `PHI512_TRACE` | the emulator prints each instruction it performs from a fault; with patching on that is each site's first execution only (`PHI512_NOPATCH` too, to see every one) |
 | `PHI512_TRACE_REGS` | the card path prints each fetch and the general registers a region changed |
 | `PHI512_NOPATCH` | the emulator leaves faulting sites unpatched (every execution faults) |
 

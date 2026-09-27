@@ -11,7 +11,7 @@ Mechanical-Jev), line for line apart from `code_dirs`, the places that hold code
    `vendor/` and `tokenizers/` are skipped. A `code_dirs` entry that does
    not exist is itself an error: `toolchain`, which left with the split,
    was skipped silently for two days.
-2. **No em or en dashes** (U+2014, U+2013) in any tracked file. Uses
+2. **No em or en dashes** (U+2014, U+2013) in every file git tracks or would track (untracked and not ignored; outside a git checkout, every file). Uses
    `grep -P` with Unicode escapes, so it needs GNU grep with PCRE, which
    Arch's `grep` package provides.
 3. **Relative links resolve.** Every Markdown link target that is a
