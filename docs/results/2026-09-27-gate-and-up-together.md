@@ -101,3 +101,30 @@ verbose lines on):
 | of which the gate and up pairs | 16.2 (24.0 as 79 requests) |
 | 345 multiplies on the host alone | 31.2 |
 | everything else llama.cpp does | about 19 |
+
+## What Intel-Phi-Jev sees
+
+The same day's three changes (the card worker's, the per-class share,
+this pair) against the session's start, on Intel-Phi-Jev's own workload:
+its subproject 03's cards half, `xks --site cards eval
+examples/dev_tasks.jsonl --limit 10 --rows ...` (the 35B-A3B offloaded,
+lazy pages, 30 questions over 10 sessions), the worker binary on both
+cards and the backend library in this checkout's release build swapped
+between runs, interleaved:
+
+| stack | wall | host peak | accuracy | question latency p50, p95 |
+| --- | --- | --- | --- | --- |
+| the session's start | 102.4 s | 12.14 GiB | 0.800 | 1.74, 5.24 s |
+| all three changes | 96.4 s | 12.36 GiB | 0.833 | 1.55, 5.45 s |
+| the session's start | 106.7 s | 12.11 GiB | 0.800 | 1.75, 5.78 s |
+| all three changes | 120.2 s | 12.34 GiB | 0.833 | 1.66, 9.77 s |
+
+The median question is about 9 percent quicker; the wall time is within
+this host's spread (the last row's tail, one question at 9.8 s, is the
+largest single difference); the peak is 0.2 GiB higher, the host holding
+more of the experts. The gain is small because xks's time is not
+one-token generation: it is the load, a prefill per session, and fifteen
+forks decoded together as a batch, where a card request's fixed cost is
+a small part of its time. The accuracy differs by one question in 30
+(rows move between the host and the cards, which round differently;
+0.833 is also what the host alone scored in the 2026-09-26 record).
