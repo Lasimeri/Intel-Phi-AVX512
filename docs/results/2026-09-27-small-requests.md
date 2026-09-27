@@ -116,6 +116,11 @@ variable of the same value.
 - The cards did the work: in the profiled request, 118 multiplies a
   token went to both cards and the host read none of their rows ("the
   cards' rows read by the host so far 0.0 MB").
+- The seamless path shares the pool: `tools/avx512-seamless-test.c` under
+  `scripts/phi512.sh` passes lane for lane at 65536, 1M and 16M elements
+  (polynomial 12.9, 22.8 and 248 ms; dot 5.4, 24.2 and 325; integers 7.4,
+  18.1 and 269, within the README's ranges), and `scripts/phi512-ground.sh`
+  agrees to the bit.
 
 ## What a token costs now
 
