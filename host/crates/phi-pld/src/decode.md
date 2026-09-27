@@ -47,7 +47,7 @@ first; the length `k_max` always (`adapt` off, the original's), or with
 whole, cut to what was accepted plus one after a rejection. On a mixture
 of experts a verified token is not free (each brings about eight experts'
 weights into the batch), so a rejected draft costs. The defaults (`main.md`)
-are the simulator's best on three prompts with the cards' measured cost:
+are the simulator's best on three prompts with the cards' measured cost (the Q4_K_M's; the Q8_0 is not measured yet):
 3 to 12 tokens of match, 2 to 64 of draft, adapting. The original's
 1-token matches are what lose there: on a free answer 1224 tokens drafted
 after 1-grams, 15 accepted.

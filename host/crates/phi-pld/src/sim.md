@@ -29,7 +29,7 @@ generation, one single-token decode per token.
 every row's choice read, linear between measured points and past the
 last; a checkpoint; a restore. `Cost::measured` is the 35B-A3B Q4_K_M
 offloaded to both cards at `-t 12` with no snapshots (`phi-pld
-verify-cost`, [the record](../../../../docs/results/2026-09-27-phi-pld.md)).
+verify-cost`, [the record](../../../../docs/results/2026-09-27-phi-pld.md)); the Q8_0's, the model for speed with the cards, is not measured yet.
 The prompt's own decodes are not priced: only generation is compared.
 
 What the model ignores: the batched kernels' rounding (a draft can move a

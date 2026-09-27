@@ -28,7 +28,17 @@ the drafter's:
 | `--fold-max` (`decode.md`) | 8 | |
 
 The defaults are the simulator's best on three prompts with the cards'
-measured cost ([the record](../../../../docs/results/2026-09-27-phi-pld.md)).
+measured cost ([the record](../../../../docs/results/2026-09-27-phi-pld.md)):
+the Q4_K_M's cost. The Q8_0, the model for speed with the cards, is not
+yet measured here, and its costs differ, so the defaults may move.
+
+Two things to know before quoting a rate. The timings' generation rate
+(`predicted_per_second`) is the generation phase alone; a long prompt's
+time comes on top. And phi-pld reads a prompt 25 to 40 percent slower
+than llama-server does (65 to 72 s against 52 s for 2385 tokens, not yet
+explained), so for a request with a long prompt it can be slower as a
+whole even where its generation is faster
+([the code generation record](../../../../docs/results/2026-09-27-code-generation-q8.md)).
 
 `verify-cost` decodes the prompt, then times a decode of 1 + k tokens
 with every row's choice read, for each k (`--ks`, default

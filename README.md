@@ -87,6 +87,21 @@ behind `--emulate`.
 
 ## The cards as GPUs for AVX-512, beside the CPU: the ggml backend
 
+**Speed at a glance** (Qwen3.8-35B-A3B, both cards, llama.cpp unchanged;
+the Q8_0, 37.8 GB and larger than this host's memory, is the model for
+every speed figure with the cards, the Q4_K_M the one for correctness
+and for comparison):
+
+| what | tokens per second | record |
+| --- | --- | --- |
+| writing code from a description, Q8_0 offloaded | **about 8** (8.04, 8.08) | `docs/results/2026-09-27-code-generation-q8.md` |
+| the same with a 2B draft model | 4.63, 4.82: slower, not used | same |
+| copying code from the prompt with prompt lookup, Q4_K_M, generation phase only | about 40 (whole request 6.5 with the 2385-token prompt) | same, and `2026-09-27-prompt-lookup-llama-server.md` |
+| Q8_0 offloaded, prompt | 72 (57.8 before the two-threads pool) | `docs/results/2026-09-27-two-threads-per-core.md` |
+
+A generation rate here is llama.cpp's `predicted_per_second`: the
+generation phase, the prompt's time not in it.
+
 The instruction-level path above is exact but pays a fixed cost per
 region, and a program like llama.cpp has millions of tiny regions per
 token (`docs/results/2026-09-22-full-avx512.md`). For it the cards are
