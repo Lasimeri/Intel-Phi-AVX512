@@ -88,13 +88,14 @@ behind `--emulate`.
 ## The cards as GPUs for AVX-512, beside the CPU: the ggml backend
 
 **Speed at a glance** (Qwen3.8-35B-A3B, both cards, llama.cpp unchanged;
-the Q8_0, 37.8 GB and larger than this host's memory, is the model for
-every speed figure with the cards, the Q4_K_M the one for correctness
-and for comparison):
+the Q6_K, 29.2 GB, offloaded so that it fits this host's memory and the
+cards without the disk, is the model for every speed figure with the
+cards, the Q4_K_M the one for correctness and for comparison):
 
 | what | tokens per second | record |
 | --- | --- | --- |
-| writing code from a description, Q8_0 offloaded | **about 8** (8.04, 8.08) | `docs/results/2026-09-27-code-generation-q8.md` |
+| **writing code from a description, Q6_K offloaded** | **9.5 to 9.8** (client's clock 9.76, 9.50; nothing from disk; the program compiles and matches gzip's CRC-32 on 312 inputs up to 2.08 GB) | `docs/results/2026-09-27-code-generation-q8.md` |
+| the same, Q8_0 offloaded (37.8 GB, past the host's memory) | about 8 (8.04, 8.08) | same |
 | the same with a 2B draft model | 4.63, 4.82: slower, not used | same |
 | copying code from the prompt with prompt lookup, Q4_K_M, generation phase only | about 40 (whole request 6.5 with the 2385-token prompt) | same, and `2026-09-27-prompt-lookup-llama-server.md` |
 | Q8_0 offloaded, prompt | 72 (57.8 before the two-threads pool) | `docs/results/2026-09-27-two-threads-per-core.md` |

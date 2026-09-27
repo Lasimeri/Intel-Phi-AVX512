@@ -1,10 +1,13 @@
-# 2026-09-27: what code generation runs at, the 35B-A3B Q8_0 on the cards
+# 2026-09-27: what code generation runs at, the 35B-A3B Q6_K and Q8_0 on the cards
 
 **Read this before any tokens-per-second figure of prompt lookup
 decoding in this repository.**
 
-- **Writing code from a description, Qwen3.8-35B-A3B Q8_0 offloaded to
-  both cards: about 8 tokens per second** (8.04 and 8.08, below).
+- **Writing code from a description, Qwen3.8-35B-A3B Q6_K offloaded to
+  both cards: 9.5 to 9.8 tokens per second**, nothing read from disk, the
+  program complete and correct (next section). The Q6_K (29.2 GB) fits
+  this host's memory and the cards together; the Q8_0 (37.8 GB) does not,
+  and runs at about 8 (8.04 and 8.08).
 - The 30 to 42 tokens per second of the two prompt lookup records of the
   same day (`2026-09-27-prompt-lookup-llama-server.md`,
   `2026-09-27-phi-pld.md`) are **not code generation**. They are a *copy*
@@ -14,10 +17,48 @@ decoding in this repository.**
 - A **2B draft model makes generation slower** here (4.63 and 4.82
   against 8.04 and 8.08). It is not used.
 
-The project's model roles, from the same day on: the Q8_0 (37.8 GB,
-larger than this host's 31 GiB) is the model for every speed figure with
-the cards; the Q4_K_M is for correctness against the host alone and as
-the smaller model to compare with.
+The project's model roles, from the same day on: the Q6_K, offloaded so
+that it fits the host's memory and the cards without the disk, is the
+model for every speed figure with the cards (the Q8_0 was, earlier the
+same day, and needs the disk); the Q4_K_M is for correctness against the
+host alone and as the smaller model to compare with.
+
+## Code generation, Q6_K, both cards
+
+The same host, cards, llama.cpp and server options as the Q8_0 section
+below, the model Qwen3.8-35B-A3B Q6_K (29.2 GB); the backend's plan:
+"1.7 GB of dense weights and 26.4 GB of experts offered to the cards:
+each keeps 33.3% of every dense matrix's rows and 12.5% of the experts'
+..., 4.40 GB". The same request rendered with the model's template
+(`/apply-template`, reasoning off, 59 tokens) sent to `/completion`,
+greedy, up to 1024 tokens, `cache_prompt` false; one warm-up, then one
+request of a single token and two full ones, each timed by the client
+(curl's `time_total`). The client's rate is (tokens - 1) over the full
+request's time less the single token's (the prompt and the first token),
+independent of the server's timings; the server's is its
+`predicted_per_second`. Disk reads and major faults are the server
+process's own (`/proc/PID/io` `read_bytes`, `/proc/PID/stat`) across each
+request.
+
+| run | tokens | client's clock | server's | disk read | major faults |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 500 (the model's own end) | **9.76** | 9.77 | 0 MB | 10 |
+| 2 | 500 (the model's own end) | **9.50** | 9.50 | 0 MB | 3 |
+
+- The two clocks agree to 0.01 tokens per second.
+- Nothing came from disk: the host held 17.8 GiB resident, 21.9 GiB
+  still available with the model loaded.
+- The same text both runs. The program compiles (tcc, 62 lines) and is
+  right on 312 inputs, each against the CRC-32 gzip stores for the same
+  bytes (`gzip -1`, the trailer's first four bytes), none different:
+  random bytes of every length from 0 to 300 (every tail a byte loop can
+  leave), 4095, 4096, 4097, 8191, 8192, 8193 and 12289 bytes (either side
+  of its 4096-byte read buffer, once and twice over), 1,000,003 bytes;
+  the 256 byte values 64 times over; 100 MB of random bytes; and a 2.08 GB
+  model file (Qwen3.8-2B-Q8_0.gguf). Also "123456789" gives CBF43926, the
+  standard check value, and without an argument it prints its usage and
+  exits 1.
+- No draft model, no prompt lookup: the model writing new code alone.
 
 ## Code generation, Q8_0, both cards
 
