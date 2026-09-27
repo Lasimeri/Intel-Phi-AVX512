@@ -213,10 +213,13 @@ and generates at 8.3 against 7.8, the text unchanged
 (`docs/results/2026-09-27-two-threads-per-core.md`).
 
 Prompt lookup decoding (a draft copied from earlier in the context,
-verified by the model in one batch) adds to that where the output repeats
-its input. llama-server's own n-gram drafters with the cards make a
-copy-heavy code edit 4.6 times faster, but on a mixture of experts a
-rejected draft costs a pass, so they lose where drafts are loose
+verified by the model in one batch) helps only where the output repeats
+its input. On a copy task (177 lines of Rust rewritten with one rename),
+Q4_K_M with the cards, llama-server's own n-gram drafters take the
+generation phase from 9.4 to about 40 tokens per second, but that phase
+is not the whole request: the 2385-token prompt takes another 52 s, so
+the request as a whole goes from 4.2 to 6.5 tokens per second. On a
+mixture of experts a rejected draft costs a pass, so loose drafts lose
 (`docs/results/2026-09-27-prompt-lookup-llama-server.md`). `phi-pld`
 (`host/crates/phi-pld`) is this repository's own engine over libllama,
 llama.cpp unchanged: the drafter of Apoorv Saxena's prompt lookup
@@ -224,11 +227,14 @@ decoding on flat hash tables as Hayder Tirmazi's post describes, a
 rollback that checkpoints the hybrid model's recurrent state and carries
 the kept tokens into the next batch instead of decoding them again, and
 options chosen by a simulator that runs the engine against the model's
-own output. On the 35B-A3B with the cards it matches llama-server's best
-on the code edit (about 40 tokens per second against 9.4), is **1.32
-times plain and 43 percent past llama-server's best** on an extraction
-(13.1), and is 3 percent under plain on a free answer, where
-llama-server's drafters draft nothing (`docs/results/2026-09-27-phi-pld.md`).
+own output. Its generation phase matches llama-server's on the copy
+(about 40), is 1.32 times plain on an extraction (13.1, 43 percent past
+llama-server's best) and 3 percent under plain on a free answer; but it
+reads prompts 25 to 40 percent slower than llama-server (not yet
+explained), so whole requests with long prompts are slower with it
+(`docs/results/2026-09-27-phi-pld.md`). These figures are the Q4_K_M; the
+Q8_0, the model for speed with the cards, is still to be measured with
+prompt lookup.
 
 A model larger than this host's 31 GiB runs from its file, the page
 cache holding what it can. By default the cards' rows are a copy, so

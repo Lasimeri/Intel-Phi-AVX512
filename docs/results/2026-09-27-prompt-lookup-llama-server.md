@@ -1,5 +1,13 @@
 # 2026-09-27: prompt lookup decoding with llama-server's own drafters, on the cards
 
+> **Read first.** The tokens per second here are of prompt lookup on a
+> *copy* task (177 lines of Rust rewritten with one rename), measured on
+> the **Q4_K_M**, and count the **generation phase only**; the 2385-token
+> prompt took another 52 to 72 s, so the whole requests ran at 4.2 to 6.5
+> tokens per second. **Writing code from a description runs at about 8
+> tokens per second** (the Q8_0 on both cards), and a 2B draft model
+> makes that slower: `2026-09-27-code-generation-q8.md`.
+
 Host: Ryzen 7 5800X, 31 GiB, kernel 7.2.6-1-cachyos, both cards up
 (workers at 114 threads, `2026-09-27-two-threads-per-core.md`). llama.cpp
 `build-native` at f5b9bd3, unchanged: prompt lookup decoding (Apoorv
