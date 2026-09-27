@@ -254,7 +254,7 @@ mapping of the window instead, in whole 64-byte vectors
 | --- | --- |
 | a pull of 4 KiB or less | one thread's 64-byte loads |
 | a push of 16 KiB or less | one thread's 64-byte stores (29 us for 16 KiB) |
-| either, up to 2 MiB | split across the pool (`copy_pool`): one load in flight per core, 2.6 GB/s at 1 MiB on card 0 |
+| either, up to 2 MiB | split across the pool (`copy_pool`): one load in flight per core, 2.6 GB/s at 1 MiB on card 0; a pull gives each thread at least 32 lines (`PULL_LINES`, below) |
 | larger | the block device, whose DMA catches up by 4 MiB |
 
 The thresholds are the probe's crossovers, on both cards
@@ -272,3 +272,55 @@ A mixture's expert ids are checked once before any thread runs, negative
 ones included (2026-09-24): the quantized path counts columns by id, and
 an id of -1 would have written before its buffer instead of failing the
 request.
+
+## One token's multiply, and whose lines the pool reads (2026-09-27)
+
+A mixture of experts at generation is many small requests: on
+Qwen3.8-35B-A3B offloaded, about 120 a token, each a card's share of
+eight experts (128 of 512 rows against k 2048 for gate and up, 448 of
+2048 against k 512 for down). Each took 0.6 to 1.3 ms of the card's
+compute where its arithmetic is some tens of microseconds, and the pool
+trace (`vpu_worker.md`, "What a dispatch costs") put all of it in the
+slices, every one of them slow, not in the dispatch. `phi-vpu
+matmul-check --moe` reproduces the request with cold weights (8 of 256
+experts at random, over four resident tensors), and it narrowed the
+cause in three steps, all on card 0:
+
+| gate/up request, one token | compute, median | host round trip, median |
+| --- | --- | --- |
+| as it was | 1.13 ms | 1.31 ms |
+| slices warmed (below) | 1.00 | 1.19 |
+| and the pull at 32 lines a thread or more | 0.14 | 0.36 |
+| and without the per-request log line (`vpu_worker.md`) | 0.14 | 0.28 |
+
+- **Cold lines.** The down request improved at once when each thread
+  asked for its whole working set before computing (`warm_slice`: its
+  rows of every matrix its groups use, the group table and the
+  activation rows, with `vprefetch1`, only when all of it is under
+  `WARM_MAX`, 192 KiB). An in-order core otherwise meets each cold line
+  alone; asked together, the misses overlap. Down went from 0.47 to 0.13
+  ms. The table and the activation rows are the same lines for every
+  thread, so each thread starts on a different line of them.
+- **The activations' writers.** Gate and up barely moved, and the
+  difference between them and down is that all eight experts read one
+  activation row. On one thread the shared row and eight separate rows
+  cost the same (2.9 ms); on 57, the shared row took 1.0 ms and eight
+  rows 0.18. At k 1024 the shared row was fast too, and that row is
+  pulled by one thread (`PULL_ONE_MAX`, 4 KiB); at k 2048 it is 4.4 KB
+  and was split across the pool, a line or two per core. Pulled by one
+  thread instead, the same request took 0.14 ms. So a block of lines
+  written one or two per core and then read by every core is slow on
+  this card, and the same block written by one core, or ten lines a
+  core, is not. Why, in the ring's protocol, is not established; the
+  measurement is what the rule rests on. A pooled pull now gives each
+  thread at least `PULL_LINES` (32) lines, which keeps the pull's link
+  round trips overlapped and the lines' owners few (the sweep is in the
+  constant's comment).
+- **False sharing of the results** was tested and is not it: every
+  thread writing its results to lines of its own changed 1.0 ms to 0.94.
+
+Every format, mixture and feed-forward case of `matmul-check` passes
+on both cards after the change, and the text a 35B-A3B generates is the
+same byte for byte with the old worker and the new
+(`docs/results/2026-09-27-small-requests.md`, which has the end-to-end
+numbers).

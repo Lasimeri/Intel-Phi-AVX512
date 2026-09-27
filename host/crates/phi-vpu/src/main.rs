@@ -85,6 +85,15 @@ enum Cmd {
         /// Diagnostic: print what the kernels' instructions produce on the card.
         #[arg(long)]
         probe: bool,
+        /// Only the one-token mixture rate: 8 of 256 experts at random, cold
+        /// weights, the card's compute and the host's round trip.
+        #[arg(long)]
+        moe: bool,
+        /// With --moe: a shape to time instead of the default two, as
+        /// M,K,ROWS (expert rows the card holds, weights per row, activation
+        /// rows: 1 for a gate or up projection, 8 for a down one). Repeatable.
+        #[arg(long = "moe-shape", value_parser = moe_shape)]
+        moe_shapes: Vec<(u64, u64, u64)>,
         /// The activations the cards are sent: 0 float32, 1 float16,
         /// which their memory operands up-convert for nothing.
         #[arg(long, default_value_t = 0)]
@@ -107,6 +116,18 @@ enum Cmd {
         #[arg(long, default_value_t = 7)]
         repeat: u32,
     },
+}
+
+/// `--moe-shape M,K,ROWS`.
+fn moe_shape(s: &str) -> Result<(u64, u64, u64), String> {
+    let v: Vec<u64> = s
+        .split(',')
+        .map(|x| x.trim().parse::<u64>().map_err(|e| format!("{x}: {e}")))
+        .collect::<Result<_, _>>()?;
+    match v.as_slice() {
+        [m, k, rows] if *m > 0 && *k > 0 && *k % 256 == 0 && (1..=8).contains(rows) => Ok((*m, *k, *rows)),
+        _ => Err("M,K,ROWS: rows M > 0, weights per row K a multiple of 256, activation rows 1 to 8".into()),
+    }
 }
 
 const DEG: usize = 30;
@@ -257,6 +278,8 @@ fn main() -> Result<()> {
             only,
             pattern,
             probe,
+            moe,
+            moe_shapes,
             repeat,
             chunk,
             m,
@@ -268,6 +291,9 @@ fn main() -> Result<()> {
             wait_ready(&w, Duration::from_secs(5))?;
             if probe {
                 return phi_vpu::matmul::probe(&w, threads);
+            }
+            if moe {
+                return phi_vpu::matmul::moe_check(&w, threads, only.as_deref(), repeat, act, &moe_shapes);
             }
             phi_vpu::matmul::check(&w, threads, only.as_deref(), pattern, repeat, chunk, (m, k), pad, act)
         }

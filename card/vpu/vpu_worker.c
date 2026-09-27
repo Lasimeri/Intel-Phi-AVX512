@@ -78,6 +78,21 @@ static long idle_us = 500;               /* doorbell poll interval once idle; -i
 
 static int verbose;
 
+/* -t: the pool's own timings, per dispatch, from the time stamp counter:
+ * how long the slowest thread took to see the generation, how long the
+ * longest slice ran, and how long the dispatcher took to see the last
+ * one finish. Summed per slice function and printed every N
+ * dispatches (-t N), so the tracing itself costs one line per N. */
+static int trace, trace_every = 1000;
+static inline uint64_t tsc(void)
+{
+    uint32_t lo, hi;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+struct stamp { volatile uint64_t start, end; } __attribute__((aligned(64)));
+static double tsc_per_us = 1100.0;
+
 static uint64_t now_ns(void)
 {
     struct timespec t;
@@ -138,6 +153,53 @@ static struct {
     volatile uint32_t parked;   /* pool threads asleep in the kernel */
 } pool;
 
+/* -t: each thread's start and end of the current generation, on lines of
+ * their own; the sums per slice function (a handful: the kernels, the
+ * copies). */
+static struct stamp stamps[MAX_POOL + 1];
+#define TRACE_FNS 8
+static struct {
+    void (*fn)(void *, int, int);
+    uint64_t n, see_last, run_max, run_disp, tail, total;
+    uint32_t late[MAX_POOL + 1];   /* how often each thread was the last to see the generation */
+} tr[TRACE_FNS];
+
+static void trace_note(void (*fn)(void *, int, int), int nslices, uint64_t t0, uint64_t t1)
+{
+    int f = 0;
+    while (f < TRACE_FNS && tr[f].fn && tr[f].fn != fn) f++;
+    if (f == TRACE_FNS) return;
+    tr[f].fn = fn;
+    uint64_t see = 0, run = 0, last_end = 0;
+    int late = 0;
+    for (int t = 0; t < pool.nthreads; t++) {
+        uint64_t s = stamps[t].start - t0, r = stamps[t].end - stamps[t].start;
+        if (s > see) { see = s; late = t; }
+        if (t < nslices - 1 && r > run) run = r;
+        if (stamps[t].end > last_end) last_end = stamps[t].end;
+    }
+    uint64_t disp = stamps[pool.nthreads].end - stamps[pool.nthreads].start;
+    if (stamps[pool.nthreads].end > last_end) last_end = stamps[pool.nthreads].end;
+    tr[f].n++;
+    tr[f].see_last += see;
+    tr[f].run_max += run;
+    tr[f].run_disp += disp;
+    tr[f].tail += t1 - last_end;
+    tr[f].total += t1 - t0;
+    tr[f].late[late]++;
+    if (tr[f].n % (uint64_t)trace_every) return;
+    double k = 1.0 / (tsc_per_us * (double)trace_every);
+    int worst = 0;
+    for (int t = 1; t < pool.nthreads; t++) if (tr[f].late[t] > tr[f].late[worst]) worst = t;
+    printf("trace fn %p x%d: per dispatch %.1f us: last thread sees it %.1f, longest pool slice %.1f, dispatcher's slice %.1f, "
+           "last end to seen %.1f; most often last to see it: thread %d (CPU %d), %u of %d\n",
+           (void *)fn, trace_every, tr[f].total * k, tr[f].see_last * k, tr[f].run_max * k, tr[f].run_disp * k, tr[f].tail * k,
+           worst, knc_cpu(worst % 57, worst / 57), tr[f].late[worst], trace_every);
+    fflush(stdout);
+    tr[f].see_last = tr[f].run_max = tr[f].run_disp = tr[f].tail = tr[f].total = 0;
+    memset(tr[f].late, 0, sizeof tr[f].late);
+}
+
 static void run_job(const struct job *j)
 {
     if (j->fn) {
@@ -187,7 +249,9 @@ static void *pool_thread(void *arg)
         wait_for_work(seen);
         seen = pool.gen;
         COMPILER_BARRIER();          /* loads of the job follow the load of gen */
+        if (trace) stamps[t].start = tsc();
         run_job(&pool.jobs[t]);
+        if (trace) stamps[t].end = tsc();
         __sync_fetch_and_add(&pool.done, 1);   /* locked: results are visible first */
     }
     return NULL;
@@ -340,7 +404,8 @@ int main(int argc, char **argv)
 {
     int max_threads = 57;
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-v") == 0) verbose = 1;
+        if (strcmp(argv[i], "-v") == 0) verbose++;
+        else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) { trace = 1; trace_every = atoi(argv[++i]); if (trace_every < 1) trace_every = 1; }
         else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) spin_ns = (uint64_t)atol(argv[++i]) * 1000000ULL;
         else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) idle_us = atol(argv[++i]);
         else if (strcmp(argv[i], "-e") == 0 && i + 1 < argc) vpu_exec_pool(atoi(argv[++i]));
@@ -375,6 +440,14 @@ int main(int argc, char **argv)
      * 0, ...) never lands a worker on the same core until all 227 other
      * hardware threads are taken. */
     pin(0);
+    if (trace) {
+        /* the counter's rate, against the kernel's clock over 20 ms */
+        uint64_t n0 = now_ns(), c0 = tsc();
+        struct timespec rest = { 0, 20000000L };
+        nanosleep(&rest, NULL);
+        tsc_per_us = (double)(tsc() - c0) * 1000.0 / (double)(now_ns() - n0);
+        printf("trace: the time stamp counter runs at %.1f per us\n", tsc_per_us);
+    }
     if (pool_start(max_threads - 1) != 0) return 1;
     if (vpu_exec_init() != 0) return 1;
 
@@ -467,7 +540,12 @@ int main(int argc, char **argv)
         rep->seq = seq;   /* written last: it is what the host polls */
         idle_since = now_ns();
 
-        if (verbose) {
+        /* A line per request costs the reply 35 to 60 us on this card (a
+         * write to a file on the host-backed disk), which a model's
+         * hundreds of small multiplies per token pay each: the matrix
+         * service's requests are logged at -v -v only. */
+        int service = kernel == VPU_K_UPLOAD || kernel == VPU_K_MATMUL || kernel == VPU_K_FREE || kernel == VPU_K_MATMUL_ID || kernel == VPU_K_FFN;
+        if (verbose > (service ? 1 : 0)) {
             printf("seq=%llu kernel=%u n=%ld threads=%d status=%d pull=%.3fms compute=%.3fms push=%.3fms\n",
                    (unsigned long long)seq, kernel, n, live, status,
                    pull_ns / 1e6, compute_ns / 1e6, push_ns / 1e6);
@@ -492,12 +570,16 @@ int vpu_pool_map(void (*fn)(void *arg, int slice, int nslices), void *arg, int n
     }
     pool.done = 0;
     COMPILER_BARRIER();
+    uint64_t t0 = trace ? tsc() : 0;
     pool.gen++;
     FULL_FENCE();
     if (pool.parked) futex(&pool.gen, FUTEX_WAKE, INT_MAX);
+    if (trace) stamps[pool.nthreads].start = tsc();
     run_job(&pool.jobs[pool.nthreads]);
+    if (trace) stamps[pool.nthreads].end = tsc();
     while (pool.done != (uint32_t)pool.nthreads) { }
     COMPILER_BARRIER();
+    if (trace) trace_note(fn, nslices, t0, tsc());
     return nslices;
 }
 

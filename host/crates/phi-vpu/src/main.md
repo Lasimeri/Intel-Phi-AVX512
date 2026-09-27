@@ -64,6 +64,7 @@ output. `proto.rs` has the rules and the reasons.
 phi-vpu -c 0 matmul-check                    # every weight type, then the rates
 phi-vpu -c 0 matmul-check --only q4_K --m 4096 --k 5120
 phi-vpu -c 0 matmul-check --probe            # what the kernels produce, and the card's ceilings
+phi-vpu -c 0 matmul-check --moe --act 1     # one token's mixture multiply, cold weights, timed
 ```
 
 The conformance part builds random weights in every type the card takes
@@ -83,6 +84,8 @@ eight experts (`K_MATMUL_ID`). The rate part times a model-sized shape.
 | `--act 0|1` | the activations the card is sent: float32, or float16, which its quantized kernels up-convert for nothing |
 | `--pattern B` | every quantized byte takes the value B: a wrong field mapping then shows as a fixed ratio |
 | `--probe` | print what each kernel instruction produces on the card, the rates one thread reaches, and the card's aggregate ceilings (read bandwidth, vector issue, the cost of one dispatch) |
+| `--moe` | only the one-token mixture rate: 8 of 256 experts at random from four resident tensors, so the weights are as cold as between two visits of a layer; the card's compute and total and the host's round trip, best and median (`matmul.md`) |
+| `--moe-shape M,K,ROWS` | with `--moe`, a shape instead of the default two (a 35B-A3B's gate or up share, 128,2048,1, and its down share, 448,512,8); repeatable |
 
 `docs/results/2026-09-23-quantized-kernels.md` and
 `docs/results/2026-09-23-ceilings-and-residency.md` are what this

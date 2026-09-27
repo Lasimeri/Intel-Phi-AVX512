@@ -125,6 +125,17 @@ static void copy_pool(void *dst, const void *src, size_t n64, int threads)
 #define MAP_POOL_MAX (2u << 20)
 #define PULL_ONE_MAX (4u << 10)
 #define PUSH_ONE_MAX (16u << 10)
+/* The fewest lines one thread of a pooled pull copies. The activations a
+ * pull brings are then read by every thread of the multiply, and how
+ * they were written decides what that costs: one token's 4.4 KB row
+ * copied a line or two per core, then read by all 57, took the pool
+ * 1.0 ms to multiply eight experts' rows by; the same row written by one
+ * core, 0.14 ms (`phi-vpu matmul-check --moe`, card 0, 2026-09-27). The
+ * pull itself is round trips over the link, which more threads overlap,
+ * so the count is a balance: 16, 32, 64 and 128 lines per thread gave
+ * 0.49, 0.36, 0.32 and 0.33 ms round trips for that request and 0.44,
+ * 0.42, 0.45 and 0.50 for twice its row (vpu_matmul.md). */
+#define PULL_LINES 32
 static int map_threads(int threads)
 {
     int max = vpu_pool_threads() + 1;
@@ -139,8 +150,13 @@ static int pull_data(void *dst, size_t len, uint64_t off, int threads)
     size_t n64 = (len + 63) / 64;
     void *win = (g_map_small && len <= MAP_POOL_MAX) ? vpu_window(off, n64 * 64) : NULL;
     if (!win) return vpu_pull(dst, len, off);
-    if (len <= PULL_ONE_MAX) phi_copy64(dst, win, (long)n64);
-    else copy_pool(dst, win, n64, map_threads(threads));
+    if (len <= PULL_ONE_MAX) {
+        phi_copy64(dst, win, (long)n64);
+    } else {
+        int s = map_threads(threads);
+        if ((size_t)s > n64 / PULL_LINES) s = (int)(n64 / PULL_LINES);
+        copy_pool(dst, win, n64, s < 1 ? 1 : s);
+    }
     return 0;
 }
 
@@ -369,6 +385,8 @@ struct job {
      * a + ids[p] * a_stride, by b's row (j % b_rows) + t * b_rows. */
     const int32_t *ids;
     uint64_t n_used, b_rows, a_stride;
+    /* Bytes of activation rows from b (0: not warmed, see warm_slice). */
+    uint64_t act_len;
 };
 
 static float sum16(const float *v)
@@ -476,12 +494,70 @@ static void rows_range_q(const struct job *j, uint64_t i0, uint64_t i1, int mate
     }
 }
 
+/* vprefetch1 [p]: the line into this core's L2 without waiting for it
+ * (MVEX 62 f1 78 08 18 /2, as vpu_matmul_kernel.S writes it). The card has
+ * no SSE prefetch and the compiler drops __builtin_prefetch for it. */
+static inline void to_l2(const void *p)
+{
+    __asm__ __volatile__(".byte 0x62, 0xf1, 0x78, 0x08, 0x18, 0x10" : : "a"(p) : "memory");
+}
+
+/* `len` bytes from `p` into L2, a line at a time, starting `from` lines in
+ * and wrapping around. */
+static void warm(const void *p, uint64_t len, uint64_t from)
+{
+    uint64_t lines = (len + 63) / 64;
+    if (lines == 0) return;
+    from %= lines;
+    for (uint64_t l = 0; l < lines; l++) {
+        uint64_t at = l + from;
+        if (at >= lines) at -= lines;
+        to_l2((const unsigned char *)p + at * 64);
+    }
+}
+
+/* The most a thread warms before it computes: a small multiply's whole
+ * working set, well inside a core's 512 KiB L2. Past this the kernels'
+ * own prefetch of the next row streams the weights, which is what a
+ * large multiply wants. */
+#define WARM_MAX (192u << 10)
+
+/* Before a small slice runs, ask for all of it: this thread's rows of
+ * every matrix its groups use, the group table and the activation rows.
+ * A cold line costs an in-order core its whole miss, and one token's
+ * mixture multiply is a few rows of eight experts, about 300 lines a
+ * thread, each met cold (the model's other layers pass through between
+ * two visits). Asked for together, the misses overlap. The table and the
+ * activations are the same lines for every thread, just written by
+ * other cores; each thread starts on a different line of them, so the
+ * pool does not queue on one line at a time. */
+static void warm_slice(const struct job *j, uint64_t i0, uint64_t i1, int slice)
+{
+    if (j->act_len == 0 || i1 <= i0) return;
+    uint64_t span = (i1 - i0) * j->nb_a, total = j->act_len;
+    const unsigned char *last = NULL;
+    for (uint64_t gi = 0; gi < j->ngroups; gi++)
+        if (j->groups[gi].a != last) { total += span; last = j->groups[gi].a; }
+    if (total > WARM_MAX) return;
+    uint64_t from = (uint64_t)slice * 7;
+    warm(j->groups, j->ngroups * sizeof *j->groups, from);
+    warm(j->b, j->act_len, from);
+    last = NULL;
+    for (uint64_t gi = 0; gi < j->ngroups; gi++) {
+        const unsigned char *a = j->groups[gi].a;
+        if (a == last) continue;
+        last = a;
+        warm(a + i0 * j->nb_a, span, 0);
+    }
+}
+
 static void rows_slice_q(void *arg, int slice, int nslices)
 {
     const struct job *j = arg;
     uint64_t i0, i1;
     int mate, nmates;
     slice_rows(slice, nslices, j->m, &i0, &i1, &mate, &nmates);
+    warm_slice(j, i0, i1, slice);
     rows_range_q(j, i0, i1, mate, nmates);
 }
 
@@ -881,7 +957,7 @@ static int ffn_run(volatile unsigned char *ctrl, int threads, int verbose,
     uint64_t p0 = now_ns();
     if (push_data(g_d.m.p, ff.n * ff.m_out * 4, ff.d_off, threads) != 0) return VPU_E_PUSH;
     *push_ns = now_ns() - p0;
-    if (verbose) {
+    if (verbose > 1) {
         printf("ffn: %llu rows of gate (%s) and up (%s) against %llu, then down %llux%llu (%s), n %llu, %d threads: "
                "pull %.3f, gate+up+swiglu %.3f, down %.3f, push %.3f ms\n",
                (unsigned long long)ff.rows, type_name(ff.gate_type), type_name(ff.up_type), (unsigned long long)ff.k,
@@ -926,7 +1002,7 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
         g_cache[g_ncache].m = m;
         g_cache[g_ncache].bytes = len;
         g_ncache++;
-        if (verbose) { printf("matmul: upload id %llu, %llu bytes\n", (unsigned long long)mm.a_id, (unsigned long long)mm.bytes); fflush(stdout); }
+        if (verbose > 1) { printf("matmul: upload id %llu, %llu bytes\n", (unsigned long long)mm.a_id, (unsigned long long)mm.bytes); fflush(stdout); }
         return VPU_OK;
     }
     /* MATMUL */
@@ -1127,7 +1203,8 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
     uint32_t b_type = mm.b_type ? 1 : 0;
     struct job j = { a, (const unsigned char *)g_b.m.p + mm.ids_bytes, g_d.m.p, mm.m, mm.n, mm.k,
                      mm.nb_a, mm.nb_b, mm.a_type, chunk, b_type, b_type ? 512u : 1024u, NULL, 0, (const int32_t *)g_b.m.p,
-                     mixture ? mm.n_used : 0, mixture ? mm.b_rows : 0, mixture ? mm.m * mm.nb_a : 0 };
+                     mixture ? mm.n_used : 0, mixture ? mm.b_rows : 0, mixture ? mm.m * mm.nb_a : 0,
+                     (mixture ? mm.b_rows * mm.n_tokens : mm.n) * mm.nb_b };
     int max = vpu_pool_threads() + 1;
     if (max > POOL_SLOTS) max = POOL_SLOTS;
     if (threads < 1) threads = 1;
@@ -1164,7 +1241,7 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
     uint64_t p0 = now_ns();
     if (push_data(g_d.m.p, mm.n * mm.m * 4, mm.d_off, threads) != 0) return VPU_E_PUSH;
     *push_ns = now_ns() - p0;
-    if (verbose) {
+    if (verbose > 1) {
         static const char *names[VPU_MM_TYPES] = { "f32", "f16", "q4_K", "q5_K", "q6_K", "q8_0", "iq4_xs" };
         printf("matmul: %llux%llu . %llux%llu (%s%s) on %d threads: pull %.3f compute %.3f push %.3f ms\n",
                (unsigned long long)mm.m, (unsigned long long)mm.k, (unsigned long long)mm.n, (unsigned long long)mm.k,

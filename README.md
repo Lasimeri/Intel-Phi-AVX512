@@ -185,6 +185,17 @@ both sides on each weight tensor and leaves with the host what the
 cards would not finish sooner, which on that model is most of the
 expert work (`docs/results/2026-09-23-mixture-of-experts.md`).
 
+Offloaded, where every multiply of a tensor with rows on the cards goes
+to them, those one-token multiplies used to cost 0.95 ms each and the
+35B-A3B generated at 4.75 tokens per second (`--no-repack`, the cards
+holding 41 percent of its weights). The card worker now warms a small
+request's lines before computing, pulls a request's activations a
+fixed 32 lines or more per thread (a row copied a line or two per core
+and then read by all 57 was the costliest part), and logs requests only
+at `-v -v`: 0.33 ms each, and **7.4 tokens per second**, against 7.7 for
+the host alone, with the same text byte for byte
+(`docs/results/2026-09-27-small-requests.md`).
+
 A model larger than this host's 31 GiB runs from its file, the page
 cache holding what it can. By default the cards' rows are a copy, so
 they save the host no memory; with `PHI_GGML_OFFLOAD=1` they leave the

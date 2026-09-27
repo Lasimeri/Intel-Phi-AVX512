@@ -91,6 +91,28 @@ ships (`--m 4096 --k 5120 --pad 256 --act 1`, in chunks of 32) is
 verified against the host at n 1, 8 and 64, not only the conformance
 shapes above it.
 
+## One token's mixture multiply (`--moe`, `moe_rate`)
+
+The rate loop above repeats one request on the same weights, so from the
+second repeat they sit in the card's caches. A model's generation is
+the opposite case for a mixture of experts: a layer's multiply picks 8
+of its 256 experts, and between two visits of that layer the rest of the
+model has passed through. `moe_rate` uploads four tensors of 256
+experts, then sends each request to the next tensor with eight distinct
+experts drawn at random, writing the ids and the activation rows into
+the window, ringing, waiting and reading the result back as the backend
+does. It prints the card's compute and total and the host's round trip,
+best and median; the median is the number that describes generation.
+The results are not compared here: `check_id` above checks the same
+kernel and request.
+
+The default shapes are one card's share of a 35B-A3B's experts: 128 of
+512 gate or up rows against k 2048 with one activation row for all eight
+experts, and 448 of 2048 down rows against k 512 with a row each.
+`--moe-shape M,K,ROWS` times others. This is how the slow one-token
+requests of 2026-09-27 were taken apart (`card/vpu/vpu_matmul.md`, "One
+token's multiply, and whose lines the pool reads").
+
 ## The feed-forward request and its SwiGLU
 
 `matmul-check` runs `check_swiglu` first: the card's SwiGLU on 4096

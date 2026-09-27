@@ -6,11 +6,14 @@ set ahead of time by `host/crates/avx512-xlate`, across the vector units,
 and writes the result back where the host can read it.
 
 ```
-phi-vpu-worker [-v] [-s MS] [-i US] [-e N] [-m 0|1] [threads]
+phi-vpu-worker [-v [-v]] [-t N] [-s MS] [-i US] [-e N] [-m 0|1] [threads]
 ```
 
 `threads` is the most the worker will spread one request across (1 to
-228, default 57). `-v` logs one line per request. `-s` is the spin window
+228, default 57). `-v` logs start-up, rejected requests and the seamless
+path's requests; `-v -v` also logs a line per matrix-multiply request
+(below, "Logging costs the reply"). `-t N` traces the pool (below, "What
+a dispatch costs"). `-s` is the spin window
 and `-i` the idle poll interval, both described below.
 `-e` is the seamless path's page pool, below.
 `scripts/phi-vpu.sh` deploys, builds, starts and stops it from the host
@@ -209,3 +212,46 @@ workers with `-e 0`; `scripts/phi-vpu.sh start` passes anything in
 its descriptor from the control area: the matmul one at
 `VPU_OFF_MATMUL`, the feed-forward one at `VPU_OFF_FFN`. The worker adds
 nothing of its own to them but the timing in the reply.
+
+## What a dispatch costs (`-t N`, 2026-09-27)
+
+`-t N` stamps every dispatch through `vpu_pool_map` (the matrix multiplies'
+and their copies; the polynomial's own dispatch is not summed) with the
+time stamp counter (`rdtsc`;
+its rate is measured against the kernel's clock at start-up and printed):
+when each thread saw the generation, when its slice began and ended, and
+when the dispatcher saw the last one done. The stamps sit on a line per
+thread, the sums are kept per slice function, and every N dispatches one
+line is printed per function: the average dispatch, how long the last
+thread took to see it, the longest pool slice, the dispatcher's own
+slice, the time from the last slice's end to the dispatcher seeing it,
+and which thread was most often the last to wake. The functions print as
+addresses; `nm phi-vpu-worker` names them. Off by default, and without
+it the pool does nothing it did not do before.
+
+Measured on card 0 (averages of 1000 dispatches):
+
+| dispatch | total | last thread sees it | longest pool slice | last end to seen |
+| --- | --- | --- | --- | --- |
+| empty (`--probe`'s loop) | 28.6 us | 6.8 | 5.2 | 20.4 |
+| a pull split across the pool, at generation | 28 us | 7.2 | 7.8 | 15.3 |
+| a 35B-A3B's one-token multiply, before the fix below | 610 to 680 us | 6.2 | 596 to 666 | 13 |
+
+So the pool's own cost, its wake and its done counter, is about 20 to
+30 us, and at generation the slices themselves were the whole of the
+problem: `vpu_matmul.md`, "One token's multiply, and whose lines the
+pool reads".
+
+## Logging costs the reply (2026-09-27)
+
+`scripts/phi-vpu.sh start` always passes `-v`, and the worker used to log
+two lines for every request, one of them before the reply: a `printf`
+and an `fflush` into `worker.log`, which lives on the card's `/data`, the
+host-backed disk. On the one-token mixture multiply
+(`phi-vpu matmul-check --moe`, card 0) the host's round trip was 0.37 and
+0.30 ms with them and 0.30 and 0.27 ms without; a 35B-A3B makes about 120
+such requests a token. The matrix-multiply service's lines (and the
+upload lines) now need `-v -v`; everything else `-v` printed, the seamless
+path's per-request lines included, is unchanged, and so is the command
+line `phi-vpu.sh` passes (Intel-Phi-Jev reads it back to know its own
+worker).

@@ -605,6 +605,146 @@ fn check_id(
     Ok(Duration::from_nanos(rep.compute_ns))
 }
 
+/// The one-token mixture multiply as a model's generation sends it,
+/// timed: `tensors` resident slices of `experts` matrices of `m` rows
+/// each, and every request picks `n_used` distinct experts at random from
+/// the next tensor in turn, so the weights it reads are as cold as they
+/// are between two visits of a layer. `b_rows` 1 is a gate or up
+/// projection (one activation row for every expert), `n_used` a down
+/// projection (a row each). Each request is the backend's: the ids and
+/// the rows written into the window, the doorbell, the wait, the result
+/// read back. Returns the card's (compute, total) times and the host's
+/// round trip, one per request. The results are not checked here; the
+/// ordinary run of this command checks the same kernel (`check_id`).
+#[allow(clippy::too_many_arguments)]
+fn moe_rate(
+    w: &Window,
+    threads: u32,
+    t: u32,
+    (m, k): (u64, u64),
+    experts: u64,
+    n_used: u64,
+    b_rows: u64,
+    tensors: u64,
+    reps: u32,
+    rng: &mut Rng,
+) -> Result<Vec<(Duration, Duration, Duration)>> {
+    let nb_a = row_bytes(t, k);
+    let nb_b = act_row_bytes(k) + 256;
+    let first_id = 7000;
+    for i in 0..tensors {
+        let mut a = Vec::with_capacity((experts * m * nb_a) as usize);
+        for _ in 0..experts * m {
+            a.extend_from_slice(&random_row(rng, t, k).0);
+        }
+        w.put(OFF_A, &a);
+        let up = Matmul {
+            a_id: first_id + i,
+            a_off: OFF_A,
+            bytes: round_up(a.len() as u64),
+            ..Matmul::default()
+        };
+        request(w, threads, K_UPLOAD, &up, Duration::from_secs(60))?;
+    }
+    let ids_bytes = (n_used * 4 + 63) & !63;
+    let mut out = Vec::with_capacity(reps as usize);
+    let mut d = vec![0u8; (n_used * m * 4) as usize];
+    for r in 0..reps as u64 {
+        let mut ids: Vec<i32> = Vec::with_capacity(n_used as usize);
+        while (ids.len() as u64) < n_used {
+            let e = (rng.next() % experts) as i32;
+            if !ids.contains(&e) {
+                ids.push(e);
+            }
+        }
+        let rows: Vec<Vec<u8>> = (0..b_rows)
+            .map(|_| act_bytes(&(0..k).map(|_| rng.unit()).collect::<Vec<f32>>()))
+            .collect();
+        let start = Instant::now();
+        // SAFETY: i32 has no padding; the slice is written as bytes.
+        w.put(OFF_B, unsafe {
+            std::slice::from_raw_parts(ids.as_ptr() as *const u8, ids.len() * 4)
+        });
+        for (c, row) in rows.iter().enumerate() {
+            w.put(OFF_B + ids_bytes + c as u64 * nb_b, row);
+        }
+        let mm = Matmul {
+            a_id: first_id + r % tensors,
+            a_type: t,
+            b_type: ACT.load(Ordering::Relaxed),
+            m,
+            n: n_used,
+            k,
+            nb_a,
+            nb_b,
+            b_off: OFF_B,
+            d_off: OFF_D,
+            n_used,
+            n_tokens: 1,
+            b_rows,
+            ids_bytes,
+            ..Matmul::default()
+        };
+        let rep = request(w, threads, K_MATMUL_ID, &mm, Duration::from_secs(60))?;
+        w.get(OFF_D, &mut d);
+        out.push((
+            Duration::from_nanos(rep.compute_ns),
+            Duration::from_nanos(rep.total_ns),
+            start.elapsed(),
+        ));
+    }
+    for i in 0..tensors {
+        let free = Matmul {
+            a_id: first_id + i,
+            ..Matmul::default()
+        };
+        request(w, threads, K_FREE, &free, Duration::from_secs(30))?;
+    }
+    Ok(out)
+}
+
+/// `moe_rate` at each shape of `shapes` (rows of each expert a card holds,
+/// weights per row, activation rows: 1 for a gate or up projection, 8 for
+/// a down one), printed as best and median. With none, the two of a
+/// 35B-A3B's experts on one card: its share of 128 of 512 gate and up
+/// rows against k 2048, and 448 of 2048 down rows against k 512.
+pub fn moe_check(w: &Window, threads: u32, only: Option<&str>, reps: u32, act: u32, shapes: &[(u64, u64, u64)]) -> Result<()> {
+    ACT.store(act, Ordering::Relaxed);
+    let t = match only {
+        Some(o) => [MM_Q4_K, MM_Q5_K, MM_Q6_K, MM_Q8_0, MM_IQ4_XS]
+            .into_iter()
+            .find(|&t| type_name(t) == o)
+            .ok_or_else(|| anyhow::anyhow!("--moe takes a quantized type: q4_K q5_K q6_K q8_0 iq4_xs"))?,
+        None => MM_Q4_K,
+    };
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    println!(
+        "one-token mixture multiplies, {} weights, 8 of 256 experts at random over 4 tensors, {threads} threads, {reps} requests:",
+        type_name(t)
+    );
+    let shapes: Vec<(u64, u64, u64)> = if shapes.is_empty() {
+        vec![(128, 2048, 1), (448, 512, 8)]
+    } else {
+        shapes.to_vec()
+    };
+    for (m, k, b_rows) in shapes {
+        let v = moe_rate(w, threads, t, (m, k), 256, 8, b_rows, 4, reps, &mut rng)?;
+        let (cb, cm) = best_median(v.iter().map(|x| x.0).collect());
+        let (tb, tm) = best_median(v.iter().map(|x| x.1).collect());
+        let (hb, hm) = best_median(v.iter().map(|x| x.2).collect());
+        println!(
+            "  {m:4} x {k:4}, {b_rows} activation row(s): compute {:.3} ms (median {:.3}), card total {:.3} ({:.3}), host round trip {:.3} ({:.3})",
+            cb * 1e3,
+            cm * 1e3,
+            tb * 1e3,
+            tm * 1e3,
+            hb * 1e3,
+            hm * 1e3
+        );
+    }
+    Ok(())
+}
+
 /// The best and the median of a set of times.
 fn best_median(mut v: Vec<Duration>) -> (f64, f64) {
     v.sort();
