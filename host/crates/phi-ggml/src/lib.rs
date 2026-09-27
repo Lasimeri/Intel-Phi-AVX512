@@ -239,7 +239,7 @@ pub extern "C" fn phi_ggml_open() -> i32 {
     if let Some(ctx) = CTX.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
         return ctx.cards.len() as i32;
     }
-    let threads = env_or("PHI_GGML_THREADS", 57u32);
+    let threads = env_or("PHI_GGML_THREADS", 114u32);
     let budget = env_or("PHI_GGML_CARD_BYTES", 4_400_000_000u64);
     // Set, the share is that; unset, it is sized at the first multiply from
     // the weights the scheduler offered (`settle_fraction`).

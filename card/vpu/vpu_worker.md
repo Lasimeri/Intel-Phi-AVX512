@@ -257,3 +257,55 @@ upload lines) now need `-v -v`; everything else `-v` printed, the seamless
 path's per-request lines included, is unchanged, and so is the command
 line `phi-vpu.sh` passes (Intel-Phi-Jev reads it back to know its own
 worker).
+
+## Two threads per core (2026-09-27)
+
+The pool is now built for two threads on each of the 57 cores (114,
+`scripts/phi-vpu.sh`'s default; the backend asks for 114,
+`PHI_GGML_THREADS`). A core's four hardware threads share its in-order
+issue slots round-robin, so the second thread only pays when the first
+leaves slots unused and nothing else takes them. Four changes make the
+pool cheap enough for that:
+
+- **Placement.** A core's second pool thread goes to its hardware thread
+  3, not 1 (`pool_slot`), keeping 1 and 2 free of the pool: the card's
+  block-device pollers run on core 55's threads 1 and 2 (CPUs 222 and
+  223), and with the second thread on 1, pool thread 112 shared CPU 222
+  with `phiblk1-poll` and was the last to wake in 6 to 10 percent of
+  dispatches. Core 56's thread 3 is CPU 0, the dispatcher's, so there
+  the second pool thread takes 1.
+- **One broadcast job.** `vpu_pool_map` writes its work (function,
+  argument, slice count) on the generation's own line (`bc`), where it
+  wrote 114 per-thread job records a dispatch, each a line some other
+  core had read the dispatch before. The threads of a core share its L1,
+  so one fetch per core wakes both. The polynomial's `dispatch` keeps its
+  per-thread records (`bc.nslices` 0).
+- **Counting done per core.** The threads of a core add to a count on a
+  line of that core's (`cores[]`, a locked add that stays in its L1); the
+  one completing its core's count adds once to `pool.done`, so the
+  dispatcher waits for 57 increments rather than 113 on one contended
+  line (`wait_done`).
+- **Waiting without issuing.** Every spin (a pool thread waiting for work,
+  the dispatcher waiting for done, a thread waiting for a pull,
+  `vpu_matmul.md`) runs `delay` between looks (ISA reference 327364-001,
+  appendix A: `VEX.128.F3.0F.W0 AE /6`, written as bytes; measured 1000
+  cycles in 925 ns). A thread that spins on its core otherwise takes issue
+  slots from the thread of that core still computing.
+
+An empty dispatch (`matmul-check --probe`) went from 42.5 us at 57
+threads and 62.8 us at 114 to 14.5 and 15.1. The request itself is read
+in one 64-byte vector load of its line (the control area is mapped
+uncached, and reading its fields one by one was a link round trip
+each), and `-t N` now also sums each multiply request's stages (read
+the request, descriptors and checks, pull, groups, compute, push,
+reply) from time stamps `vpu_matmul.c` leaves in `vpu_marks`. What the
+matrix service does with two threads per core is in `vpu_matmul.md`.
+
+The seamless path (`vpu_exec.c`) splits a loop over 57 threads and was
+measured slower on a 114-thread pool: the 1M-element seamless test's
+polynomial, dot product and integer kernels took 25.7, 29.3 and 22.2 ms
+against 21.9, 23.4 and 18.3 at 57. Its copies and write-back diffs used
+the whole pool, and a core's copies over the link go one at a time
+however many of its threads issue them, so they now take one slice per
+core (`vpu_pool_cores`): 28.4, 25.4 and 20.3 against 25.8, 24.4 and 18.4
+in the next pair of runs. `scripts/phi512.sh` starts its worker at 57.

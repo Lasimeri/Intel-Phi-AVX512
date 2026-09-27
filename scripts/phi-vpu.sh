@@ -2,7 +2,7 @@
 # phi-vpu.sh: put the AVX-512 co-processor worker on a card and drive it.
 #
 #   scripts/phi-vpu.sh [-c N] deploy        build the worker (host cross toolchain, else another card, else this card) and put it on the card
-#   scripts/phi-vpu.sh [-c N] start [T]     start the worker with T threads (default 57);
+#   scripts/phi-vpu.sh [-c N] start [T]     start the worker with T threads (default 114, two per core);
 #                                           PHI_VPU_ARGS="-s MS -i US" passes worker options
 #                                           PHI_VPU_HUGEPAGES=N huge pages reserved on the card at start (768)
 #   scripts/phi-vpu.sh [-c N] stop
@@ -22,7 +22,7 @@ root=$(cd "$here/.." && pwd)
 phi_env "$@"
 set -- "${PHI_ARGS[@]}"
 dir=${PHI_VPU_DIR:-/opt/phi/vpu}
-threads_default=57
+threads_default=114   # two threads on each of the 57 cores (card/vpu/vpu_worker.md, "Two threads per core")
 
 # The card over its own SSH forward, with the pinned host key: every card
 # boots the same image and presents the same key, so one alias covers all.

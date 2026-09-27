@@ -2,7 +2,7 @@
 
 ```
 scripts/phi-vpu.sh [-c N] deploy        build the worker (host cross toolchain, else another card, else this card) and put it on the card
-scripts/phi-vpu.sh [-c N] start [T]     start the worker with T threads (default 57)
+scripts/phi-vpu.sh [-c N] start [T]     start the worker with T threads (default 114, two per core)
 scripts/phi-vpu.sh [-c N] stop          stop the worker and release the huge pages
 scripts/phi-vpu.sh [-c N] status        worker process on the card, control words on the host
 scripts/phi-vpu.sh [-c N] log           the worker's output

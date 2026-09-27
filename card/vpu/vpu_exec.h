@@ -156,5 +156,6 @@ int64_t vpu_exec_scratch_tpoff(void);
  * pool (the caller's thread is the last slice) and wait for all. */
 int vpu_pool_map(void (*fn)(void *arg, int slice, int nslices), void *arg, int nslices);
 int vpu_pool_threads(void);
+int vpu_pool_cores(void);   /* at most one slice per core: for copies through the window */
 
 #endif

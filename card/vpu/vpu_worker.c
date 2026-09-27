@@ -46,6 +46,9 @@
 
 /* Translated from AVX-512 by avx512-xlate; see card/examples/avx512_poly.S */
 void poly_kernel_x8(float *d, const float *x, const float *coef, long n);
+/* 64-byte vector copies (vpu_matmul_kernel.S, kernelgen/copy.rs): whole-line
+ * loads from the uncached control area. */
+void phi_copy64(void *dst, const void *src, long count);
 
 #define CTRL_BYTES 16384   /* control words, the mailbox and the exec descriptor (vpu_exec.h) */
 #define WIN_BYTES (768UL << 20)   /* the window the matmul service uses: OFF_D + D_MAX (matmul.rs) */
@@ -148,10 +151,57 @@ static struct {
     int nthreads;               /* pool threads; the dispatcher is one more */
     pthread_t th[MAX_POOL];
     struct job jobs[MAX_POOL + 1];   /* jobs[nthreads] is the dispatcher's own */
-    volatile uint32_t gen;      /* bumped once per request */
-    volatile uint32_t done;     /* pool threads finished with this generation */
-    volatile uint32_t parked;   /* pool threads asleep in the kernel */
+    volatile uint32_t done __attribute__((aligned(64)));   /* cores finished with this generation */
+    volatile uint32_t parked __attribute__((aligned(64)));   /* pool threads asleep in the kernel */
 } pool;
+
+/* The generation and, for vpu_pool_map, the whole of its work, on one
+ * line: a thread that sees the bump has the job in the same fetch, and
+ * the threads of a core share that core's L1, so one fetch per core wakes
+ * all of them. `nslices` 0 means the per-thread jobs of `pool.jobs` (the
+ * polynomial's dispatch). */
+static struct {
+    volatile uint32_t gen;      /* bumped once per request */
+    int nslices;
+    void (*fn)(void *arg, int slice, int nslices);
+    void *arg;
+} bc __attribute__((aligned(64)));
+
+/* Pool threads per core, and each core's own count of threads finished,
+ * on a line of that core's: the threads of a core add to it (a locked add
+ * on a line in their own L1, no ring traffic) and the one that completes
+ * the core's count adds once to `pool.done`, so the dispatcher waits for
+ * 57 cores rather than 113 threads. Never reset: every thread adds once
+ * per generation, so a core's count is a multiple of its threads exactly
+ * when all of them are done. */
+struct corecount { volatile uint64_t n; } __attribute__((aligned(64)));
+static struct corecount cores[57];
+static int core_threads[57];
+static uint32_t busy_cores;
+
+/* delay r32 (ISA reference 327364-001, appendix A: VEX.128.F3.0F.W0 AE
+ * /6): the thread neither fetches nor issues for `cycles`. A core's four
+ * hardware threads share its issue slots, so a thread spinning while
+ * another thread of its core computes takes cycles from that one; a wait
+ * that delays between looks takes almost none. Measured on the card: 1000
+ * cycles in 925 ns. */
+static inline void knc_delay(uint32_t cycles)
+{
+    __asm__ __volatile__(".byte 0xc5, 0xfa, 0xae, 0xf0" : : "a"(cycles) : "memory");
+}
+#define WAIT_DELAY 64   /* cycles between looks at a word another core will write */
+
+/* The hardware thread a pool thread's slot on its core becomes: a core's
+ * first two threads go to its hardware threads 0 and 3, keeping 1 and 2,
+ * where the card's own kernel threads were seen running (the block
+ * devices' pollers on CPUs 222 and 223, core 55's threads 1 and 2), free.
+ * Core 56's thread 3 is CPU 0, the dispatcher's, so there the second pool
+ * thread takes 1. */
+static int pool_slot(int core, int mate)
+{
+    static const int order[4] = { 0, 3, 1, 2 }, order56[4] = { 0, 1, 2, 3 };
+    return core == 56 ? order56[mate & 3] : order[mate & 3];
+}
 
 /* -t: each thread's start and end of the current generation, on lines of
  * their own; the sums per slice function (a handful: the kernels, the
@@ -200,6 +250,28 @@ static void trace_note(void (*fn)(void *, int, int), int nslices, uint64_t t0, u
     memset(tr[f].late, 0, sizeof tr[f].late);
 }
 
+/* -t: a multiply request's stages, from the stamps vpu_matmul.c and the
+ * poll loop leave in vpu_marks (0 the doorbell seen, 6 the request read,
+ * 1 the descriptors read and checked, 2 pulled, 3 the groups built, 4
+ * computed, 5 pushed, 7 the reply written), summed per kind of request
+ * and printed every -t N of that kind. */
+extern uint64_t vpu_marks[8];
+static void stage_note(uint32_t kernel)
+{
+    static const char *names[3] = { "matmul", "matmul_id", "matmul_more" };
+    static const int order[8] = { 0, 6, 1, 2, 3, 4, 5, 7 };
+    static uint64_t sum[3][7], count[3];
+    int k = kernel == VPU_K_MATMUL ? 0 : kernel == VPU_K_MATMUL_ID ? 1 : kernel == VPU_K_MATMUL_MORE ? 2 : -1;
+    if (k < 0) return;
+    for (int s = 0; s < 7; s++) sum[k][s] += vpu_marks[order[s + 1]] - vpu_marks[order[s]];
+    if (++count[k] % (uint64_t)trace_every) return;
+    double f = 1.0 / (tsc_per_us * (double)trace_every);
+    printf("stages %s x%d, us: read request %.1f, descriptors and checks %.1f, pull %.1f, groups %.1f, compute %.1f, push %.1f, reply %.1f\n",
+           names[k], trace_every, sum[k][0] * f, sum[k][1] * f, sum[k][2] * f, sum[k][3] * f, sum[k][4] * f, sum[k][5] * f, sum[k][6] * f);
+    fflush(stdout);
+    memset(sum[k], 0, sizeof sum[k]);
+}
+
 static void run_job(const struct job *j)
 {
     if (j->fn) {
@@ -224,7 +296,8 @@ static void wait_for_work(uint32_t seen)
     uint64_t t0 = now_ns();
     for (;;) {
         for (int i = 0; i < SPIN_ROUNDS; i++) {
-            if (pool.gen != seen) return;
+            if (bc.gen != seen) return;
+            knc_delay(WAIT_DELAY);
         }
         if (now_ns() - t0 < spin_ns) continue;
 
@@ -232,9 +305,9 @@ static void wait_for_work(uint32_t seen)
         /* The kernel compares gen with `seen` atomically against any
          * wake, so a bump that lands between the check above and this
          * call returns EAGAIN rather than sleeping through it. */
-        futex(&pool.gen, FUTEX_WAIT, seen);
+        futex(&bc.gen, FUTEX_WAIT, seen);
         __sync_fetch_and_sub(&pool.parked, 1);
-        if (pool.gen != seen) return;
+        if (bc.gen != seen) return;
         t0 = now_ns();
     }
 }
@@ -242,24 +315,40 @@ static void wait_for_work(uint32_t seen)
 static void *pool_thread(void *arg)
 {
     int t = (int)(intptr_t)arg;
-    pin(knc_cpu(t % 57, t / 57));
+    int core = t % 57;
+    pin(knc_cpu(core, pool_slot(core, t / 57)));
     pool_altstack(t);
     uint32_t seen = 0;
     for (;;) {
         wait_for_work(seen);
-        seen = pool.gen;
+        seen = bc.gen;
         COMPILER_BARRIER();          /* loads of the job follow the load of gen */
         if (trace) stamps[t].start = tsc();
-        run_job(&pool.jobs[t]);
+        int nslices = bc.nslices;
+        if (nslices == 0) run_job(&pool.jobs[t]);
+        else if (t < nslices - 1) bc.fn(bc.arg, t, nslices);
         if (trace) stamps[t].end = tsc();
-        __sync_fetch_and_add(&pool.done, 1);   /* locked: results are visible first */
+        /* locked: results are visible first; the thread completing its
+         * core's count reports the core */
+        if (core_threads[core] == 1 || (__sync_add_and_fetch(&cores[core].n, 1) % (uint64_t)core_threads[core]) == 0)
+            __sync_fetch_and_add(&pool.done, 1);
     }
     return NULL;
+}
+
+/* Wait for every core's threads to be done with this generation. */
+static void wait_done(void)
+{
+    while (pool.done != busy_cores) knc_delay(WAIT_DELAY);
+    COMPILER_BARRIER();
 }
 
 static int pool_start(int nthreads)
 {
     pool.nthreads = nthreads;
+    for (int t = 0; t < nthreads; t++) core_threads[t % 57]++;
+    busy_cores = 0;
+    for (int c = 0; c < 57; c++) busy_cores += core_threads[c] > 0;
     for (int t = 0; t < nthreads; t++) {
         if (pthread_create(&pool.th[t], NULL, pool_thread, (void *)(intptr_t)t) != 0) {
             perror("pthread_create");
@@ -302,15 +391,15 @@ static int dispatch(int threads, float *in, float *out, float *coef, long n)
     }
 
     pool.done = 0;
+    bc.nslices = 0;              /* the per-thread jobs */
     COMPILER_BARRIER();          /* the jobs are stored before the generation */
-    pool.gen++;
+    bc.gen++;
     FULL_FENCE();                /* ...and the generation before parked is read */
-    if (pool.parked) futex(&pool.gen, FUTEX_WAKE, INT_MAX);
+    if (pool.parked) futex(&bc.gen, FUTEX_WAKE, INT_MAX);
 
     run_job(&pool.jobs[pool.nthreads]);
 
-    while (pool.done != (uint32_t)pool.nthreads) { /* spin: alone on this core */ }
-    COMPILER_BARRIER();
+    wait_done();
     return live;
 }
 
@@ -499,11 +588,19 @@ int main(int argc, char **argv)
         last = seq;
 
         uint64_t t0 = now_ns();
-        long n = (long)req->n;
-        int threads = (int)req->threads;
-        uint32_t kernel = req->kernel;
-        uint64_t in_off = req->in_off, out_off = req->out_off;
-        uint64_t aux_off = req->aux_off, aux_len = req->aux_len;
+        vpu_marks[0] = tsc();
+        /* The request's line in one 64-byte load, where reading its
+         * fields one by one was a round trip over the link each (the
+         * mapping is uncached): the host wrote them before the sequence
+         * number just seen. */
+        struct vpu_request rq[64 / sizeof(struct vpu_request) + 1] __attribute__((aligned(64)));
+        phi_copy64(rq, (const void *)req, 1);
+        vpu_marks[6] = tsc();
+        long n = (long)rq[0].n;
+        int threads = (int)rq[0].threads;
+        uint32_t kernel = rq[0].kernel;
+        uint64_t in_off = rq[0].in_off, out_off = rq[0].out_off;
+        uint64_t aux_off = rq[0].aux_off, aux_len = rq[0].aux_len;
 
         int status = VPU_OK, live = 0;
         uint64_t pull_ns = 0, push_ns = 0, compute_ns = 0;
@@ -538,6 +635,7 @@ int main(int argc, char **argv)
         rep->threads = live;
         COMPILER_BARRIER();
         rep->seq = seq;   /* written last: it is what the host polls */
+        if (trace && kernel != VPU_K_EXEC) { vpu_marks[7] = tsc(); stage_note(kernel); }
         idle_since = now_ns();
 
         /* A line per request costs the reply 35 to 60 us on this card (a
@@ -563,23 +661,22 @@ int vpu_pool_map(void (*fn)(void *arg, int slice, int nslices), void *arg, int n
 {
     if (nslices > pool.nthreads + 1) nslices = pool.nthreads + 1;
     if (nslices < 1) nslices = 1;
-    for (int t = 0; t <= pool.nthreads; t++) {
-        struct job *j = &pool.jobs[t];
-        memset(j, 0, sizeof *j);
-        int slice = (t == pool.nthreads) ? nslices - 1 : (t < nslices - 1 ? t : -1);
-        if (slice >= 0) { j->fn = fn; j->arg = arg; j->slice = slice; j->nslices = nslices; }
-    }
+    /* One job for everyone, on the generation's line: slice s goes to pool
+     * thread s and the last to this thread (the dispatcher), which would
+     * otherwise wait on a core that has work to do. */
     pool.done = 0;
+    bc.fn = fn;
+    bc.arg = arg;
+    bc.nslices = nslices;
     COMPILER_BARRIER();
     uint64_t t0 = trace ? tsc() : 0;
-    pool.gen++;
+    bc.gen++;
     FULL_FENCE();
-    if (pool.parked) futex(&pool.gen, FUTEX_WAKE, INT_MAX);
+    if (pool.parked) futex(&bc.gen, FUTEX_WAKE, INT_MAX);
     if (trace) stamps[pool.nthreads].start = tsc();
-    run_job(&pool.jobs[pool.nthreads]);
+    fn(arg, nslices - 1, nslices);
     if (trace) stamps[pool.nthreads].end = tsc();
-    while (pool.done != (uint32_t)pool.nthreads) { }
-    COMPILER_BARRIER();
+    wait_done();
     if (trace) trace_note(fn, nslices, t0, tsc());
     return nslices;
 }
@@ -587,4 +684,15 @@ int vpu_pool_map(void (*fn)(void *arg, int slice, int nslices), void *arg, int n
 int vpu_pool_threads(void)
 {
     return pool.nthreads;
+}
+
+/* One slice per core, the most a copy through the uncached window can
+ * use: a core's loads and stores over the link go one at a time whatever
+ * number of its threads issue them, so a second thread per core only
+ * adds a slice (the seamless path's copies measured 20 percent slower cut
+ * for 114 than for 57, 2026-09-27). */
+int vpu_pool_cores(void)
+{
+    int n = pool.nthreads + 1;
+    return n < 57 ? n : 57;
 }

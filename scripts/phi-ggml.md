@@ -14,7 +14,7 @@ no batch dimensions, under the window's limits) and keeps the rest on
 the CPU. `MUL_MAT_ID` is the mixture-of-experts multiply, which is where
 almost all of an MoE model's weights are. Each such multiply is shared
 by rows: every card keeps a share of the weight rows
-resident (uploaded once) and multiplies them on its 57 threads with the
+resident (uploaded once) and multiplies them on its 114 threads (two per core) with the
 kernels of `card/vpu/vpu_matmul_kernel.S` while the host computes its
 own rows with ggml's CPU kernels; the results are gathered per multiply.
 
@@ -54,7 +54,7 @@ then sleeps between looks; unset, it spins throughout),
 `PHI_GGML_PP_ADAPT=0` the same request gives the same output),
 `PHI_GGML_HOST_THREADS` (the host's threads for its rows, 12: leave the
 card daemons a CPU each, and give the program the same `-t`),
-`PHI_GGML_THREADS` (card threads, 57),
+`PHI_GGML_THREADS` (card threads, 114: two per core),
 `PHI_GGML_ACT` (1: activations cross as float16; 0: float32),
 `PHI_GGML_MIN_BYTES` (below), `PHI_GGML_GRAPH=N` (print the first N
 sub-graphs the scheduler hands over, `host/crates/phi-ggml/csrc/ggml-phi.md`). `--verbose`

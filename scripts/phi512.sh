@@ -93,8 +93,12 @@ else
             echo "phi512: no Intel-Phi-AVX512 checkout at '$root' to start the worker from; set PHI512_ROOT" >&2
             exit 1
         }
-        # Stdin is the program's: the start's ssh would read it.
-        "$root/scripts/phi-vpu.sh" -c "$card" start >&2 </dev/null || {
+        # Stdin is the program's: the start's ssh would read it. One thread per
+        # core: the seamless path splits a loop over 57 (offload.rs,
+        # SPLIT_THREADS) and copies through the window one core at a time,
+        # so a second thread per core only polls beside them (the default,
+        # 114, is the matrix multiplies'; card/vpu/vpu_worker.md).
+        "$root/scripts/phi-vpu.sh" -c "$card" start 57 >&2 </dev/null || {
             echo "phi512: could not start the worker on card $card (is the card up? phi -c $card status)" >&2
             exit 1
         }

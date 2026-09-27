@@ -205,7 +205,12 @@ And a layer's gate and up, two multiplies of the same activations with
 the same experts, now go to each card as one request: **9.6 tokens per
 second and 69 at the prompt offloaded**, against the host alone's 7.5
 and 63, the text byte for byte what it was
-(`docs/results/2026-09-27-gate-and-up-together.md`).
+(`docs/results/2026-09-27-gate-and-up-together.md`). The cards now run
+two threads on each core (114, the default): with the worker's pool
+rebuilt for it, the same model at Q8_0 (37.8 GB, more than this host's
+memory) processes prompts offloaded at 72 tokens per second against 57.8
+and generates at 8.3 against 7.8, the text unchanged
+(`docs/results/2026-09-27-two-threads-per-core.md`).
 
 A model larger than this host's 31 GiB runs from its file, the page
 cache holding what it can. By default the cards' rows are a copy, so

@@ -71,7 +71,7 @@ pins the old behaviour if it turns out to.
 
 `PHI_GGML_CARDS` names the cards (a comma list of indices; default every
 card whose window exists), `PHI_GGML_THREADS` the card threads per
-multiply (57; the pool must be that size, more spins), `PHI_GGML_VERBOSE`
+multiply (114, two on each core since 2026-09-27; 57 is one per core), `PHI_GGML_VERBOSE`
 prints every multiply with the host part, the wait, and each card's
 pull, compute and push. The host side's thread count is the glue's
 (`PHI_GGML_HOST_THREADS`, 12): the card daemons serve the DMA on the

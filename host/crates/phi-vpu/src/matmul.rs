@@ -754,6 +754,17 @@ fn check_more(
     Ok(())
 }
 
+/// One timed request of `moe_rate`: the card's compute, its whole time
+/// from doorbell to reply and its pull and push within that, and the
+/// host's round trip.
+struct Timed {
+    compute: Duration,
+    total: Duration,
+    host: Duration,
+    pull: Duration,
+    push: Duration,
+}
+
 /// The one-token mixture multiply as a model's generation sends it,
 /// timed: `tensors` resident slices of `experts` matrices of `m` rows
 /// each, and every request picks `n_used` distinct experts at random from
@@ -783,11 +794,16 @@ fn moe_rate(
     reps: u32,
     pair: u32,
     rng: &mut Rng,
-) -> Result<Vec<(Duration, Duration, Duration)>> {
+) -> Result<Vec<Timed>> {
     let nb_a = row_bytes(t, k);
     let nb_b = act_row_bytes(k) + 256;
     let first_id = 7000;
     let per = if pair > 0 { 2 } else { 1 };
+    // `b_rows` 0 is a plain one-column multiply (`K_MATMUL`), a dense
+    // matrix at one token, cold over sixteen tensors instead of four.
+    let plain = b_rows == 0;
+    let (experts, n_used, b_rows) = if plain { (1, 1, 1) } else { (experts, n_used, b_rows) };
+    let tensors = if plain { tensors * 4 } else { tensors };
     for i in 0..tensors * per {
         let mut a = Vec::with_capacity((experts * m * nb_a) as usize);
         for _ in 0..experts * m {
@@ -802,7 +818,7 @@ fn moe_rate(
         };
         request(w, threads, K_UPLOAD, &up, Duration::from_secs(60))?;
     }
-    let ids_bytes = (n_used * 4 + 63) & !63;
+    let ids_bytes = if plain { 0 } else { (n_used * 4 + 63) & !63 };
     let mut out = Vec::with_capacity(reps as usize);
     let mut d = vec![0u8; (n_used * m * 4) as usize];
     for r in 0..reps as u64 {
@@ -817,10 +833,12 @@ fn moe_rate(
             .map(|_| act_bytes(&(0..k).map(|_| rng.unit()).collect::<Vec<f32>>()))
             .collect();
         let start = Instant::now();
-        // SAFETY: i32 has no padding; the slice is written as bytes.
-        w.put(OFF_B, unsafe {
-            std::slice::from_raw_parts(ids.as_ptr() as *const u8, ids.len() * 4)
-        });
+        if !plain {
+            // SAFETY: i32 has no padding; the slice is written as bytes.
+            w.put(OFF_B, unsafe {
+                std::slice::from_raw_parts(ids.as_ptr() as *const u8, ids.len() * 4)
+            });
+        }
         for (c, row) in rows.iter().enumerate() {
             w.put(OFF_B + ids_bytes + c as u64 * nb_b, row);
         }
@@ -835,18 +853,19 @@ fn moe_rate(
             nb_b,
             b_off: OFF_B,
             d_off: OFF_D,
-            n_used,
-            n_tokens: 1,
-            b_rows,
+            n_used: if plain { 0 } else { n_used },
+            n_tokens: if plain { 0 } else { 1 },
+            b_rows: if plain { 0 } else { b_rows },
             ids_bytes,
             ..Matmul::default()
         };
         let second = mm.a_id + 1;
+        let one_kind = if plain { K_MATMUL } else { K_MATMUL_ID };
         let d2 = OFF_D + round_up(n_used * m * 4);
-        let (compute, total) = match pair {
+        let (compute, total, pull, push) = match pair {
             0 => {
-                let rep = request(w, threads, K_MATMUL_ID, &mm, Duration::from_secs(60))?;
-                (rep.compute_ns, rep.total_ns)
+                let rep = request(w, threads, one_kind, &mm, Duration::from_secs(60))?;
+                (rep.compute_ns, rep.total_ns, rep.pull_ns, rep.push_ns)
             }
             1 => {
                 let one = request(w, threads, K_MATMUL_ID, &mm, Duration::from_secs(60))?;
@@ -860,7 +879,12 @@ fn moe_rate(
                     ..mm
                 };
                 let two = request(w, threads, K_MATMUL_ID, &mm2, Duration::from_secs(60))?;
-                (one.compute_ns + two.compute_ns, one.total_ns + two.total_ns)
+                (
+                    one.compute_ns + two.compute_ns,
+                    one.total_ns + two.total_ns,
+                    one.pull_ns + two.pull_ns,
+                    one.push_ns + two.push_ns,
+                )
             }
             _ => {
                 let mut more = More {
@@ -877,14 +901,21 @@ fn moe_rate(
                 };
                 w.write(OFF_MORE, more);
                 let rep = request(w, threads, K_MATMUL_MORE, &mm, Duration::from_secs(60))?;
-                (rep.compute_ns, rep.total_ns)
+                (rep.compute_ns, rep.total_ns, rep.pull_ns, rep.push_ns)
             }
         };
         w.get(OFF_D, &mut d);
         if pair > 0 {
             w.get(d2, &mut d);
         }
-        out.push((Duration::from_nanos(compute), Duration::from_nanos(total), start.elapsed()));
+        let ns = Duration::from_nanos;
+        out.push(Timed {
+            compute: ns(compute),
+            total: ns(total),
+            host: start.elapsed(),
+            pull: ns(pull),
+            push: ns(push),
+        });
     }
     for i in 0..tensors * per {
         let free = Matmul {
@@ -930,15 +961,20 @@ pub fn moe_check(w: &Window, threads: u32, only: Option<&str>, reps: u32, act: u
         };
         for &(pair, what) in pairs {
             let v = moe_rate(w, threads, t, (m, k), 256, 8, b_rows, 4, reps, pair, &mut rng)?;
-            let (cb, cm) = best_median(v.iter().map(|x| x.0).collect());
-            let (tb, tm) = best_median(v.iter().map(|x| x.1).collect());
-            let (hb, hm) = best_median(v.iter().map(|x| x.2).collect());
+            let (cb, cm) = best_median(v.iter().map(|x| x.compute).collect());
+            let (tb, tm) = best_median(v.iter().map(|x| x.total).collect());
+            let (hb, hm) = best_median(v.iter().map(|x| x.host).collect());
+            let (_, pm) = best_median(v.iter().map(|x| x.pull).collect());
+            let (_, qm) = best_median(v.iter().map(|x| x.push).collect());
             println!(
-                "  {m:4} x {k:4}, {b_rows} activation row(s){what}: compute {:.3} ms (median {:.3}), card total {:.3} ({:.3}), host round trip {:.3} ({:.3})",
+                "  {m:4} x {k:4}, {}{what}: compute {:.3} ms (median {:.3}), card total {:.3} ({:.3}; pull {:.3}, push {:.3}), host round trip {:.3} ({:.3})",
+                if b_rows == 0 { "plain, one column".to_string() } else { format!("{b_rows} activation row(s)") },
                 cb * 1e3,
                 cm * 1e3,
                 tb * 1e3,
                 tm * 1e3,
+                pm * 1e3,
+                qm * 1e3,
                 hb * 1e3,
                 hm * 1e3
             );
@@ -1006,6 +1042,18 @@ pub fn check(
             check_id(w, threads, t, 61, 512, experts, n_used, n_tokens, b_rows, id, &mut rng)?;
             id += 1;
         }
+        // Rows enough for every core's threads to share them when the pool
+        // has two per core (114 slices: a core's pair takes alternate rows,
+        // or four columns each of a group of eight), which 61 rows never
+        // reach: plain at each kernel width, and a mixture.
+        if threads > 57 {
+            for &n in &[1u64, 8, 13] {
+                check_one(w, threads, t, 128, 512, n, id, &mut rng, 1)?;
+                id += 1;
+            }
+            check_id(w, threads, t, 128, 512, 8, 3, 5, 1, id, &mut rng)?;
+            id += 1;
+        }
         // Further matrices in the same request (K_MATMUL_MORE), quantized
         // types only: of another type and other row counts than the first,
         // plain and as mixtures sharing the ids (a gate and up pair, and a
@@ -1031,8 +1079,9 @@ pub fn check(
             id += 4;
         }
         println!(
-            "{:7} ok: 61 rows, k 512 (Q8_0 also 544), n 1 4 8 13, and mixtures of 8 experts{}, {threads} threads",
+            "{:7} ok: 61 rows{}, k 512 (Q8_0 also 544), n 1 4 8 13, and mixtures of 8 experts{}, {threads} threads",
             type_name(t),
+            if threads > 57 { " and 128" } else { "" },
             if t != MM_F32 && t != MM_F16 {
                 ", and up to four matrices in one request"
             } else {

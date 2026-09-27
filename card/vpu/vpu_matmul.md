@@ -356,3 +356,55 @@ mixtures sharing one activation row; and a down style one of four
 matrices with a row per column. `--moe` times a 35B-A3B's gate and up as
 two requests and as one: on card 0, 0.57 ms median round trip against
 0.37 (`docs/results/2026-09-27-gate-and-up-together.md`).
+
+## Two threads per core, built for (2026-09-27)
+
+The section above, "Two threads per core, measured again", found the
+second thread no help on a prompt-sized batch (q6_K at n 64, 188 against
+209 GFLOP/s), and the service stayed capped at 58 slices (`POOL_SLOTS`,
+`map_threads`). It is built for 114 now (`POOL_SLOTS`), because a
+second thread has issue to spare and a one-token request is issue and
+latency bound, and what stood in its way was fixed cost that grew with
+the thread count:
+
+- **Each thread builds its own groups** for a request of up to
+  `OWN_GROUPS_MAX` (64) columns (`own_groups`, `groups_own`, the same
+  groups `groups_mixture` builds, by a stable insertion sort), where the
+  dispatcher wrote one table for all: the table's lines had been read by
+  every core the request before, so each write first invalidated every
+  copy, 12 to 27 us a request (the `-t` stage trace), and then every
+  thread read the table from the dispatcher's L2.
+- **A small request's pull rides in its compute dispatch** (`struct
+  fused`): the dispatcher reads the ids itself (one vector load), wakes
+  the pool once, the first cores' threads copy the activations (at least
+  `PULL_LINES` lines a core, both threads of it), and every thread builds
+  its groups and asks for its weight rows before waiting for the copy
+  (with `delay`), then asks for the activations and computes
+  (`run_pieces`). Two threads of one core copy no faster than one (the
+  uncached loads over the link go one at a time a core), so what this
+  saves is the separate dispatch and the weights' misses, which now run
+  under the copy.
+- **The two threads of a core split the warm-up** (`warm` takes every
+  `nmates`-th line) and, in a request of several matrices, cut rows by
+  core as one matrix does (`rows_slice_multi` through `slice_rows`),
+  taking alternate rows.
+- **Descriptors are read in 64-byte vectors** (`ctrl_read`): the control
+  area is uncached, and `memcpy` on this core loads 8 bytes at a time, a
+  link round trip each.
+
+Measured with `phi-vpu matmul-check --moe --only q8_0 --act 1 --repeat
+300`, card 0, a Q8_0 35B-A3B's shapes (64 expert rows a card, a dense
+2752 x 2048 share), median host round trip in ms:
+
+| request | before, 57 threads | before, 114 | after, 57 | after, 114 |
+| --- | --- | --- | --- | --- |
+| gate or up, 64 x 2048, one row | 0.262 | 0.284 | 0.217 | 0.220 |
+| gate and up as one request | 0.307 | 0.368 | 0.279 | 0.261 |
+| down, 64 x 512, eight rows | 0.186 | 0.250 | 0.110 | 0.113 |
+| dense 2752 x 2048, one column | 0.335 | 0.360 | 0.277 | 0.232 |
+
+Two threads per core now match one at the small requests and win at
+the larger ones (the dense share 16 percent, the pair 6), where before
+they lost everywhere. End to end in `docs/results/2026-09-27-two-threads-per-core.md`.
+Every case of `matmul-check` passes at 57 and at 114 threads, the latter
+with 128-row cases that reach the two-thread splits (61 rows never do).

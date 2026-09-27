@@ -125,8 +125,10 @@ fn moe_shape(s: &str) -> Result<(u64, u64, u64), String> {
         .map(|x| x.trim().parse::<u64>().map_err(|e| format!("{x}: {e}")))
         .collect::<Result<_, _>>()?;
     match v.as_slice() {
-        [m, k, rows] if *m > 0 && *k > 0 && *k % 256 == 0 && (1..=8).contains(rows) => Ok((*m, *k, *rows)),
-        _ => Err("M,K,ROWS: rows M > 0, weights per row K a multiple of 256, activation rows 1 to 8".into()),
+        [m, k, rows] if *m > 0 && *k > 0 && *k % 256 == 0 && *rows <= 8 => Ok((*m, *k, *rows)),
+        _ => {
+            Err("M,K,ROWS: rows M > 0, weights per row K a multiple of 256, activation rows 1 to 8 (0: a plain one-column multiply)".into())
+        }
     }
 }
 

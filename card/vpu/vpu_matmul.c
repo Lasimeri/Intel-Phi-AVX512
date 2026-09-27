@@ -136,10 +136,13 @@ static void copy_pool(void *dst, const void *src, size_t n64, int threads)
  * 0.49, 0.36, 0.32 and 0.33 ms round trips for that request and 0.44,
  * 0.42, 0.45 and 0.50 for twice its row (vpu_matmul.md). */
 #define PULL_LINES 32
+/* The most slices a multiply is cut into: two threads on each of the 57
+ * cores (vpu_matmul.md, "Two threads per core"). */
+#define POOL_SLOTS 114
 static int map_threads(int threads)
 {
     int max = vpu_pool_threads() + 1;
-    if (max > 58) max = 58;
+    if (max > POOL_SLOTS) max = POOL_SLOTS;
     return threads < 1 ? 1 : threads > max ? max : threads;
 }
 
@@ -168,6 +171,31 @@ static int push_data(const void *src, size_t len, uint64_t off, int threads)
     if (len <= PUSH_ONE_MAX) phi_copy64(win, src, (long)n64);
     else copy_pool(win, src, n64, map_threads(threads));
     return 0;
+}
+
+/* The time stamp counter at each stage of the request being served (1:
+ * its descriptors read and checked; 2: its activations pulled; 3: its
+ * groups built; 4: computed; 5: pushed), for the worker's -t trace to
+ * total; the worker stamps 0 (the doorbell seen), 6 (the request read)
+ * and 7 (the reply written). Six cycles each, so always kept. */
+uint64_t vpu_marks[8];
+static inline uint64_t mark_tsc(void)
+{
+    uint32_t lo, hi;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+#define MARK(i) (vpu_marks[i] = mark_tsc())
+
+/* A descriptor out of the control area, which is host memory mapped
+ * uncached: every load is a round trip over the link (about 0.7 us), and
+ * memcpy on this core loads 8 bytes at a time, 16 round trips for a
+ * 128-byte descriptor. Whole 64-byte vector loads are two. `src`, `dst`
+ * and `len` are whole lines: every descriptor sits on line boundaries
+ * (vpu_matmul.h) and the copies are declared 64-byte aligned. */
+static void ctrl_read(void *dst, volatile const unsigned char *src, size_t len)
+{
+    phi_copy64(dst, (const void *)src, (long)(len / 64));
 }
 
 static uint64_t now_ns(void)
@@ -350,7 +378,6 @@ static float q8_0_tail(const uint8_t *blk, const void *x, int nblocks, uint32_t 
  * how the shape was measured rather than argued. */
 #define ROW_CHUNK 32
 #define ROW_CHUNK_MAX 64
-#define POOL_SLOTS 58
 
 /* Up to eight columns that share a weight matrix, which is what one
  * call of a kernel takes: which matrix, where each column's activation
@@ -387,7 +414,38 @@ struct job {
     uint64_t n_used, b_rows, a_stride;
     /* Bytes of activation rows from b (0: not warmed, see warm_slice). */
     uint64_t act_len;
+    /* Each thread builds the groups it reads (`groups_own`), rather than
+     * the dispatcher one table for all: a request of up to OWN_GROUPS_MAX
+     * columns, one token's. The table's lines were read by every core the
+     * request before, and writing them first invalidated every copy, 12 to
+     * 27 us a request on the dispatcher alone (the -t stage trace,
+     * 2026-09-27). */
+    int own_groups;
+    /* The activations are still arriving (`struct fused`, its pull in this
+     * dispatch): wait for them before reading them. */
+    struct fused *fused;
 };
+
+#define OWN_GROUPS_MAX 64
+static uint64_t groups_own(struct group *gs, const struct job *j);
+
+/* A small request's pull, done inside its compute dispatch rather than as
+ * a dispatch of its own before it: the first `cores` cores' threads copy
+ * the activations from the window (both threads of a core, so each core
+ * has two loads over the link in flight, and the copied lines have few
+ * owners), while every thread builds its groups and asks for its weight
+ * rows, which need only the ids; then each waits for the copy. The ids
+ * are copied by the dispatcher before the pool is woken. */
+struct fused {
+    unsigned char *dst;              /* where the activations go (after the ids) */
+    const unsigned char *src;        /* the window, as mapped */
+    uint64_t n64;                    /* 64-byte lines of them */
+    int cores;                       /* cores whose threads copy */
+    uint32_t copiers;                /* those threads */
+    uint64_t done_ns;                /* when the last copy finished */
+    volatile uint32_t copied __attribute__((aligned(64)));   /* copies finished */
+};
+static struct fused g_fused;
 
 static float sum16(const float *v)
 {
@@ -503,13 +561,14 @@ static inline void to_l2(const void *p)
 }
 
 /* `len` bytes from `p` into L2, a line at a time, starting `from` lines in
- * and wrapping around. */
-static void warm(const void *p, uint64_t len, uint64_t from)
+ * and wrapping around; of those, every `nmates`-th from `mate` on: the
+ * threads of one core share its L2, so each asks for its own part. */
+static void warm(const void *p, uint64_t len, uint64_t from, int mate, int nmates)
 {
     uint64_t lines = (len + 63) / 64;
     if (lines == 0) return;
     from %= lines;
-    for (uint64_t l = 0; l < lines; l++) {
+    for (uint64_t l = (uint64_t)mate; l < lines; l += (uint64_t)nmates) {
         uint64_t at = l + from;
         if (at >= lines) at -= lines;
         to_l2((const unsigned char *)p + at * 64);
@@ -522,16 +581,19 @@ static void warm(const void *p, uint64_t len, uint64_t from)
  * large multiply wants. */
 #define WARM_MAX (192u << 10)
 
-/* Before a small slice runs, ask for all of it: this thread's rows of
- * every matrix its groups use, the group table and the activation rows.
- * A cold line costs an in-order core its whole miss, and one token's
- * mixture multiply is a few rows of eight experts, about 300 lines a
- * thread, each met cold (the model's other layers pass through between
- * two visits). Asked for together, the misses overlap. The table and the
- * activations are the same lines for every thread, just written by
- * other cores; each thread starts on a different line of them, so the
- * pool does not queue on one line at a time. */
-static void warm_slice(const struct job *j, uint64_t i0, uint64_t i1, int slice)
+/* Before a small slice runs, ask for all of it: this core's rows of every
+ * matrix its groups use, the group table and the activation rows. A cold
+ * line costs an in-order core its whole miss, and one token's mixture
+ * multiply is a few rows of eight experts, about 300 lines a core, each
+ * met cold (the model's other layers pass through between two visits).
+ * Asked for together, the misses overlap. The table and the activations
+ * are the same lines for every core, just written by other cores; each
+ * core starts on a different line of them, so the pool does not queue on
+ * one line at a time. The threads of a core (`mate` of `nmates`, sharing
+ * rows i0..i1) split the asking between them. */
+#define WARM_ACTS 1      /* the group table and the activation rows */
+#define WARM_WEIGHTS 2   /* this core's rows of every matrix the groups use */
+static void warm_slice(const struct job *j, uint64_t i0, uint64_t i1, int core, int mate, int nmates, int what)
 {
     if (j->act_len == 0 || i1 <= i0) return;
     uint64_t span = (i1 - i0) * j->nb_a, total = j->act_len;
@@ -539,32 +601,124 @@ static void warm_slice(const struct job *j, uint64_t i0, uint64_t i1, int slice)
     for (uint64_t gi = 0; gi < j->ngroups; gi++)
         if (j->groups[gi].a != last) { total += span; last = j->groups[gi].a; }
     if (total > WARM_MAX) return;
-    uint64_t from = (uint64_t)slice * 7;
-    warm(j->groups, j->ngroups * sizeof *j->groups, from);
-    warm(j->b, j->act_len, from);
+    uint64_t from = (uint64_t)core * 7;
+    if (what & WARM_ACTS) {
+        warm(j->groups, j->ngroups * sizeof *j->groups, from, mate, nmates);
+        warm(j->b, j->act_len, from, mate, nmates);
+    }
+    if (!(what & WARM_WEIGHTS)) return;
     last = NULL;
     for (uint64_t gi = 0; gi < j->ngroups; gi++) {
         const unsigned char *a = j->groups[gi].a;
         if (a == last) continue;
         last = a;
-        warm(a + i0 * j->nb_a, span, 0);
+        warm(a + i0 * j->nb_a, span, 0, mate, nmates);
+    }
+}
+
+/* Rows i0..i1 of a job on this thread (`mate` of the `nmates` sharing
+ * them on core `core`): its own groups first when the job asks for them,
+ * then the warm-up, then the rows. */
+/* delay r32 (ISA reference 327364-001, appendix A): the thread neither
+ * fetches nor issues for `cycles`, leaving its core to the others while
+ * it waits (vpu_worker.c). */
+static inline void knc_delay(uint32_t cycles)
+{
+    __asm__ __volatile__(".byte 0xc5, 0xfa, 0xae, 0xf0" : : "a"(cycles) : "memory");
+}
+
+/* A thread's share of a fused pull: the lines of its core's part, split
+ * between the core's threads, then counted; the copy that completes the
+ * count notes the time. Every thread of the first `cores` cores counts,
+ * whether its share had lines or not. */
+static void copy_share(struct fused *f, int slice, int nslices)
+{
+    int core = slice, mate = 0, nmates = 1;
+    if (nslices > 57 && nslices % 57 == 0) {
+        core = slice % 57;
+        mate = slice / 57;
+        nmates = nslices / 57;
+    }
+    if (core >= f->cores) return;
+    uint64_t lo = f->n64 * (uint64_t)core / (uint64_t)f->cores, hi = f->n64 * (uint64_t)(core + 1) / (uint64_t)f->cores;
+    uint64_t a = lo + (hi - lo) * (uint64_t)mate / (uint64_t)nmates, b = lo + (hi - lo) * (uint64_t)(mate + 1) / (uint64_t)nmates;
+    if (b > a) phi_copy64(f->dst + a * 64, f->src + a * 64, (long)(b - a));
+    /* locked: the copy is visible before the count */
+    if (__sync_add_and_fetch(&f->copied, 1) == f->copiers) f->done_ns = now_ns();
+}
+
+/* Set up a fused pull of `n64` lines for a dispatch of `nslices`: at
+ * least PULL_LINES lines a copying core, as for a pooled pull, and no more
+ * cores than the dispatch has. */
+static void fused_setup(struct fused *f, unsigned char *dst, const unsigned char *src, uint64_t n64, int nslices)
+{
+    int per_core = nslices > 57 && nslices % 57 == 0 ? nslices / 57 : 1;
+    int most = nslices / per_core;
+    int cores = (int)(n64 / PULL_LINES);
+    if (cores < 1) cores = 1;
+    if (cores > most) cores = most;
+    f->dst = dst;
+    f->src = src;
+    f->n64 = n64;
+    f->cores = cores;
+    f->copiers = (uint32_t)(cores * per_core);
+    f->done_ns = 0;
+    f->copied = 0;
+}
+
+/* A slice's work: its rows of one matrix, or of each matrix of a request
+ * of several (up to VPU_MORE_MAX + 1 pieces), with `mate` of the `nmates`
+ * threads of core `core` taking alternate rows. Each piece's own groups
+ * first when the job asks for them, and its weight rows asked for; then,
+ * when the activations are still arriving (`fused`), this thread's share
+ * of copying them and the wait for the rest (the weights, which need
+ * only the ids, are on their way meanwhile, the copying threads' too);
+ * then the activations asked for and the rows computed. */
+static void run_pieces(const struct job *const *jobs, const uint64_t (*rng)[2], int count, int slice, int nslices,
+                       int core, int mate, int nmates)
+{
+    struct group own[VPU_MORE_MAX + 1][OWN_GROUPS_MAX];
+    struct job local[VPU_MORE_MAX + 1];
+    const struct job *use[VPU_MORE_MAX + 1];
+    struct fused *f = count > 0 ? jobs[0]->fused : NULL;
+    for (int x = 0; x < count; x++) {
+        use[x] = jobs[x];
+        if (jobs[x]->own_groups && rng[x][1] > rng[x][0]) {
+            local[x] = *jobs[x];
+            local[x].groups = own[x];
+            local[x].ngroups = groups_own(own[x], &local[x]);
+            use[x] = &local[x];
+        }
+        warm_slice(use[x], rng[x][0], rng[x][1], core, mate, nmates, f ? WARM_WEIGHTS : WARM_ACTS | WARM_WEIGHTS);
+    }
+    if (f) {
+        copy_share(f, slice, nslices);
+        int any = 0;
+        for (int x = 0; x < count; x++) any |= rng[x][1] > rng[x][0];
+        if (!any) return;
+        while (f->copied != f->copiers) knc_delay(64);
+    }
+    for (int x = 0; x < count; x++) {
+        if (rng[x][1] <= rng[x][0]) continue;
+        if (f) warm_slice(use[x], rng[x][0], rng[x][1], core, mate, nmates, WARM_ACTS);
+        rows_range_q(use[x], rng[x][0], rng[x][1], mate, nmates);
     }
 }
 
 static void rows_slice_q(void *arg, int slice, int nslices)
 {
     const struct job *j = arg;
-    uint64_t i0, i1;
+    uint64_t rng[1][2];
     int mate, nmates;
-    slice_rows(slice, nslices, j->m, &i0, &i1, &mate, &nmates);
-    warm_slice(j, i0, i1, slice);
-    rows_range_q(j, i0, i1, mate, nmates);
+    slice_rows(slice, nslices, j->m, &rng[0][0], &rng[0][1], &mate, &nmates);
+    run_pieces(&j, (const uint64_t(*)[2])rng, 1, slice, nslices, slice % 57, mate, nmates);
 }
 
 /* A request of several matrices by the same activations
- * (VPU_K_MATMUL_MORE): their rows one after another, cut into the pool's
- * slices as one range, and each piece of a slice computed as the rows of
- * its own matrix's job. One thread per core, as everywhere here. */
+ * (VPU_K_MATMUL_MORE): their rows one after another, cut into the cores'
+ * ranges as one (`slice_rows`), and each piece of a core's range computed
+ * as the rows of its own matrix's job, the core's threads taking
+ * alternate rows of it as they do of one matrix. */
 struct multi_job {
     const struct job *jobs[VPU_MORE_MAX + 1];
     uint64_t at[VPU_MORE_MAX + 2];   /* the first row of each job in the whole; at[count] is the total */
@@ -574,14 +728,15 @@ struct multi_job {
 static void rows_slice_multi(void *arg, int slice, int nslices)
 {
     const struct multi_job *mj = arg;
-    uint64_t total = mj->at[mj->count];
-    uint64_t r0 = total * (uint64_t)slice / (uint64_t)nslices, r1 = total * (uint64_t)(slice + 1) / (uint64_t)nslices;
+    uint64_t r0, r1, rng[VPU_MORE_MAX + 1][2];
+    int mate, nmates;
+    slice_rows(slice, nslices, mj->at[mj->count], &r0, &r1, &mate, &nmates);
     for (uint32_t x = 0; x < mj->count; x++) {
         uint64_t lo = r0 > mj->at[x] ? r0 : mj->at[x], hi = r1 < mj->at[x + 1] ? r1 : mj->at[x + 1];
-        if (hi <= lo) continue;
-        warm_slice(mj->jobs[x], lo - mj->at[x], hi - mj->at[x], slice);
-        rows_range_q(mj->jobs[x], lo - mj->at[x], hi - mj->at[x], 0, 1);
+        rng[x][0] = hi > lo ? lo - mj->at[x] : 0;
+        rng[x][1] = hi > lo ? hi - mj->at[x] : 0;
     }
+    run_pieces(mj->jobs, (const uint64_t(*)[2])rng, (int)mj->count, slice, nslices, slice % 57, mate, nmates);
 }
 
 /* The column groups of an ordinary multiply: consecutive columns, one
@@ -644,6 +799,46 @@ static uint64_t groups_mixture(struct group *gs, const struct job *j, uint64_t e
             }
             ng++;
             start += T;
+        }
+    }
+    return ng;
+}
+
+/* The groups of a request of few columns, built by the thread that reads
+ * them (`own_groups`), in its own memory: a plain multiply's as
+ * `groups_plain` builds them, a mixture's as `groups_mixture` does (the
+ * columns in order of the expert they chose, a stable insertion sort in
+ * place of the counting sort, then runs of eight, four or one), so the
+ * same columns meet in the same kernels either way. */
+static uint64_t groups_own(struct group *gs, const struct job *j)
+{
+    if (j->n_used == 0) return groups_plain(gs, j);
+    uint32_t order[OWN_GROUPS_MAX];
+    uint64_t n = j->n;
+    for (uint64_t p = 0; p < n; p++) {
+        uint64_t q = p;
+        while (q > 0 && j->ids[order[q - 1]] > j->ids[p]) {
+            order[q] = order[q - 1];
+            q--;
+        }
+        order[q] = (uint32_t)p;
+    }
+    uint64_t ng = 0;
+    for (uint64_t s = 0; s < n;) {
+        int32_t e = j->ids[order[s]];
+        uint64_t end = s;
+        while (end < n && j->ids[order[end]] == e) end++;
+        while (s < end) {
+            int T = group_of(end - s);
+            gs[ng].a = j->a + (uint64_t)e * j->a_stride;
+            gs[ng].n = T;
+            for (int q = 0; q < T; q++) {
+                uint32_t p = order[s + q];
+                gs[ng].x[q] = mix_row(j, p);
+                gs[ng].dst[q] = p;
+            }
+            ng++;
+            s += T;
         }
     }
     return ng;
@@ -881,8 +1076,8 @@ static void ffn_slice(void *arg, int slice, int nslices)
 static int ffn_run(volatile unsigned char *ctrl, int threads, int verbose,
                    uint64_t *compute_ns, uint64_t *pull_ns, uint64_t *push_ns, int *live)
 {
-    struct vpu_ffn ff;
-    memcpy(&ff, (const void *)(ctrl + VPU_OFF_FFN), sizeof ff);
+    struct vpu_ffn ff __attribute__((aligned(64)));
+    ctrl_read(&ff, ctrl + VPU_OFF_FFN, sizeof ff);
     if (ff.rows == 0 || ff.rows % 256 != 0 || ff.n == 0 || ff.k == 0 || ff.m_out == 0) return VPU_E_REQUEST;
     if (ff.b_off % VPU_BLOCK != 0 || ff.d_off % VPU_BLOCK != 0) return VPU_E_REQUEST;
     if (!quantized(ff.gate_type) || !quantized(ff.up_type) || !quantized(ff.down_type)) return VPU_E_REQUEST;
@@ -994,9 +1189,10 @@ static int ffn_run(volatile unsigned char *ctrl, int threads, int verbose,
 int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, int verbose,
                    uint64_t *compute_ns, uint64_t *pull_ns, uint64_t *push_ns, int *live)
 {
-    struct vpu_matmul mm;
-    memcpy(&mm, (const void *)(ctrl + VPU_OFF_MATMUL), sizeof mm);
+    struct vpu_matmul mm __attribute__((aligned(64)));
+    ctrl_read(&mm, ctrl + VPU_OFF_MATMUL, sizeof mm);
     *compute_ns = *pull_ns = *push_ns = 0;
+    MARK(1);
     *live = 0;
     if (g_consts[0] == 0) consts_init();
     if (kernel == VPU_K_FFN) return ffn_run(ctrl, threads, verbose, compute_ns, pull_ns, push_ns, live);
@@ -1220,13 +1416,13 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
      * is (resident, a quantized type, its shape, its rows within its
      * slice), and its results given their own run of card memory after
      * the base's, a line apart. */
-    struct vpu_more mo;
+    struct vpu_more mo __attribute__((aligned(64)));
     memset(&mo, 0, sizeof mo);
     uint64_t d_at[VPU_MORE_MAX + 1] = { 0 }, d_end = mm.n * mm.m * 4;
     const unsigned char *more_a[VPU_MORE_MAX] = { NULL };
     uint64_t more_have[VPU_MORE_MAX] = { 0 };
     if (more) {
-        memcpy(&mo, (const void *)(ctrl + VPU_OFF_MORE), sizeof mo);
+        ctrl_read(&mo, ctrl + VPU_OFF_MORE, sizeof mo);
         if (mo.count < 1 || mo.count > VPU_MORE_MAX || mm.a_id == 0 || !quantized(mm.a_type)) return VPU_E_REQUEST;
         for (uint32_t x = 0; x < mo.count; x++) {
             const struct vpu_more_mat *e = &mo.mat[x];
@@ -1248,8 +1444,21 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
     size_t brows = mixture ? mm.b_rows * mm.n_tokens : mm.n;
     size_t blen = blocks(mm.ids_bytes + brows * mm.nb_b), dlen = blocks(d_end);
     if (grow(&g_b, blen) != 0 || grow(&g_d, dlen) != 0) return VPU_E_ALLOC;
-    if (pull_data(g_b.m.p, mm.ids_bytes + brows * mm.nb_b, mm.b_off, threads) != 0) return VPU_E_PULL;
+    /* A small request (a few columns of a quantized type, its data within
+     * the mapping) pulls its activations inside its compute dispatch
+     * (`struct fused`); the ids, which the groups need, come first, here. */
+    size_t pull_len = mm.ids_bytes + brows * mm.nb_b;
+    const unsigned char *win = NULL;
+    if (quantized(mm.a_type) && mm.n <= OWN_GROUPS_MAX && g_map_small && pull_len <= MAP_POOL_MAX)
+        win = vpu_window(mm.b_off, (pull_len + 63) / 64 * 64);
+    if (win) {
+        if (mm.ids_bytes) phi_copy64(g_b.m.p, win, (long)(mm.ids_bytes / 64));
+    } else if (pull_data(g_b.m.p, pull_len, mm.b_off, threads) != 0) {
+        return VPU_E_PULL;
+    }
+    uint64_t act64 = (brows * mm.nb_b + 63) / 64;
     *pull_ns = now_ns() - t0;
+    MARK(2);
 
     uint32_t chunk = (uint32_t)mm.chunk;
     if (chunk < 1 || chunk > ROW_CHUNK_MAX) chunk = ROW_CHUNK;
@@ -1301,28 +1510,45 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
                 if (ex[x + 1] > most) most = ex[x + 1];
             }
         }
-        if (grow(&g_groups, (mo.count + 1) * mm.n * sizeof(struct group)) != 0) return VPU_E_ALLOC;
-        if (mixture && grow(&g_order, (most + mm.n) * sizeof(uint32_t)) != 0) return VPU_E_ALLOC;
+        /* A few columns: every thread groups them itself (`own_groups`). */
+        int own = mm.n <= OWN_GROUPS_MAX;
+        if (!own && grow(&g_groups, (mo.count + 1) * mm.n * sizeof(struct group)) != 0) return VPU_E_ALLOC;
+        if (!own && mixture && grow(&g_order, (most + mm.n) * sizeof(uint32_t)) != 0) return VPU_E_ALLOC;
         struct multi_job mj = { .count = mo.count + 1 };
         uint64_t total = 0;
         for (uint32_t x = 0; x <= mo.count; x++) {
-            struct group *gs = (struct group *)g_groups.m.p + (size_t)x * mm.n;
-            jobs[x].groups = gs;
-            jobs[x].ngroups = mixture ? groups_mixture(gs, &jobs[x], ex[x], (uint32_t *)g_order.m.p) : groups_plain(gs, &jobs[x]);
+            if (own) {
+                jobs[x].own_groups = 1;
+            } else {
+                struct group *gs = (struct group *)g_groups.m.p + (size_t)x * mm.n;
+                jobs[x].groups = gs;
+                jobs[x].ngroups = mixture ? groups_mixture(gs, &jobs[x], ex[x], (uint32_t *)g_order.m.p) : groups_plain(gs, &jobs[x]);
+            }
             mj.jobs[x] = &jobs[x];
             mj.at[x] = total;
             total += jobs[x].m;
         }
         mj.at[mo.count + 1] = total;
         if ((uint64_t)threads > total) threads = (int)total;
+        if (win) {
+            fused_setup(&g_fused, (unsigned char *)g_b.m.p + mm.ids_bytes, win + mm.ids_bytes, act64, threads);
+            for (uint32_t x = 0; x <= mo.count; x++) jobs[x].fused = &g_fused;
+        }
+        MARK(3);
         uint64_t c0 = now_ns();
         *live = vpu_pool_map(rows_slice_multi, &mj, threads);
         *compute_ns = now_ns() - c0;
+        if (win) {
+            *pull_ns = g_fused.done_ns - t0;
+            *compute_ns = now_ns() - g_fused.done_ns;
+        }
+        MARK(4);
         uint64_t p0 = now_ns();
         for (uint32_t x = 0; x <= mo.count; x++)
             if (push_data((const unsigned char *)g_d.m.p + d_at[x], mm.n * jobs[x].m * 4, x == 0 ? mm.d_off : mo.mat[x - 1].d_off, threads) != 0)
                 return VPU_E_PUSH;
         *push_ns = now_ns() - p0;
+        MARK(5);
         if (verbose > 1) {
             printf("matmul: %u matrices, %llu rows in all, . %llux%llu, on %d threads: pull %.3f compute %.3f push %.3f ms\n",
                    mo.count + 1, (unsigned long long)total, (unsigned long long)mm.n, (unsigned long long)mm.k, *live,
@@ -1336,20 +1562,36 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
      * and do not use them. */
     void (*slice)(void *, int, int) = mixture ? rows_slice_id : rows_slice;
     if (quantized(mm.a_type)) {
-        if (grow(&g_groups, mm.n * sizeof(struct group)) != 0) return VPU_E_ALLOC;
-        if (mixture && grow(&g_order, (experts + mm.n) * sizeof(uint32_t)) != 0) return VPU_E_ALLOC;
-        j.groups = (const struct group *)g_groups.m.p;
-        j.ngroups = mixture ? groups_mixture((struct group *)g_groups.m.p, &j, experts, (uint32_t *)g_order.m.p)
-                            : groups_plain((struct group *)g_groups.m.p, &j);
         slice = rows_slice;
+        if (mm.n <= OWN_GROUPS_MAX) {
+            /* A few columns: every thread groups them itself (`own_groups`). */
+            j.own_groups = 1;
+        } else {
+            if (grow(&g_groups, mm.n * sizeof(struct group)) != 0) return VPU_E_ALLOC;
+            if (mixture && grow(&g_order, (experts + mm.n) * sizeof(uint32_t)) != 0) return VPU_E_ALLOC;
+            j.groups = (const struct group *)g_groups.m.p;
+            j.ngroups = mixture ? groups_mixture((struct group *)g_groups.m.p, &j, experts, (uint32_t *)g_order.m.p)
+                                : groups_plain((struct group *)g_groups.m.p, &j);
+        }
     }
+    if (win) {
+        fused_setup(&g_fused, (unsigned char *)g_b.m.p + mm.ids_bytes, win + mm.ids_bytes, act64, threads);
+        j.fused = &g_fused;
+    }
+    MARK(3);
     uint64_t c0 = now_ns();
     *live = vpu_pool_map(slice, &j, threads);
     *compute_ns = now_ns() - c0;
+    if (win) {
+        *pull_ns = g_fused.done_ns - t0;
+        *compute_ns = now_ns() - g_fused.done_ns;
+    }
+    MARK(4);
 
     uint64_t p0 = now_ns();
     if (push_data(g_d.m.p, mm.n * mm.m * 4, mm.d_off, threads) != 0) return VPU_E_PUSH;
     *push_ns = now_ns() - p0;
+    MARK(5);
     if (verbose > 1) {
         static const char *names[VPU_MM_TYPES] = { "f32", "f16", "q4_K", "q5_K", "q6_K", "q8_0", "iq4_xs" };
         printf("matmul: %llux%llu . %llux%llu (%s%s) on %d threads: pull %.3f compute %.3f push %.3f ms\n",

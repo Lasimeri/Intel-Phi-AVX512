@@ -369,7 +369,7 @@ static void stage_copy(void *dst, const void *src, size_t len)
      * thread's copy of a few pages (measured: a prologue's small fetch went
      * from 0.9 to 1.5 ms through the pool). */
     if (g_in_exec || len < STAGE_POOL_MIN) memcpy(dst, src, len);
-    else vpu_pool_map(copy_slice, &j, vpu_pool_threads() + 1);
+    else vpu_pool_map(copy_slice, &j, vpu_pool_cores());
 }
 
 struct diff_job { const uint64_t *now, *was; uint64_t *masks; };
@@ -475,7 +475,7 @@ static int writeback_diff(struct chunk *c, int *n, uint32_t *pages_out)
 {
     static uint64_t masks[PAGES_PER_CHUNK];
     struct diff_job j = { (const uint64_t *)c->base, c->shadow, masks };
-    vpu_pool_map(diff_slice, &j, vpu_pool_threads() + 1);
+    vpu_pool_map(diff_slice, &j, vpu_pool_cores());
     for (unsigned p = 0; p < PAGES_PER_CHUNK; p++) {
         if (!masks[p]) continue;
         if (stage_page(n, c->base + p * 4096, masks[p]) != 0) return -1;
@@ -562,7 +562,7 @@ static void on_segv(int sig, siginfo_t *si, void *ctx)
             void *shadow = shadow_get();
             if (!shadow) { unlock(); leave(uc, VPU_EXIT_LIMIT, addr); return; }
             struct copy_job j = { (const void *)base, shadow, VPU_EXEC_CHUNK };
-            vpu_pool_map(copy_slice, &j, vpu_pool_threads() + 1);
+            vpu_pool_map(copy_slice, &j, vpu_pool_cores());
             c->shadow = shadow;
             set_prot(c, 1);
             c->dirty = 1;

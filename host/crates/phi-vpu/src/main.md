@@ -85,7 +85,7 @@ eight experts (`K_MATMUL_ID`). The rate part times a model-sized shape.
 | `--pattern B` | every quantized byte takes the value B: a wrong field mapping then shows as a fixed ratio |
 | `--probe` | print what each kernel instruction produces on the card, the rates one thread reaches, and the card's aggregate ceilings (read bandwidth, vector issue, the cost of one dispatch) |
 | `--moe` | only the one-token mixture rate: 8 of 256 experts at random from four resident tensors, so the weights are as cold as between two visits of a layer; the card's compute and total and the host's round trip, best and median (`matmul.md`) |
-| `--moe-shape M,K,ROWS` | with `--moe`, a shape instead of the default two (a 35B-A3B's gate or up share, 128,2048,1, and its down share, 448,512,8); repeatable |
+| `--moe-shape M,K,ROWS` | with `--moe`, a shape instead of the default two (a 35B-A3B's gate or up share, 128,2048,1, and its down share, 448,512,8); repeatable; ROWS 0 is a plain one-column multiply (a dense matrix at one token), over sixteen tensors so its weights are cold. Each line also gives the card's pull and push medians |
 
 `docs/results/2026-09-23-quantized-kernels.md` and
 `docs/results/2026-09-23-ceilings-and-residency.md` are what this
