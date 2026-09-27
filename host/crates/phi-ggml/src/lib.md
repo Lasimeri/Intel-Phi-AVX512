@@ -275,7 +275,8 @@ never more than an equal split between the host and the cards
 offered, a share of 31.2 percent and 4.23 GB per card. On the 35B-A3B,
 whose Q4_K experts are repacked, it is 5.1 GB offered and the cap. What
 a full card is worth is in
-`docs/results/2026-09-23-redundancy-and-transport.md`.
+`docs/results/2026-09-23-redundancy-and-transport.md`. (Sized per class
+and exactly since 2026-09-27: below, "A share per class".)
 
 The cap was first an equal split between the cards, half each on two,
 which leaves the host no rows at all, and the one-token judgement
@@ -425,3 +426,58 @@ and at generation with the share set to where the adaptation settles
 (`PHI_GGML_PP_SHARE=0.58`), and computes what the default does
 (perplexity and KL divergence within error):
 `docs/results/2026-09-26-repacking-and-determinism.md`.
+
+## A share per class (2026-09-27)
+
+One share for every matrix was sized as budget over total, less 3
+percent for rounding, and on a mixture of experts offered whole (the
+35B-A3B with `--no-repack`, 20.9 GB) that went wrong twice:
+
+- **Most of the budget went where a token reads least.** A token reads
+  every byte of a dense matrix and 8 of a layer's 256 experts, so a byte
+  of card memory on a dense matrix takes about thirty times the host
+  reading off it that a byte of expert does. At 20.5 percent of
+  everything, the dense matrices that carry the gain held a fifth of
+  their rows.
+- **The rounding ran past the 3 percent.** A card's rows are rounded so
+  the host keeps a multiple of 64, and a 512-row expert matrix moves in
+  steps of an eighth: at 20.5 percent it took 128 rows, a quarter. Both
+  cards reported "budget is spent at 4.36 GB" before the model's end, and
+  the vocabulary matrix, which comes last (417 MB, 22.8 ms of host
+  reading a token), had no rows on them at all. The dense 27B had the
+  same end at 31.2 percent.
+
+`size_shares` now sizes from each tensor's shape, which the glue notes
+with it (`phi_ggml_note_weight`: rows, bytes per row, matrices, whether
+a mixture's). The dense matrices go first, at the cap if they fit and
+at the largest share that fits if not. The experts share what is left:
+the largest uniform share that fits, then, because a uniform share stops
+short of the budget by up to a step of every expert tensor, one more
+64-row step for each expert tensor in address order while the budget
+still holds. Every cost is what `plan` will spend: `card_rows` is the
+rounding `plan` itself uses (one function for both), `declined` the
+`min_bytes` rule it applies, and `card_cost` whole 2 MiB pages, so the
+budget is filled and not overrun, with no allowance kept back.
+
+On the 35B-A3B with `--no-repack`: 1.4 GB of dense weights and 19.5 GB of
+experts offered, each card keeping a third of every dense matrix and
+12.6 percent of the experts (83 expert tensors a step more), 4.40 GB,
+with nothing left out. Repacked (llama.cpp's default), 0.7 and 4.4 GB
+are offered and everything fits at the cap, as before. On the 27B (dense
+only) the share that fits exactly is 30.0 percent, where 31.2 ran out
+before the end.
+
+Measured (`docs/results/2026-09-27-share-per-class.md`), llama-server
+and llama-bench, interleaved: the offloaded 35B-A3B generates at 8.9
+tokens per second against 7.5 with one share and 7.5 for the host alone
+(`--no-repack`, the same session), at the host's prompt rate, and holds
+13.4 GiB resident where the host alone holds 20.7; the split with
+`--no-repack`, 12 percent slower than the host on 2026-09-26, now 8.9
+against 7.6; the repacked split unchanged; the 27B 2.01 and 2.02 tokens
+per second against 1.90 and 1.87 at generation, pp512 unchanged. The
+logits are the host's to within its own kernels' differences (perplexity
+and KL divergence).
+
+`PHI_GGML_FRACTION` set still fixes one share for every tensor. A tensor
+offered after the shares are settled (a draft model's) takes its class's
+base share (`share_of`), fitted into what budget is left as before.

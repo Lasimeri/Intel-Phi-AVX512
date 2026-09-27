@@ -170,11 +170,11 @@ the 2026-09-23 figures (+26 and about -8 percent), whose prompt side was
 measured with the stride defect live and whose host ran on 16 threads.
 Verified: perplexity and KL divergence against the host alone within
 error, and in llama-server over two rounds (84 and 8.8 against 83.4 and
-7.8). Its experts stay repacked on the host for now: offering every
-weight (`--no-repack`) made the split 11 and 12 percent slower, because
-one share over 20.9 GB thins the non-expert tensors that carry the gain
-and fills the cards before the model's last layers (a share per class is
-untested). The default split does not repeat a greedy output between
+7.8). Its experts stay repacked on the host: offering every weight
+(`--no-repack`) made the split 11 and 12 percent slower with one share
+over all 20.9 GB, and with a share per class (the dense matrices first,
+since 2026-09-27) it generates as fast as the repacked split (8.9) but
+keeps the unrepacked host's slower prompt (63 against 83). The default split does not repeat a greedy output between
 identical requests (its judge moves tensors by their timings);
 `PHI_GGML_JUDGE=0 PHI_GGML_PP_ADAPT=0` repeats exactly, within a server
 and across separate runs, at about 5 percent of speed
@@ -192,9 +192,15 @@ holding 41 percent of its weights). The card worker now warms a small
 request's lines before computing, pulls a request's activations a
 fixed 32 lines or more per thread (a row copied a line or two per core
 and then read by all 57 was the costliest part), and logs requests only
-at `-v -v`: 0.33 ms each, and **7.4 tokens per second**, against 7.7 for
-the host alone, with the same text byte for byte
-(`docs/results/2026-09-27-small-requests.md`).
+at `-v -v`: 0.33 ms each, and 7.4 tokens per second with the same text
+byte for byte (`docs/results/2026-09-27-small-requests.md`). The cards'
+budget then went to the dense matrices first, the experts sharing the
+rest, sized with the rows' own rounding, which puts the vocabulary
+matrix on the cards too: **8.9 tokens per second offloaded against 7.5
+for the host alone** in the same session, at the host's prompt rate,
+with 13.3 GiB of the host resident against 20.7, and the logits within
+the host's own kernels' differences; the dense 27B generates 7 percent
+faster for the same reason (`docs/results/2026-09-27-share-per-class.md`).
 
 A model larger than this host's 31 GiB runs from its file, the page
 cache holding what it can. By default the cards' rows are a copy, so

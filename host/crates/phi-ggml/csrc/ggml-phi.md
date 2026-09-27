@@ -133,9 +133,10 @@ backend repacks some quantized types into its own interleaved layout
 this backend reads ggml's standard layout only. The scheduler checks
 buffers before placing a node too; declining here is what keeps such a
 weight out of the count the share is sized by. Every weight a multiply
-is accepted for is noted (`phi_ggml_note_weight`) with its whole size,
-and the Rust side sizes the cards' share from the total at the first
-multiply (`../src/lib.md`).
+is accepted for is noted (`phi_ggml_note_weight`) with its shape (rows,
+bytes per row, matrices) and whether it is a mixture's, and the Rust side
+sizes the cards' shares from them at the first multiply, the dense
+matrices first (`../src/lib.md`, "A share per class").
 
 ## A device only when the cards open (2026-09-24)
 

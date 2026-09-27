@@ -24,7 +24,7 @@
 
 int phi_ggml_open(void);
 int phi_ggml_supports(uint32_t a_type, uint64_t m, uint64_t k, uint64_t nb_a, uint64_t nb_b, uint64_t n);
-void phi_ggml_note_weight(const uint8_t *data, uint64_t bytes);
+void phi_ggml_note_weight(const uint8_t *data, uint64_t m, uint64_t nb_a, uint64_t experts, int mixture);
 int64_t phi_ggml_begin(const uint8_t *a, uint32_t a_type, uint64_t m, uint64_t k, uint64_t nb_a, int keep,
                        const uint8_t *b, uint64_t n, uint64_t nb_b);
 int64_t phi_ggml_begin_id(const uint8_t *a, uint32_t a_type, uint64_t m, uint64_t k, uint64_t nb_a, int keep,
@@ -381,10 +381,11 @@ static bool phi_supports_mul_mat_id(const struct ggml_tensor *op)
     if (src0->ne[3] != 1 || src1->ne[3] != 1) return false;
     if (src0->ne[0] != src1->ne[0]) return false;
     if (!strstr(src0->name, "weight")) return false;
-    /* the card holds every expert's rows: the whole tensor is the budget */
+    /* the card holds every expert's rows: the whole tensor is the budget, and a
+     * mixture's weights are sized as a class of their own (Rust, settle_fraction) */
     if (phi_ggml_supports((uint32_t)t, (uint64_t)src0->ne[1], (uint64_t)src0->ne[0], src0->nb[1], src1->nb[1],
                              (uint64_t)(src1->ne[1] * src1->ne[2])) == 0) return false;
-    phi_ggml_note_weight(src0->data, (uint64_t)src0->nb[2] * (uint64_t)src0->ne[2]);
+    phi_ggml_note_weight(src0->data, (uint64_t)src0->ne[1], src0->nb[1], (uint64_t)src0->ne[2], 1);
     return true;
 }
 
@@ -404,8 +405,8 @@ static bool phi_supports_mul_mat(const struct ggml_tensor *op)
     /* only a weight is worth splitting: anything else the host does whole */
     if (!strstr(src0->name, "weight")) return false;
     if (phi_ggml_supports((uint32_t)t, (uint64_t)src0->ne[1], (uint64_t)src0->ne[0], src0->nb[1], src1->nb[1], (uint64_t)src1->ne[1]) == 0) return false;
-    /* what the cards could hold, for sizing their share (Rust, settle_fraction) */
-    phi_ggml_note_weight(src0->data, (uint64_t)src0->nb[1] * (uint64_t)src0->ne[1]);
+    /* what the cards could hold, by shape, for sizing their share (Rust, settle_fraction) */
+    phi_ggml_note_weight(src0->data, (uint64_t)src0->ne[1], src0->nb[1], 1, 0);
     return true;
 }
 

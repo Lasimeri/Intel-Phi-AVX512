@@ -94,7 +94,14 @@ struct Ctx {
     /// the 27B's cards at 3.48 GB of 4.4.
     fraction_auto: bool,
     fraction_settled: bool,
-    offered: HashMap<usize, u64>,
+    offered: HashMap<usize, Offer>,
+    /// The share of each offered tensor, by address, once settled
+    /// (`size_shares`): the dense matrices first, the experts in what
+    /// budget is left. A tensor not in it (offered after settling, a
+    /// draft model's) takes `fraction`, or `fraction_experts` for a
+    /// mixture.
+    shares: HashMap<usize, f64>,
+    fraction_experts: f64,
     /// The weights a multiply must take off the host before a card is
     /// worth its round trip: 0.45 ms at a host rate no worse than 10
     /// GB/s is 4.5 MB, and this is the conservative end of that, so
@@ -312,6 +319,8 @@ pub extern "C" fn phi_ggml_open() -> i32 {
         fraction_auto: fixed.is_none(),
         fraction_settled: false,
         offered: HashMap::new(),
+        shares: HashMap::new(),
+        fraction_experts: fraction,
         min_bytes: env_or("PHI_GGML_MIN_BYTES", 4_000_000u64),
         too_small: 0,
         judged: None,
@@ -548,21 +557,39 @@ pub extern "C" fn phi_ggml_supports(a_type: u32, m: u64, k: u64, nb_a: u64, nb_b
     1
 }
 
-/// A weight tensor the glue has just accepted a multiply of (`bytes`, the
-/// whole tensor), noted for sizing the share (`Ctx::offered`). Calls
-/// before the backend is open, or after the share is settled, are ignored:
-/// llama.cpp asks about operations while it loads the model too, and a
-/// second model (a draft) arriving later is fitted into what budget is
-/// left, as any tensor past the budget is.
+/// A weight the scheduler offered this backend: `m` rows of `nb_a` bytes,
+/// `experts` matrices of them for a mixture (`MUL_MAT_ID`), one for an
+/// ordinary multiply.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Offer {
+    m: u64,
+    nb_a: u64,
+    experts: u64,
+    mixture: bool,
+}
+
+/// A weight tensor the glue has just accepted a multiply of, noted for
+/// sizing the shares (`Ctx::offered`): its rows, bytes per row, matrices,
+/// and whether it is a mixture's. Calls before the backend is open, or
+/// after the shares are settled, are ignored: llama.cpp asks about
+/// operations while it loads the model too, and a second model (a draft)
+/// arriving later is fitted into what budget is left, as any tensor past
+/// the budget is.
 #[no_mangle]
-pub extern "C" fn phi_ggml_note_weight(data: *const u8, bytes: u64) {
+pub extern "C" fn phi_ggml_note_weight(data: *const u8, m: u64, nb_a: u64, experts: u64, mixture: i32) {
     if data.is_null() {
         return;
     }
     let mut guard = CTX.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(ctx) = guard.as_mut() {
         if !ctx.fraction_settled {
-            ctx.offered.insert(data as usize, bytes);
+            let offer = Offer {
+                m,
+                nb_a,
+                experts: experts.max(1),
+                mixture: mixture != 0,
+            };
+            ctx.offered.insert(data as usize, offer);
         }
     }
 }
@@ -590,28 +617,190 @@ fn share_cap(ncards: usize, all_rows: bool) -> f64 {
     1.0 / (ncards as f64 + 1.0)
 }
 
-/// Size the share at the first multiply, from the weights offered: each
-/// card keeps `fraction` of every one of them, so the share that fills the
-/// smallest budget is that budget over their total, less 3 percent
-/// because a card's rows round up to 64 and the output matrix, which
-/// comes last, must still fit. Never more than an equal split with the
-/// host would leave it (`share_cap`).
+/// The rows each card takes of a matrix of `m` rows at share `f`, indexed
+/// by card, as `plan` assigns them: the last card first, from the top
+/// down; the host's remainder kept a multiple of 64, which ggml's fast
+/// paths want (measured 0.43 ms against 7.7 ms for 2918 rows of a
+/// 4864-row f16); no slice larger than the upload window. `row_bytes` is
+/// a row of every matrix the tensor holds (`nb_a * experts`). One
+/// function for both, so that what the shares are sized by is exactly
+/// what is uploaded.
+fn card_rows(m: u64, f: f64, ncards: usize, row_bytes: u64) -> Vec<u64> {
+    let mut out = vec![0; ncards];
+    let mut lo = m;
+    for rows_c in out.iter_mut().rev() {
+        let mut rows = (m as f64 * f).round() as u64;
+        if row_bytes > 0 && rows * row_bytes > A_MAX {
+            rows = A_MAX / row_bytes;
+        }
+        rows = rows.min(lo);
+        rows = lo - ((lo - rows) & !63);
+        *rows_c = rows;
+        lo -= rows;
+    }
+    out
+}
+
+/// Whether an ordinary multiply's rows stay off the cards altogether at
+/// share `f`: every card's part together cannot reach `min_bytes`, so no
+/// multiply of it would be sent (`begin`) and its rows are not uploaded.
+/// A mixture's card part grows with its columns and is always planned.
+fn declined(o: &Offer, f: f64, ncards: usize, min_bytes: u64) -> bool {
+    let most = (((o.m as f64 * f).round() as u64) * ncards as u64).min(o.m);
+    !o.mixture && most * o.nb_a < min_bytes
+}
+
+/// What a tensor costs each card at share `f` (`card_cost`: whole 2 MiB
+/// pages), added into `per_card`.
+fn add_cost(per_card: &mut [u64], o: &Offer, f: f64, min_bytes: u64) {
+    if declined(o, f, per_card.len(), min_bytes) {
+        return;
+    }
+    let row_bytes = o.nb_a * o.experts;
+    for (c, rows) in card_rows(o.m, f, per_card.len(), row_bytes).into_iter().enumerate() {
+        if rows > 0 {
+            per_card[c] += card_cost(rows * row_bytes);
+        }
+    }
+}
+
+/// Each offered tensor's share, and the two classes' base shares, so that
+/// every card's uploads fit `budget`. The dense matrices first, at the cap
+/// if they fit there: a token reads every byte of one, where it reads 8 of
+/// a mixture's 256 experts, so a byte of card memory spent on a dense
+/// matrix takes about thirty times the host's per-token reading off it
+/// (2026-09-27, `docs/results/2026-09-27-share-per-class.md`). The
+/// experts then share what is left: the largest uniform share that fits,
+/// then one more 64-row step for each expert tensor in address order
+/// while the budget holds, because an expert matrix of 512 rows moves in
+/// steps of an eighth and a uniform share stops short of the budget by up
+/// to a step of every tensor.
+fn size_shares(offers: &[(usize, Offer)], ncards: usize, cap: f64, budget: u64, min_bytes: u64) -> (f64, f64, HashMap<usize, f64>) {
+    let cost = |set: &[&(usize, Offer)], f: f64, base: &[u64]| -> Vec<u64> {
+        let mut per_card = base.to_vec();
+        for (_, o) in set {
+            add_cost(&mut per_card, o, f, min_bytes);
+        }
+        per_card
+    };
+    let fits = |per_card: &[u64]| per_card.iter().all(|&c| c <= budget);
+    // The largest share in 0..=cap for which `ok` holds (it holds at 0).
+    let largest = |ok: &dyn Fn(f64) -> bool| -> f64 {
+        if ok(cap) {
+            return cap;
+        }
+        let (mut lo, mut hi) = (0.0, cap);
+        for _ in 0..40 {
+            let mid = 0.5 * (lo + hi);
+            if ok(mid) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    };
+    let zero = vec![0u64; ncards];
+    let mut sorted: Vec<&(usize, Offer)> = offers.iter().collect();
+    sorted.sort_by_key(|(addr, _)| *addr);
+    let (experts, dense): (Vec<_>, Vec<_>) = sorted.into_iter().partition(|(_, o)| o.mixture);
+    let f_dense = largest(&|f| fits(&cost(&dense, f, &zero)));
+    let used = cost(&dense, f_dense, &zero);
+    let mut f_experts = largest(&|f| fits(&cost(&experts, f, &used)));
+    // A share too small to round to a row of anything is none at all.
+    if cost(&experts, f_experts, &zero).iter().all(|&c| c == 0) {
+        f_experts = 0.0;
+    }
+    let mut shares: HashMap<usize, f64> = dense.iter().map(|(a, _)| (*a, f_dense)).collect();
+    let mut used = cost(&experts, f_experts, &used);
+    for (addr, o) in &experts {
+        let at = |f: f64| card_rows(o.m, f, ncards, o.nb_a * o.experts);
+        let now = at(f_experts);
+        // The next share that gives some card 64 rows more, if the cap allows.
+        let step = (64.0 / o.m as f64).max(1e-9);
+        let mut f = f_experts;
+        let mut next = None;
+        while f + step <= cap + 1e-12 {
+            f += step;
+            if at(f) != now {
+                next = Some(f);
+                break;
+            }
+        }
+        let mut chosen = f_experts;
+        if let Some(f) = next {
+            let mut trial = used.clone();
+            let (mut before, mut after) = (vec![0u64; ncards], vec![0u64; ncards]);
+            add_cost(&mut before, o, f_experts, min_bytes);
+            add_cost(&mut after, o, f, min_bytes);
+            for c in 0..ncards {
+                trial[c] = trial[c] - before[c] + after[c];
+            }
+            if fits(&trial) {
+                used = trial;
+                chosen = f;
+            }
+        }
+        shares.insert(*addr, chosen);
+    }
+    (f_dense, f_experts, shares)
+}
+
+/// Size the shares at the first multiply, from the weights offered
+/// (`size_shares`): the dense matrices at the cap if they fit, the
+/// experts in what is left, every card's uploads counted as `plan` will
+/// make them. Never more than an equal split with the host would leave
+/// (`share_cap`). `PHI_GGML_FRACTION` set, it is every tensor's share.
 fn settle_fraction(ctx: &mut Ctx) {
     if ctx.fraction_settled {
         return;
     }
     ctx.fraction_settled = true;
-    let total: u64 = ctx.offered.values().sum();
-    if !ctx.fraction_auto || total == 0 {
+    if !ctx.fraction_auto || ctx.offered.is_empty() {
+        ctx.fraction_experts = ctx.fraction;
         return;
     }
     let budget = ctx.cards.iter().map(|c| c.budget).min().unwrap_or(0);
-    ctx.fraction = (0.97 * budget as f64 / total as f64).min(share_cap(ctx.cards.len(), ctx.all_rows));
+    let cap = share_cap(ctx.cards.len(), ctx.all_rows);
+    let offers: Vec<(usize, Offer)> = ctx.offered.iter().map(|(a, o)| (*a, *o)).collect();
+    let (f_dense, f_experts, shares) = size_shares(&offers, ctx.cards.len(), cap, budget, ctx.min_bytes);
+    let gb = |mixture: bool| {
+        offers
+            .iter()
+            .filter(|(_, o)| o.mixture == mixture)
+            .map(|(_, o)| o.m * o.nb_a * o.experts)
+            .sum::<u64>() as f64
+            / 1e9
+    };
+    let stepped = offers
+        .iter()
+        .filter(|(a, o)| o.mixture && shares.get(a).is_some_and(|&f| f > f_experts))
+        .count();
+    let mut per_card = vec![0u64; ctx.cards.len()];
+    for (a, o) in &offers {
+        add_cost(&mut per_card, o, shares[a], ctx.min_bytes);
+    }
+    ctx.fraction = f_dense;
+    ctx.fraction_experts = f_experts;
+    ctx.shares = shares;
     say(&format!(
-        "{:.1} GB of weights offered to the cards: each keeps {:.1}% of every weight matrix's rows",
-        total as f64 / 1e9,
-        ctx.fraction * 100.0
+        "{:.1} GB of dense weights and {:.1} GB of experts offered to the cards: each keeps {:.1}% of every dense matrix's rows \
+         and {:.1}% of the experts' ({stepped} expert tensors a step more), {:.2} GB",
+        gb(false),
+        gb(true),
+        f_dense * 100.0,
+        f_experts * 100.0,
+        per_card.iter().copied().max().unwrap_or(0) as f64 / 1e9
     ));
+}
+
+/// The share of the tensor at `key`: its own once the shares are settled,
+/// else its class's.
+fn share_of(ctx: &Ctx, key: usize, mixture: bool) -> f64 {
+    ctx.shares
+        .get(&key)
+        .copied()
+        .unwrap_or(if mixture { ctx.fraction_experts } else { ctx.fraction })
 }
 
 /// Ring a card's doorbell for the descriptor `mm` without waiting.
@@ -692,32 +881,30 @@ fn card_cost(bytes: u64) -> u64 {
 }
 
 /// Decide and carry out the shares of a weight tensor seen for the first
-/// time: each card that still has budget takes `fraction` of the rows,
-/// uploaded now. A mixture's tensor holds `experts` matrices of `m` rows
-/// (`nb_a2` apart), and the card takes the same rows of every one of
-/// them, one after another in its own buffer: the expert an id names is
-/// then `rows * nb_a` into it.
+/// time: each card that still has budget takes share `f` of the rows
+/// (`card_rows`, the same rounding the shares were sized with), uploaded
+/// now. A mixture's tensor holds `experts` matrices of `m` rows (`nb_a2`
+/// apart), and the card takes the same rows of every one of them, one
+/// after another in its own buffer: the expert an id names is then
+/// `rows * nb_a` into it.
 ///
 /// # Safety
 /// `a` must be `experts` matrices of `m` rows of `nb_a` bytes, `nb_a2` apart.
-unsafe fn plan(ctx: &mut Ctx, a: *const u8, a_type: u32, m: u64, nb_a: u64, experts: u64, nb_a2: u64) -> Split {
+#[allow(clippy::too_many_arguments)]
+unsafe fn plan(ctx: &mut Ctx, a: *const u8, a_type: u32, m: u64, nb_a: u64, experts: u64, nb_a2: u64, f: f64) -> Split {
     let mut r0 = m;
     let mut cards = Vec::new();
     let mut lo = m;
+    let want = card_rows(m, f, ctx.cards.len(), nb_a * experts);
     for (ci, card) in ctx.cards.iter_mut().enumerate().rev() {
         if card.full {
             continue;
         }
-        let mut rows = (m as f64 * ctx.fraction).round() as u64;
-        if rows * nb_a * experts > A_MAX {
-            rows = A_MAX / (nb_a * experts);
-        }
-        // The host's rows stay a multiple of 64: ggml's fast paths want that
-        // (measured 0.43 ms against 7.7 ms for 2918 rows of a 4864-row f16).
-        if rows > lo {
-            rows = lo;
-        }
-        rows = lo - ((lo - rows) & !63);
+        // As sized; recomputed against what is left when a card before this
+        // one took nothing (full, or its upload refused), so the host's
+        // rows still stay a multiple of 64.
+        let rows = want[ci].min(lo);
+        let rows = lo - ((lo - rows) & !63);
         if rows == 0 {
             continue;
         }
@@ -978,12 +1165,19 @@ unsafe fn begin(a: *const u8, a_type: u32, m: u64, k: u64, nb_a: u64, keep: i32,
     }
     if !ctx.splits.contains_key(&key) {
         // A plain multiply whose largest possible card part, every card's
-        // `fraction` of the rows, cannot reach `min_bytes` is never given
-        // to the cards (below), so its rows are not uploaded either: the
-        // cards' budget goes to tensors that will use it. A mixture's card
-        // part grows with its columns, so it is planned as always.
-        let most = (((m as f64 * ctx.fraction).round() as u64) * ctx.cards.len() as u64).min(m);
-        let split = if !mixture && most * nb_a < ctx.min_bytes {
+        // share of the rows, cannot reach `min_bytes` is never given to the
+        // cards (below), so its rows are not uploaded either: the cards'
+        // budget goes to tensors that will use it (`declined`, which the
+        // shares were sized with). A mixture's card part grows with its
+        // columns, so it is planned as always.
+        let f = share_of(ctx, key, mixture);
+        let offer = Offer {
+            m,
+            nb_a,
+            experts: mix.experts,
+            mixture,
+        };
+        let split = if declined(&offer, f, ctx.cards.len(), ctx.min_bytes) {
             Split {
                 r0: m,
                 cards: Vec::new(),
@@ -993,7 +1187,7 @@ unsafe fn begin(a: *const u8, a_type: u32, m: u64, k: u64, nb_a: u64, keep: i32,
             }
         } else {
             // SAFETY: the caller's contract.
-            unsafe { plan(ctx, a, a_type, m, nb_a, mix.experts, mix.nb_a2) }
+            unsafe { plan(ctx, a, a_type, m, nb_a, mix.experts, mix.nb_a2, f) }
         };
         ctx.splits.insert(key, split);
     }
@@ -1417,6 +1611,95 @@ mod tests {
         // SAFETY: as above.
         let most = unsafe { to_f16(x.as_ptr(), h.as_mut_ptr(), 3) };
         assert!(most <= F16_MAX, "65504 is a half, and must not be refused");
+    }
+
+    /// The rows `plan` gives each card, as the shares are sized with them:
+    /// the 35B-A3B's gate or up experts (512 rows) at 20.5 percent take 128
+    /// a card, its down experts (2048) 448, and the host keeps a multiple
+    /// of 64 of each; the vocabulary matrix at a third leaves the host its
+    /// own third to 64 rows.
+    #[test]
+    fn card_rows_rounds_as_plan_does() {
+        assert_eq!(card_rows(512, 0.205, 2, 1), vec![128, 128]);
+        assert_eq!(card_rows(2048, 0.205, 2, 1), vec![448, 448]);
+        let v = card_rows(248_320, 1.0 / 3.0, 2, 1);
+        assert_eq!(v, vec![82_816, 82_816]);
+        assert_eq!((248_320 - v[0] - v[1]) % 64, 0);
+        assert_eq!(card_rows(512, 0.0, 2, 1), vec![0, 0]);
+        // no slice past the upload window
+        let big = card_rows(1 << 20, 0.5, 1, 1024);
+        assert!(big[0] * 1024 <= A_MAX);
+    }
+
+    fn offer(m: u64, nb_a: u64, experts: u64) -> Offer {
+        Offer {
+            m,
+            nb_a,
+            experts,
+            mixture: experts > 1,
+        }
+    }
+
+    fn used(offers: &[(usize, Offer)], shares: &HashMap<usize, f64>, ncards: usize, min_bytes: u64) -> Vec<u64> {
+        let mut per_card = vec![0; ncards];
+        for (a, o) in offers {
+            add_cost(&mut per_card, o, shares[a], min_bytes);
+        }
+        per_card
+    }
+
+    /// Dense matrices take the cap when they fit, the experts share what
+    /// is left, single expert tensors take one more step while the budget
+    /// holds, and no card is ever given more than its budget.
+    #[test]
+    fn dense_first_then_experts_in_what_is_left() {
+        let cap = share_cap(2, false);
+        // A vocabulary-like matrix and eight dense ones, then 40 layers of
+        // gate, up and down experts shaped like the 35B-A3B's.
+        let mut offers = vec![(1, offer(248_320, 1680, 1))];
+        for i in 0..8 {
+            offers.push((10 + i, offer(8192, 1152, 1)));
+        }
+        for l in 0..40 {
+            offers.push((1000 + 3 * l, offer(512, 1152, 256)));
+            offers.push((1001 + 3 * l, offer(512, 1152, 256)));
+            offers.push((1002 + 3 * l, offer(2048, 288, 256)));
+        }
+        let budget = 4_400_000_000;
+        let (f_dense, f_experts, shares) = size_shares(&offers, 2, cap, budget, 4_000_000);
+        assert_eq!(f_dense, cap);
+        assert!(f_experts > 0.0 && f_experts < cap, "{f_experts}");
+        let per_card = used(&offers, &shares, 2, 4_000_000);
+        assert!(per_card.iter().all(|&c| c <= budget), "{per_card:?}");
+        // The greedy steps leave less than one more step of any expert
+        // tensor unused.
+        let step = card_cost(64 * 1152 * 256);
+        assert!(per_card.iter().all(|&c| budget - c < step), "{per_card:?} leaves a step unused");
+        assert!(shares.values().any(|&f| f > f_experts), "no expert tensor took a step");
+    }
+
+    /// When the dense matrices alone are more than the budget, their share
+    /// shrinks to fit and the experts get nothing; a matrix whose card part
+    /// is under `min_bytes` is not uploaded and costs nothing.
+    #[test]
+    fn a_budget_too_small_for_the_dense_matrices() {
+        let cap = share_cap(2, false);
+        let offers: Vec<(usize, Offer)> = (0..10)
+            .map(|i| (i, offer(8192, 1152, 1)))
+            .chain([(99, offer(512, 1152, 256))])
+            .collect();
+        let budget = 20_000_000;
+        let (f_dense, f_experts, shares) = size_shares(&offers, 2, cap, budget, 1_000_000);
+        assert!(f_dense < cap);
+        assert_eq!(f_experts, 0.0);
+        assert!(used(&offers, &shares, 2, 1_000_000).iter().all(|&c| c <= budget));
+        // 2048 rows of 1152 bytes: a third each is 1.6 MB, under 4 MB
+        let small = offer(2048, 1152, 1);
+        assert!(declined(&small, cap, 2, 4_000_000));
+        let mut per_card = vec![0; 2];
+        add_cost(&mut per_card, &small, cap, 4_000_000);
+        assert_eq!(per_card, vec![0, 0]);
+        assert!(!declined(&offer(512, 1152, 256), 0.01, 2, 4_000_000), "a mixture is always planned");
     }
 
     /// Offloaded rows are dropped only from a mapping of a file, and only
