@@ -96,7 +96,8 @@ cards, the Q4_K_M the one for correctness and for comparison):
 | --- | --- | --- |
 | **writing code from a description, Q6_K offloaded** | **9.5 to 9.8** (client's clock 9.76, 9.50; nothing from disk; the program compiles and matches gzip's CRC-32 on 312 inputs up to 2.08 GB) | `docs/results/2026-09-27-code-generation-q8.md` |
 | the same, Q8_0 offloaded (37.8 GB, past the host's memory) | about 8 (8.04, 8.08) | same |
-| the same with a 2B draft model | 4.63, 4.82: slower, not used | same |
+| the same with a draft model, even the smallest (2B Q4_K_M with the Q6_K) | 6.89, 6.91: slower, not used | same |
+| the 9B Q8_0 dense, **entirely on the cards** (host 2.3 GiB) | about 8 (8.03, 7.99) | same |
 | copying code from the prompt with prompt lookup, Q4_K_M, generation phase only | about 40 (whole request 6.5 with the 2385-token prompt) | same, and `2026-09-27-prompt-lookup-llama-server.md` |
 | Q8_0 offloaded, prompt | 72 (57.8 before the two-threads pool) | `docs/results/2026-09-27-two-threads-per-core.md` |
 

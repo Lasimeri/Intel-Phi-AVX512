@@ -1,4 +1,4 @@
-# 2026-09-27: what code generation runs at, the 35B-A3B Q6_K and Q8_0 on the cards
+# 2026-09-27: what code generation runs at on the cards: the 35B-A3B (Q6_K, Q8_0) and the 9B (Q8_0)
 
 **Read this before any tokens-per-second figure of prompt lookup
 decoding in this repository.**
@@ -14,8 +14,13 @@ decoding in this repository.**
   task, measured on the **Q4_K_M**, and they count the **generation phase
   only**. End to end, the same requests ran at 4.2 to 6.5 tokens per
   second (the second table).
-- A **2B draft model makes generation slower** here (4.63 and 4.82
-  against 8.04 and 8.08). It is not used.
+- A **draft model makes generation slower** here, the smallest there is
+  too: the 2B Q8_0 with the Q8_0 target 4.63 and 4.82 against 8.04 and
+  8.08; the 2B Q4_K_M with the Q6_K target 6.89 and 6.91 against 9.30 to
+  9.76. It is not used.
+- **The 9B Q8_0 entirely on the cards** (every multiply's rows, half on
+  each, 4.41 GB a card; the host 2.3 GiB): **about 8 tokens per second**
+  (8.03, 7.99), nothing from disk (the 9B section).
 
 The project's model roles, from the same day on: the Q6_K, offloaded so
 that it fits the host's memory and the cards without the disk, is the
@@ -59,6 +64,56 @@ request.
   standard check value, and without an argument it prints its usage and
   exits 1.
 - No draft model, no prompt lookup: the model writing new code alone.
+- Re-measured about an hour later, alternating with the draft model
+  below: 9.44 and 9.30 (client), the same text.
+
+**With the smallest draft model there is.** empero-ai publishes no
+Qwen3.8 distill below 2B (their Qwen3.8 distills are 2B, 4B, 9B and
+35B-A3B); the smallest file of the 2B is its Q4_K_M (1.31 GB,
+`empero-ai/Qwen3.8-2B-Distill-GGUF`, sha256 as published). The same
+request with it as draft model (`-md`, `--spec-type draft-simple`, 3
+tokens a draft):
+
+| run | tokens | client's clock | server's | drafts accepted | disk read |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 511 (the model's own end) | 6.89 | 6.90 | 378 of 399 (95 percent) | 0 MB |
+| 2 | 511 | 6.91 | 6.92 | 378 of 399 | 0 MB |
+
+26 to 28 percent slower than the target alone (9.30 to 9.76), though 95
+percent of the drafts are taken; the program it wrote passes the same 312
+inputs. The draft model runs on the host alone (the cards' shares are
+sized from the target's weights before it loads), and each drafted token
+reads all of its 1.31 GB at the host's 20.5 GB/s, about 64 ms (estimated
+from those two figures); three of them and a verification of four cost
+more than the 3.8 tokens a step yields at about 105 ms a token. No draft
+model is used.
+
+## Code generation, the 9B Q8_0 entirely on the cards
+
+`empero-ai/Qwen3.8-9B-Distill-GGUF`, `Qwen3.8-9B-Q8_0.gguf` (9.79 GB,
+sha256 as published; its card calls it a distillation of Qwen3.8 2.4T
+A95B into the Qwen3.5-9B architecture). The same request and harness as
+the Q6_K section, with `PHI_GGML_ALL_ROWS=1` (the cards take every row,
+the host none) and the offload. At the default budget of 4.4 GB a card
+the 8.4 GB of weights the cards can multiply fit at 48.5 percent a card,
+the host keeping 3 percent; at `PHI_GGML_CARD_BYTES=4600000000` they fit
+whole, 50 percent a card, 4.41 GB each, 0.52 and 0.57 GB still free on
+the cards afterwards.
+
+| placement | run | tokens | client's clock | server's | disk read | host resident |
+| --- | --- | --- | --- | --- | --- | --- |
+| **all on the cards** (4.6 GB budget) | 1 | 535 (the model's own end) | **8.03** | 8.05 | 0 MB | 2.3 GiB |
+| | 2 | 535 | **7.99** | 8.00 | 0 MB | |
+| 97 percent on the cards (4.4 GB budget) | 1 | 535 | 8.08 | 8.10 | 0 MB | 1.8 GiB |
+| | 2 | 535 | 8.08 | 8.10 | 0 MB | |
+
+- The same text in all four runs; the program compiles and passes the
+  same 312 inputs.
+- What stays on the host is what llama.cpp keeps on the CPU whatever the
+  backend: the token embedding table (read one row a token), the norms
+  and the recurrent layers' small weights, the context's cache.
+- A dense 9B reads all of its weights every token; on the cards that is
+  4.2 GB each at about 8 tokens per second, 34 GB/s a card.
 
 ## Code generation, Q8_0, both cards
 
