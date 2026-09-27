@@ -68,8 +68,27 @@ the order run:
 - The pairs form: in a profiled request (`PHI_GGML_VERBOSE=1`), 119 card
   requests a token where there were 158, 40 of them pairs (the gate and
   up of each of the 40 layers).
-- The judged default split is unaffected (it forms no pairs, since its
-  judgement times each tensor alone).
+- The other modes go through the same rewritten `begin` (`prepare`, then
+  `issue`), so they were run again with both libraries, the same day:
+
+  | configuration | library | pp (688) tok/s | tg64 tok/s | text |
+  | --- | --- | --- | --- | --- |
+  | split, judge off (`PHI_GGML_JUDGE=0 PHI_GGML_PP_ADAPT=0 PHI_GGML_PP_SHARE=0.58`), `--no-repack` | share only | 58.07, 57.97, 57.80 | 9.33, 9.30, 9.33 | |
+  | the same | share and pair | 59.10, 59.05, 58.84 | 9.23, 9.30, 9.39 | the same byte for byte |
+  | split, judge off, repacked | share only | 78.67, 78.34, 78.03 | 8.99, 9.05, 9.08 | |
+  | the same | share and pair | 80.85, 80.46, 81.13 | 9.14, 9.11, 9.09 | the same byte for byte |
+  | the default split (judged), repacked | share and pair | 81.66, 82.94, 82.61 | 9.05, 8.82, 8.87 | (judged: not repeatable) |
+
+  With the judgement off a split repeats exactly, so the same text from
+  both libraries tests the rewrite and the pair together outside the
+  offloaded mode. There the pairs form at the prompt only (at one token a
+  card's part of an expert multiply falls under `PHI_GGML_MIN_BYTES`,
+  which only the offloaded mode ignores), hence 2 to 3 percent at the
+  prompt and nothing at generation. The judged default split forms none
+  and reads as it did (83.1 and 8.86 with the share-only library,
+  `2026-09-27-share-per-class.md`). The dense 27B, `llama-bench -n 32 -r 3
+  -t 12`, interleaved: 2.004 and 2.014 tokens per second with the pair
+  library against 2.016 with share only.
 
 ## What a token costs now
 
