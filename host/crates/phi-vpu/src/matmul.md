@@ -113,6 +113,14 @@ experts, and 448 of 2048 down rows against k 512 with a row each.
 requests of 2026-09-27 were taken apart (`card/vpu/vpu_matmul.md`, "One
 token's multiply, and whose lines the pool reads").
 
+A shape with one activation row is also timed as a gate and up pair,
+two tensors of that shape by the same activations and ids: as two
+requests (the times summed), then as one (`K_MATMUL_MORE`). `check_more`
+(in the ordinary run) checks that request's results: for every quantized
+type, a plain one of three matrices of two types and three row counts, a
+pair of mixtures sharing one activation row, and four mixtures with a
+row per column.
+
 ## The feed-forward request and its SwiGLU
 
 `matmul-check` runs `check_swiglu` first: the card's SwiGLU on 4096

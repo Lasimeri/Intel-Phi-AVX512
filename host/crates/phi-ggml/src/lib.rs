@@ -148,6 +148,10 @@ struct Ctx {
     half_act: bool,
     /// The host's row ranges of the multiply begun last: (from, to) pairs.
     host_ranges: Vec<(u64, u64)>,
+    /// And of the second matrix of a pair (`phi_ggml_begin_id_pair`), empty
+    /// otherwise; and how many pairs went as one request.
+    host_ranges2: Vec<(u64, u64)>,
+    pairs: u64,
     verbose: bool,
     calls: u64,
     t_begin: Instant,
@@ -331,6 +335,8 @@ pub extern "C" fn phi_ggml_open() -> i32 {
         pp_steps: 0,
         half_act: env_or("PHI_GGML_ACT", 1u32) != 0,
         host_ranges: Vec::new(),
+        host_ranges2: Vec::new(),
+        pairs: 0,
         verbose,
         calls: 0,
         t_begin: Instant::now(),
@@ -1010,6 +1016,10 @@ struct Pending {
     rows: u64,
     cols: u64,
     n_used: u64,
+    /// A second matrix in the same request (`K_MATMUL_MORE`): the first row
+    /// of the card's slice of it, the rows computed, and where in the
+    /// window its results are.
+    more: Option<(u64, u64, u64)>,
 }
 
 /// A mixture's columns, as the caller describes them: nothing for an
@@ -1113,20 +1123,68 @@ pub unsafe extern "C" fn phi_ggml_begin(
     unsafe { begin(a, a_type, m, k, nb_a, keep, b, n, nb_b, mix) }
 }
 
+/// What `prepare` decided about one multiply.
+enum Prep {
+    /// No columns: nothing to compute.
+    Nothing,
+    /// The host computes every row, for `reason`; `host_only` (past a limit)
+    /// or not (too small, or judged).
+    Host {
+        key: usize,
+        touched: u64,
+        reason: &'static str,
+        host_only: bool,
+    },
+    /// The cards take `work`, the host `ranges`.
+    Cards(Ready),
+}
+
+/// A multiply ready to go to the cards: the tensor, the batch class, how
+/// its activations cross, the host's ranges and each card's rows
+/// (card, first row of its slice, rows this request computes).
+struct Ready {
+    key: usize,
+    a_type: u32,
+    m: u64,
+    k: u64,
+    nb_a: u64,
+    n: u64,
+    nb_b: u64,
+    class: usize,
+    mixture: bool,
+    ids_bytes: u64,
+    b_rows: u64,
+    half: bool,
+    card_nb_b: u64,
+    touched: u64,
+    ranges: Vec<(u64, u64)>,
+    work: Vec<(usize, u64, u64)>,
+    read_back: u64,
+    on_cards: u64,
+}
+
+/// Decide a multiply without starting it: plan the tensor's rows if it is
+/// new (the one side effect, and one a second call repeats harmlessly),
+/// then every rule that keeps it with the host, then the ranges.
+///
+/// # Safety
+/// `a` must be the tensor of the sizes and strides given.
 #[allow(clippy::too_many_arguments)]
-unsafe fn begin(a: *const u8, a_type: u32, m: u64, k: u64, nb_a: u64, keep: i32, b: *const u8, n: u64, nb_b: u64, mix: Mixture) -> i64 {
-    let mut guard = CTX.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(ctx) = guard.as_mut() else {
-        say("not open");
-        return -1;
-    };
-    ctx.calls += 1;
-    settle_fraction(ctx);
-    ctx.t_begin = Instant::now();
+unsafe fn prepare(
+    ctx: &mut Ctx,
+    a: *const u8,
+    a_type: u32,
+    m: u64,
+    k: u64,
+    nb_a: u64,
+    keep: i32,
+    n: u64,
+    nb_b: u64,
+    mix: &Mixture,
+) -> Prep {
     if n == 0 {
         // llama-server asks for the logits of no tokens sometimes: nothing to compute.
-        ctx.host_ranges.clear();
-        return 0;
+        return Prep::Nothing;
     }
     let mixture = mix.n_used > 0;
     // A mixture's activation area holds the ids and then its rows.
@@ -1140,17 +1198,21 @@ unsafe fn begin(a: *const u8, a_type: u32, m: u64, k: u64, nb_a: u64, keep: i32,
     let key = a as usize;
     // The matrices a host fallback reads: the experts the columns name, at most.
     let touched = if mixture { n.min(mix.experts) } else { 1 };
+    let host = |reason, host_only| Prep::Host {
+        key,
+        touched,
+        reason,
+        host_only,
+    };
     if keep == 0 || phi_ggml_supports(a_type, m, k, nb_a, nb_b, b_rows) == 0 || ids_bytes + b_rows * card_nb_b > B_MAX || n * m * 4 > D_MAX
     {
-        ctx.host_only += 1;
-        return host_all(ctx, key, m, nb_a, touched, "past the window's limits");
+        return host("past the window's limits", true);
     }
     // A tensor of a fused feed-forward block goes to the cards only through
     // ffn.rs, which holds ffn_down by columns; reaching it here means the
     // block was declined as a whole, and then the host does all of it.
     if ctx.ffn_members.contains(&key) {
-        ctx.host_only += 1;
-        return host_all(ctx, key, m, nb_a, touched, "a fused block's");
+        return host("a fused block's", true);
     }
     let shape = [m, nb_a, u64::from(a_type), mix.experts];
     if ctx.splits.get(&key).is_some_and(|s| s.shape != shape) {
@@ -1212,12 +1274,10 @@ unsafe fn begin(a: *const u8, a_type: u32, m: u64, k: u64, nb_a: u64, keep: i32,
     // the rows are the card's to compute whatever it costs, as they are
     // below for every judgement of speed.
     if !ctx.offload && class == 1 && (a_type == MM_F16 || a_type == MM_F32) {
-        ctx.too_small += 1;
-        return host_all(ctx, key, m, nb_a, touched, "float weights at a batch");
+        return host("float weights at a batch", false);
     }
     if !ctx.offload && ctx.splits[&key].avoid[class] {
-        ctx.too_small += 1;
-        return host_all(ctx, key, m, nb_a, touched, "the cards did not pay for themselves");
+        return host("the cards did not pay for themselves", false);
     }
     let split = &ctx.splits[&key];
     let r0 = split.r0;
@@ -1246,9 +1306,6 @@ unsafe fn begin(a: *const u8, a_type: u32, m: u64, k: u64, nb_a: u64, keep: i32,
         }
     }
     ranges.retain(|r| r.1 > r.0);
-    // The host's part of the cards' slices at a batch is rows it reads
-    // back; never offloaded, where the share is 1.
-    ctx.host_read += read_back;
     let on_cards: u64 = work.iter().map(|&(_, _, rows)| rows).sum();
     // The weights the cards would take off the host: their rows once, or
     // once per column for a mixture. Below `min_bytes` no card can pay
@@ -1261,47 +1318,124 @@ unsafe fn begin(a: *const u8, a_type: u32, m: u64, k: u64, nb_a: u64, keep: i32,
     // a card go to it however few: the host has let go of them.
     let cols = if mixture { n } else { 1 };
     if on_cards == 0 || (!ctx.offload && on_cards * nb_a * cols < ctx.min_bytes) {
-        ctx.too_small += 1;
-        return host_all(ctx, key, m, nb_a, touched, "too small to pay for a card");
+        return host("too small to pay for a card", false);
     }
+    Prep::Cards(Ready {
+        key,
+        a_type,
+        m,
+        k,
+        nb_a,
+        n,
+        nb_b,
+        class,
+        mixture,
+        ids_bytes,
+        b_rows,
+        half,
+        card_nb_b,
+        touched,
+        ranges,
+        work,
+        read_back,
+        on_cards,
+    })
+}
+
+/// The host takes a multiply whole, counted as it was decided.
+fn host_decided(ctx: &mut Ctx, p: &Prep, m: u64, nb_a: u64) -> i64 {
+    match *p {
+        Prep::Nothing => {
+            ctx.host_ranges.clear();
+            0
+        }
+        Prep::Host {
+            key,
+            touched,
+            reason,
+            host_only,
+        } => {
+            if host_only {
+                ctx.host_only += 1;
+            } else {
+                ctx.too_small += 1;
+            }
+            host_all(ctx, key, m, nb_a, touched, reason)
+        }
+        Prep::Cards(_) => unreachable!("a multiply for the cards is issued, not taken by the host"),
+    }
+}
+
+/// A second matrix by the same activations, in the same request
+/// (`K_MATMUL_MORE`): its tensor and each card's rows of it, in the order
+/// of the first's `work`.
+struct Second<'a> {
+    r: &'a Ready,
+}
+
+/// Start a multiply the cards take: the activations into each card's
+/// window (float16, or float32 when a value is past a half's range), the
+/// ids for a mixture, the descriptor, the doorbell. With `second`, one
+/// request per card carries both matrices, and the second's results land
+/// a whole number of blocks after the first's. Returns the host's range
+/// count, or the host taking it all when float32 does not fit the window.
+///
+/// # Safety
+/// `b` and `mix` must describe the multiply's activations.
+unsafe fn issue(ctx: &mut Ctx, r: &Ready, b: *const u8, mix: &Mixture, second: Option<Second>) -> i64 {
+    // The host's part of the cards' slices at a batch is rows it reads
+    // back; never offloaded, where the share is 1.
+    ctx.host_read += r.read_back + second.as_ref().map_or(0, |s| s.r.read_back);
+    let (mut half, mut card_nb_b) = (r.half, r.card_nb_b);
     // The activations into the first card's window. If any is past a
     // half's range the multiply goes as float32, to every card (none has
     // been rung yet), or to the host alone when float32 does not fit.
-    let (mut half, mut card_nb_b) = (half, card_nb_b);
     if half {
-        let (ci, _, _) = work[0];
+        let (ci, _, _) = r.work[0];
         // SAFETY: b is b_rows rows as nb_b and mix say; the area is B_MAX.
-        let most = unsafe { put_rows(&ctx.cards[ci], b, b_rows, k, nb_b, &mix, OFF_B + ids_bytes, card_nb_b, true) };
+        let most = unsafe { put_rows(&ctx.cards[ci], b, r.b_rows, r.k, r.nb_b, mix, OFF_B + r.ids_bytes, card_nb_b, true) };
         if most > F16_MAX {
             half = false;
-            card_nb_b = nb_b + B_PAD;
+            card_nb_b = r.nb_b + B_PAD;
             if ctx.verbose {
                 say(&format!(
                     "activations up to {most:e} do not fit a half: this multiply goes as float32"
                 ));
             }
-            if ids_bytes + b_rows * card_nb_b > B_MAX {
+            if r.ids_bytes + r.b_rows * card_nb_b > B_MAX {
                 ctx.host_only += 1;
-                return host_all(ctx, key, m, nb_a, touched, "float32 activations past the window");
+                if let Some(s) = &second {
+                    // Both whole on the host: the second's ranges are all of it.
+                    host_all(ctx, s.r.key, s.r.m, s.r.nb_a, s.r.touched, "float32 activations past the window");
+                    ctx.host_ranges2 = std::mem::take(&mut ctx.host_ranges);
+                }
+                return host_all(ctx, r.key, r.m, r.nb_a, r.touched, "float32 activations past the window");
             }
         }
     }
-    ctx.judged = Some(Judged {
-        key,
-        class,
-        share: on_cards as f64 / m as f64,
-        adapts: class == 1 && !mixture,
-    });
-    let first = work[0].0;
-    for (w_i, &(ci, lo, rows)) in work.iter().enumerate() {
+    // A pair is not judged (it is formed only when nothing is: offloaded,
+    // or the judgement off), and a mixture never teaches the batch share.
+    ctx.judged = if second.is_some() {
+        None
+    } else {
+        Some(Judged {
+            key: r.key,
+            class: r.class,
+            share: r.on_cards as f64 / r.m as f64,
+            adapts: r.class == 1 && !r.mixture,
+        })
+    };
+    let first = r.work[0].0;
+    let d2 = OFF_D + round_up(r.n * r.work.iter().map(|w| w.2).max().unwrap_or(0) * 4);
+    for (w_i, &(ci, lo, rows)) in r.work.iter().enumerate() {
         // The rows are the same for every card: the first card's window
         // gets them from `b` (converted, when float16) and each other card's
         // is a copy of those bytes, rather than converting them again.
         if w_i > 0 {
-            copy_window(&ctx.cards, first, ci, OFF_B + ids_bytes, b_rows * card_nb_b);
+            copy_window(&ctx.cards, first, ci, OFF_B + r.ids_bytes, r.b_rows * card_nb_b);
         }
         let card = &mut ctx.cards[ci];
-        if mixture {
+        if r.mixture {
             // The expert each column picks, one token's after another.
             for t in 0..mix.n_tokens {
                 // SAFETY: ids is n_used int32 per token, ids_nb1 apart.
@@ -1317,38 +1451,180 @@ unsafe fn begin(a: *const u8, a_type: u32, m: u64, k: u64, nb_a: u64, keep: i32,
         // The first card has its rows already when they went as float16.
         if w_i == 0 && !half {
             // SAFETY: as above.
-            unsafe { put_rows(card, b, b_rows, k, nb_b, &mix, OFF_B + ids_bytes, card_nb_b, half) };
+            unsafe { put_rows(card, b, r.b_rows, r.k, r.nb_b, mix, OFF_B + r.ids_bytes, card_nb_b, half) };
         }
         let mm = Matmul {
-            a_id: card.ids[&key],
+            a_id: card.ids[&r.key],
             a_off: 0,
             bytes: 0,
-            a_type,
+            a_type: r.a_type,
             b_type: half as u32,
             m: rows,
-            n,
-            k,
-            nb_a,
+            n: r.n,
+            k: r.k,
+            nb_a: r.nb_a,
             nb_b: card_nb_b,
             b_off: OFF_B,
             d_off: OFF_D,
             chunk: 0,
             n_used: mix.n_used,
             n_tokens: mix.n_tokens,
-            b_rows: if mixture { mix.b_rows } else { 0 },
-            ids_bytes,
+            b_rows: if r.mixture { mix.b_rows } else { 0 },
+            ids_bytes: r.ids_bytes,
         };
-        let seq = ring(card, if mixture { K_MATMUL_ID } else { K_MATMUL }, &mm);
+        let (kernel, more) = match &second {
+            Some(s) => {
+                let (_, lo2, rows2) = s.r.work[w_i];
+                let mut more = More {
+                    count: 1,
+                    ..More::default()
+                };
+                more.mat[0] = MoreMat {
+                    a_id: card.ids[&s.r.key],
+                    a_type: s.r.a_type,
+                    pad: 0,
+                    m: rows2,
+                    nb_a: s.r.nb_a,
+                    d_off: d2,
+                };
+                card.w.write(OFF_MORE, more);
+                (K_MATMUL_MORE, Some((lo2, rows2, d2)))
+            }
+            None => (if r.mixture { K_MATMUL_ID } else { K_MATMUL }, None),
+        };
+        let seq = ring(card, kernel, &mm);
         card.pending = Some(Pending {
             seq,
             lo,
             rows,
-            cols: n,
+            cols: r.n,
             n_used: mix.n_used,
+            more,
         });
     }
-    ctx.host_ranges = ranges;
+    ctx.host_ranges = r.ranges.clone();
+    ctx.host_ranges2 = second.map_or(Vec::new(), |s| s.r.ranges.clone());
     ctx.host_ranges.len() as i64
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn begin(a: *const u8, a_type: u32, m: u64, k: u64, nb_a: u64, keep: i32, b: *const u8, n: u64, nb_b: u64, mix: Mixture) -> i64 {
+    let mut guard = CTX.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(ctx) = guard.as_mut() else {
+        say("not open");
+        return -1;
+    };
+    ctx.calls += 1;
+    settle_fraction(ctx);
+    ctx.t_begin = Instant::now();
+    ctx.host_ranges2.clear();
+    // SAFETY: the caller's contract.
+    match unsafe { prepare(ctx, a, a_type, m, k, nb_a, keep, n, nb_b, &mix) } {
+        Prep::Cards(r) => unsafe { issue(ctx, &r, b, &mix, None) },
+        p => host_decided(ctx, &p, m, nb_a),
+    }
+}
+
+/// Two mixture multiplies by the same activations and the same ids (a
+/// layer's gate and up, which ggml builds one after the other) as one
+/// request per card (`K_MATMUL_MORE`): one pull of the activations, one
+/// dispatch, one reply. `a` and `a2` are the two weight tensors, of the
+/// same shape but each of its own type. Returns the host's range count of
+/// the first (`phi_ggml_host_range_of` gives both), or -2 when the pair
+/// cannot go as one: either one stays with the host, they are on
+/// different cards, the judgement is on (it times each tensor alone), or
+/// the results do not fit the window together. The caller then runs the
+/// two as it always did; nothing has been started.
+///
+/// # Safety
+/// `a`, `a2`, `b` and `ids` must be the tensors of the sizes and strides
+/// given.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn phi_ggml_begin_id_pair(
+    a: *const u8,
+    a_type: u32,
+    a2: *const u8,
+    a2_type: u32,
+    m: u64,
+    k: u64,
+    nb_a: u64,
+    nb_a_2: u64,
+    b: *const u8,
+    n: u64,
+    nb_b: u64,
+    experts: u64,
+    nb_a2: u64,
+    nb_a2_2: u64,
+    ids: *const i32,
+    n_used: u64,
+    n_tokens: u64,
+    ids_nb1: u64,
+    b_rows: u64,
+    nb_b2: u64,
+) -> i64 {
+    let mut guard = CTX.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(ctx) = guard.as_mut() else {
+        say("not open");
+        return -1;
+    };
+    if !ctx.offload && ctx.judge || n_used == 0 {
+        return -2;
+    }
+    settle_fraction(ctx);
+    let mix = Mixture {
+        experts: experts.max(1),
+        nb_a2,
+        ids,
+        n_used,
+        n_tokens,
+        ids_nb1,
+        b_rows: b_rows.max(1),
+        nb_b2,
+    };
+    let mix2 = Mixture { nb_a2: nb_a2_2, ..mix };
+    // SAFETY: the caller's contract.
+    let p1 = unsafe { prepare(ctx, a, a_type, m, k, nb_a, 1, n, nb_b, &mix) };
+    let p2 = unsafe { prepare(ctx, a2, a2_type, m, k, nb_a_2, 1, n, nb_b, &mix2) };
+    let (Prep::Cards(r1), Prep::Cards(r2)) = (&p1, &p2) else {
+        return -2;
+    };
+    let same_cards = r1.work.len() == r2.work.len() && r1.work.iter().zip(&r2.work).all(|(x, y)| x.0 == y.0);
+    let rows1 = r1.work.iter().map(|w| w.2).max().unwrap_or(0);
+    let rows2 = r2.work.iter().map(|w| w.2).max().unwrap_or(0);
+    if !same_cards || r1.half != r2.half || round_up(n * rows1 * 4) + n * rows2 * 4 > D_MAX {
+        return -2;
+    }
+    ctx.calls += 1;
+    ctx.pairs += 1;
+    ctx.t_begin = Instant::now();
+    // SAFETY: the caller's contract.
+    unsafe { issue(ctx, r1, b, &mix, Some(Second { r: r2 })) }
+}
+
+/// The host's row range `i` of matrix `which` (0, or 1 for the second of a
+/// pair) of the multiply begun last. Returns 0 when there is none.
+///
+/// # Safety
+/// `from` and `to` must point to writable u64s.
+#[no_mangle]
+pub unsafe extern "C" fn phi_ggml_host_range_of(which: u32, i: u64, from: *mut u64, to: *mut u64) -> i32 {
+    let guard = CTX.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(ctx) = guard.as_ref() else {
+        return 0;
+    };
+    let ranges = if which == 0 { &ctx.host_ranges } else { &ctx.host_ranges2 };
+    match ranges.get(i as usize) {
+        Some(&(a, b)) => {
+            // SAFETY: the caller passes two writable u64s.
+            unsafe {
+                *from = a;
+                *to = b;
+            }
+            1
+        }
+        None => 0,
+    }
 }
 
 /// The host's row range `i` of the multiply begun last. Returns 0 when there
@@ -1391,6 +1667,52 @@ pub unsafe extern "C" fn phi_ggml_end(d: *mut u8, nb_d: u64) -> i32 {
 /// `d` must be the result tensor of the multiply begun last.
 #[no_mangle]
 pub unsafe extern "C" fn phi_ggml_end_id(d: *mut u8, nb_d: u64, nb_d2: u64) -> i32 {
+    // SAFETY: the caller's contract.
+    unsafe { end(d, nb_d, nb_d2, None) }
+}
+
+/// The end of a pair begun with `phi_ggml_begin_id_pair`: the first
+/// matrix's results into `d`, the second's into `d_2`, each with its own
+/// strides. Returns 0, or -1 after a message.
+///
+/// # Safety
+/// `d` and `d_2` must be the result tensors of the pair begun last.
+#[no_mangle]
+pub unsafe extern "C" fn phi_ggml_end_id_pair(d: *mut u8, nb_d: u64, nb_d2: u64, d_2: *mut u8, nb_d_2: u64, nb_d2_2: u64) -> i32 {
+    // SAFETY: the caller's contract.
+    unsafe { end(d, nb_d, nb_d2, Some((d_2, nb_d_2, nb_d2_2))) }
+}
+
+/// A card's `cols` runs of `rows` floats at window offset `off` into `d`,
+/// from row `lo`: an ordinary multiply has one destination row per column,
+/// a mixture one per (expert slot, token), column `p` at
+/// `(p % n_used) * nb_d + (p / n_used) * nb_d2`.
+///
+/// # Safety
+/// `d` must hold every row the columns address, `lo + rows` floats each.
+#[allow(clippy::too_many_arguments)]
+unsafe fn gather(card: &Card, off: u64, lo: u64, rows: u64, cols: u64, n_used: u64, d: *mut u8, nb_d: u64, nb_d2: u64) {
+    for p in 0..cols {
+        let at = if n_used > 0 {
+            (p % n_used) * nb_d + (p / n_used) * nb_d2
+        } else {
+            p * nb_d
+        };
+        // SAFETY: the card wrote `cols` runs of `rows` floats at `off`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                card.w.ptr(off + p * rows * 4, (rows * 4) as usize) as *const u8,
+                d.add((at + lo * 4) as usize),
+                (rows * 4) as usize,
+            )
+        };
+    }
+}
+
+/// # Safety
+/// `d`, and the second's destination for a pair, must be the result
+/// tensors of the multiply (or pair) begun last.
+unsafe fn end(d: *mut u8, nb_d: u64, nb_d2: u64, second: Option<(*mut u8, u64, u64)>) -> i32 {
     let mut guard = CTX.lock().unwrap_or_else(|e| e.into_inner());
     let Some(ctx) = guard.as_mut() else {
         return -1;
@@ -1408,6 +1730,7 @@ pub unsafe extern "C" fn phi_ggml_end_id(d: *mut u8, nb_d: u64, nb_d2: u64) -> i
             rows,
             cols,
             n_used,
+            more,
         }) = card.pending.take()
         else {
             continue;
@@ -1420,22 +1743,13 @@ pub unsafe extern "C" fn phi_ggml_end_id(d: *mut u8, nb_d: u64, nb_d2: u64) -> i
                 continue;
             }
         };
-        for p in 0..cols {
-            // An ordinary multiply has one destination row per column; a
-            // mixture has one per (expert slot, token).
-            let at = if n_used > 0 {
-                (p % n_used) * nb_d + (p / n_used) * nb_d2
-            } else {
-                p * nb_d
-            };
-            // SAFETY: the card wrote `cols` runs of `rows` floats at OFF_D.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    card.w.ptr(OFF_D + p * rows * 4, (rows * 4) as usize) as *const u8,
-                    d.add((at + lo * 4) as usize),
-                    (rows * 4) as usize,
-                )
-            };
+        // SAFETY: the caller's contract; the card wrote its rows at OFF_D.
+        unsafe { gather(card, OFF_D, lo, rows, cols, n_used, d, nb_d, nb_d2) };
+        let mut all_rows = rows;
+        if let (Some((lo2, rows2, off2)), Some((d_2, nb_d_2, nb_d2_2))) = (more, second) {
+            // SAFETY: as above; the second matrix's rows are at `off2`.
+            unsafe { gather(card, off2, lo2, rows2, cols, n_used, d_2, nb_d_2, nb_d2_2) };
+            all_rows += rows2;
         }
         card.busy += rep_time(&rep);
         t_card = t_card.max(rep_time(&rep));
@@ -1443,7 +1757,7 @@ pub unsafe extern "C" fn phi_ggml_end_id(d: *mut u8, nb_d: u64, nb_d2: u64) -> i
             lines.push(format!(
                 "card {} rows {}: {:.3} ms (pull {:.3}, compute {:.3}, push {:.3})",
                 card.index,
-                rows,
+                all_rows,
                 rep.total_ns as f64 / 1e6,
                 rep.pull_ns as f64 / 1e6,
                 rep.compute_ns as f64 / 1e6,

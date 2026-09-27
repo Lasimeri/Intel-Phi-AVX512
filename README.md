@@ -201,6 +201,11 @@ for the host alone** in the same session, at the host's prompt rate,
 with 13.3 GiB of the host resident against 20.7, and the logits within
 the host's own kernels' differences; the dense 27B generates 7 percent
 faster for the same reason (`docs/results/2026-09-27-share-per-class.md`).
+And a layer's gate and up, two multiplies of the same activations with
+the same experts, now go to each card as one request: **9.6 tokens per
+second and 69 at the prompt offloaded**, against the host alone's 7.5
+and 63, the text byte for byte what it was
+(`docs/results/2026-09-27-gate-and-up-together.md`).
 
 A model larger than this host's 31 GiB runs from its file, the page
 cache holding what it can. By default the cards' rows are a copy, so

@@ -324,3 +324,35 @@ on both cards after the change, and the text a 35B-A3B generates is the
 same byte for byte with the old worker and the new
 (`docs/results/2026-09-27-small-requests.md`, which has the end-to-end
 numbers).
+
+## Several matrices by the same activations, one request (`VPU_K_MATMUL_MORE`, 2026-09-27)
+
+ggml builds a mixture-of-experts layer's gate and up projections as two
+`MUL_MAT_ID`s of the same activations with the same ids, one after the
+other, and each was a request of its own: its pull, its dispatch, its
+push, its reply. `VPU_K_MATMUL_MORE` (8) is the matmul descriptor's
+multiply plus up to `VPU_MORE_MAX` (3) further matrices listed in
+`struct vpu_more` at `VPU_OFF_MORE` (13632), each a resident slice of its
+own quantized type and row count, with its own `d_off`. The base
+descriptor says plain or mixture (`n_used`), and everything it describes
+about the activations and ids holds for all of them.
+
+The request is checked as the base is, matrix by matrix: resident, a
+quantized type, its shape (`shape_ok` with its own type and row stride),
+for a plain multiply its rows within its slice, for a mixture every id
+within its own slice's count of experts. Then one pull, every matrix a
+`struct job` of its own sharing the activations (their groups one after
+another in the one table, their results each in their own run of card
+memory, a line apart), and one dispatch whose slices cut the
+concatenated rows of all of them as one range (`rows_slice_multi`, each
+piece computed and warmed as its own job's rows), and one push per
+result. One thread per core, as everywhere else here. Float weight
+types are refused (their path takes one column at a time and uses no
+groups); the host then sends the matrices one at a time.
+
+`phi-vpu matmul-check` checks it for every quantized type: plain, three
+matrices of two types and three row counts; a gate and up style pair of
+mixtures sharing one activation row; and a down style one of four
+matrices with a row per column. `--moe` times a 35B-A3B's gate and up as
+two requests and as one: on card 0, 0.57 ms median round trip against
+0.37 (`docs/results/2026-09-27-gate-and-up-together.md`).

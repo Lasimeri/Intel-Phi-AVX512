@@ -561,6 +561,29 @@ static void rows_slice_q(void *arg, int slice, int nslices)
     rows_range_q(j, i0, i1, mate, nmates);
 }
 
+/* A request of several matrices by the same activations
+ * (VPU_K_MATMUL_MORE): their rows one after another, cut into the pool's
+ * slices as one range, and each piece of a slice computed as the rows of
+ * its own matrix's job. One thread per core, as everywhere here. */
+struct multi_job {
+    const struct job *jobs[VPU_MORE_MAX + 1];
+    uint64_t at[VPU_MORE_MAX + 2];   /* the first row of each job in the whole; at[count] is the total */
+    uint32_t count;
+};
+
+static void rows_slice_multi(void *arg, int slice, int nslices)
+{
+    const struct multi_job *mj = arg;
+    uint64_t total = mj->at[mj->count];
+    uint64_t r0 = total * (uint64_t)slice / (uint64_t)nslices, r1 = total * (uint64_t)(slice + 1) / (uint64_t)nslices;
+    for (uint32_t x = 0; x < mj->count; x++) {
+        uint64_t lo = r0 > mj->at[x] ? r0 : mj->at[x], hi = r1 < mj->at[x + 1] ? r1 : mj->at[x + 1];
+        if (hi <= lo) continue;
+        warm_slice(mj->jobs[x], lo - mj->at[x], hi - mj->at[x], slice);
+        rows_range_q(mj->jobs[x], lo - mj->at[x], hi - mj->at[x], 0, 1);
+    }
+}
+
 /* The column groups of an ordinary multiply: consecutive columns, one
  * matrix, eight at a time while eight are left. */
 static uint64_t groups_plain(struct group *gs, const struct job *j)
@@ -1013,7 +1036,11 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
         fflush(stdout);
     }
     if (mm.m == 0 || mm.n == 0 || mm.k == 0 || mm.b_off % VPU_BLOCK != 0 || mm.d_off % VPU_BLOCK != 0) return VPU_E_REQUEST;
-    if (kernel == VPU_K_MATMUL_ID && (mm.n_used == 0 || mm.b_rows == 0 || mm.n_tokens == 0 || mm.n != mm.n_used * mm.n_tokens || mm.ids_bytes % 64 != 0 || mm.a_id == 0)) return VPU_E_REQUEST;
+    /* A request of further matrices (VPU_K_MATMUL_MORE) is a plain multiply
+     * or a mixture as its base descriptor says. */
+    int more = (kernel == VPU_K_MATMUL_MORE);
+    int mixture = (kernel == VPU_K_MATMUL_ID) || (more && mm.n_used > 0);
+    if (mixture && (mm.n_used == 0 || mm.b_rows == 0 || mm.n_tokens == 0 || mm.n != mm.n_used * mm.n_tokens || mm.ids_bytes % 64 != 0 || mm.a_id == 0)) return VPU_E_REQUEST;
     if (mm.a_type == VPU_MM_SWIGLU) {
         /* The SwiGLU kernel on its own, for matmul-check's conformance
          * case (m floats of g at b_off, m of u at b_off + nb_b): nothing
@@ -1180,7 +1207,7 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
         int i = cache_find(mm.a_id);
         if (i < 0) return VPU_E_REQUEST;
         /* an ordinary multiply reads m rows; a mixture reads m rows of each expert, which the id check below bounds */
-        if (kernel != VPU_K_MATMUL_ID && mm.m * mm.nb_a > g_cache[i].bytes) return VPU_E_REQUEST;
+        if (!mixture && mm.m * mm.nb_a > g_cache[i].bytes) return VPU_E_REQUEST;
         a = g_cache[i].m.p;
     } else {
         if (mm.a_off % VPU_BLOCK != 0) return VPU_E_REQUEST;
@@ -1189,11 +1216,37 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
         if (vpu_pull(g_a.m.p, len, mm.a_off) != 0) return VPU_E_PULL;
         a = g_a.m.p;
     }
+    /* Further matrices by the same activations: each checked as the base
+     * is (resident, a quantized type, its shape, its rows within its
+     * slice), and its results given their own run of card memory after
+     * the base's, a line apart. */
+    struct vpu_more mo;
+    memset(&mo, 0, sizeof mo);
+    uint64_t d_at[VPU_MORE_MAX + 1] = { 0 }, d_end = mm.n * mm.m * 4;
+    const unsigned char *more_a[VPU_MORE_MAX] = { NULL };
+    uint64_t more_have[VPU_MORE_MAX] = { 0 };
+    if (more) {
+        memcpy(&mo, (const void *)(ctrl + VPU_OFF_MORE), sizeof mo);
+        if (mo.count < 1 || mo.count > VPU_MORE_MAX || mm.a_id == 0 || !quantized(mm.a_type)) return VPU_E_REQUEST;
+        for (uint32_t x = 0; x < mo.count; x++) {
+            const struct vpu_more_mat *e = &mo.mat[x];
+            struct vpu_matmul s = mm;
+            s.a_type = e->a_type;
+            s.m = e->m;
+            s.nb_a = e->nb_a;
+            int i = cache_find(e->a_id);
+            if (i < 0 || e->m == 0 || e->d_off % VPU_BLOCK != 0 || !quantized(e->a_type) || !shape_ok(&s)) return VPU_E_REQUEST;
+            if (!mixture && e->m * e->nb_a > g_cache[i].bytes) return VPU_E_REQUEST;
+            more_a[x] = g_cache[i].m.p;
+            more_have[x] = g_cache[i].bytes;
+            d_at[x + 1] = (d_end + 63) & ~(uint64_t)63;
+            d_end = d_at[x + 1] + mm.n * e->m * 4;
+        }
+    }
     /* The ids come first in b's area for a mixture, then the rows; one
      * pull takes both. */
-    int mixture = (kernel == VPU_K_MATMUL_ID);
     size_t brows = mixture ? mm.b_rows * mm.n_tokens : mm.n;
-    size_t blen = blocks(mm.ids_bytes + brows * mm.nb_b), dlen = blocks(mm.n * mm.m * 4);
+    size_t blen = blocks(mm.ids_bytes + brows * mm.nb_b), dlen = blocks(d_end);
     if (grow(&g_b, blen) != 0 || grow(&g_d, dlen) != 0) return VPU_E_ALLOC;
     if (pull_data(g_b.m.p, mm.ids_bytes + brows * mm.nb_b, mm.b_off, threads) != 0) return VPU_E_PULL;
     *pull_ns = now_ns() - t0;
@@ -1209,7 +1262,7 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
     if (max > POOL_SLOTS) max = POOL_SLOTS;
     if (threads < 1) threads = 1;
     if (threads > max) threads = max;
-    if ((uint64_t)threads > mm.m) threads = (int)mm.m;
+    if (!more && (uint64_t)threads > mm.m) threads = (int)mm.m;
     /* An id that would read past what this tensor's slice holds is a
      * broken request, not a segfault: the ids come from the host and are
      * checked here, once, before any thread runs. */
@@ -1221,6 +1274,62 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
             /* Negative too: the quantized path counts by id before any
              * thread runs, and -1 would write before its buffer. */
             if (j.ids[p] < 0 || j.ids[p] >= (int32_t)experts) return VPU_E_REQUEST;
+    }
+    if (more) {
+        /* Every matrix a job of its own, sharing the activations and, for a
+         * mixture, the ids; each with its own ids check (its slice holds
+         * its own count of experts), its groups after the others' in one
+         * table, its results in its own run of card memory. */
+        struct job jobs[VPU_MORE_MAX + 1];
+        uint64_t ex[VPU_MORE_MAX + 1] = { experts }, most = experts;
+        jobs[0] = j;
+        for (uint32_t x = 0; x < mo.count; x++) {
+            const struct vpu_more_mat *e = &mo.mat[x];
+            struct job *jx = &jobs[x + 1];
+            *jx = j;
+            jx->a = more_a[x];
+            jx->m = e->m;
+            jx->nb_a = e->nb_a;
+            jx->type = e->a_type;
+            jx->d = (float *)((unsigned char *)g_d.m.p + d_at[x + 1]);
+            ex[x + 1] = 1;
+            if (mixture) {
+                jx->a_stride = e->m * e->nb_a;
+                ex[x + 1] = more_have[x] / jx->a_stride;
+                for (uint64_t p = 0; p < mm.n; p++)
+                    if (j.ids[p] < 0 || j.ids[p] >= (int32_t)ex[x + 1]) return VPU_E_REQUEST;
+                if (ex[x + 1] > most) most = ex[x + 1];
+            }
+        }
+        if (grow(&g_groups, (mo.count + 1) * mm.n * sizeof(struct group)) != 0) return VPU_E_ALLOC;
+        if (mixture && grow(&g_order, (most + mm.n) * sizeof(uint32_t)) != 0) return VPU_E_ALLOC;
+        struct multi_job mj = { .count = mo.count + 1 };
+        uint64_t total = 0;
+        for (uint32_t x = 0; x <= mo.count; x++) {
+            struct group *gs = (struct group *)g_groups.m.p + (size_t)x * mm.n;
+            jobs[x].groups = gs;
+            jobs[x].ngroups = mixture ? groups_mixture(gs, &jobs[x], ex[x], (uint32_t *)g_order.m.p) : groups_plain(gs, &jobs[x]);
+            mj.jobs[x] = &jobs[x];
+            mj.at[x] = total;
+            total += jobs[x].m;
+        }
+        mj.at[mo.count + 1] = total;
+        if ((uint64_t)threads > total) threads = (int)total;
+        uint64_t c0 = now_ns();
+        *live = vpu_pool_map(rows_slice_multi, &mj, threads);
+        *compute_ns = now_ns() - c0;
+        uint64_t p0 = now_ns();
+        for (uint32_t x = 0; x <= mo.count; x++)
+            if (push_data((const unsigned char *)g_d.m.p + d_at[x], mm.n * jobs[x].m * 4, x == 0 ? mm.d_off : mo.mat[x - 1].d_off, threads) != 0)
+                return VPU_E_PUSH;
+        *push_ns = now_ns() - p0;
+        if (verbose > 1) {
+            printf("matmul: %u matrices, %llu rows in all, . %llux%llu, on %d threads: pull %.3f compute %.3f push %.3f ms\n",
+                   mo.count + 1, (unsigned long long)total, (unsigned long long)mm.n, (unsigned long long)mm.k, *live,
+                   *pull_ns / 1e6, *compute_ns / 1e6, *push_ns / 1e6);
+            fflush(stdout);
+        }
+        return VPU_OK;
     }
     /* The columns in groups of eight, four or one, built once here and
      * read by every thread. The float kernels take one column at a time

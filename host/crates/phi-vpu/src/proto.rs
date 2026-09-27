@@ -431,6 +431,59 @@ pub struct Ffn {
     pub reserved: [u64; 7],
 }
 
+/// Further matrices by the same activations (and a mixture's same ids) in
+/// the same request as the matmul descriptor's own: one pull, one
+/// dispatch, one push per result (`struct vpu_more`, vpu_matmul.h).
+pub const K_MATMUL_MORE: u32 = 8;
+/// Window offset of the further-matrices descriptor, after the
+/// feed-forward one.
+pub const OFF_MORE: usize = 13632;
+/// The most further matrices one request carries.
+pub const MORE_MAX: usize = 3;
+
+/// `struct vpu_more_mat`: one further matrix.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MoreMat {
+    pub a_id: u64,
+    /// `MM_*`, a quantized type.
+    pub a_type: u32,
+    pub pad: u32,
+    /// Its rows this request computes (a mixture: rows of each expert).
+    pub m: u64,
+    pub nb_a: u64,
+    /// Where its `n` rows of `m` floats go, whole blocks.
+    pub d_off: u64,
+}
+
+/// `struct vpu_more`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct More {
+    /// Further matrices, 1 to `MORE_MAX`.
+    pub count: u32,
+    pub pad: u32,
+    pub mat: [MoreMat; MORE_MAX],
+}
+
+#[cfg(test)]
+mod more_layout {
+    use super::*;
+    use std::mem::{offset_of, size_of};
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn more_descriptor_matches_the_c_struct() {
+        assert_eq!(size_of::<MoreMat>(), 40);
+        assert_eq!(offset_of!(MoreMat, a_type), 8);
+        assert_eq!(offset_of!(MoreMat, m), 16);
+        assert_eq!(offset_of!(MoreMat, nb_a), 24);
+        assert_eq!(offset_of!(MoreMat, d_off), 32);
+        assert_eq!(size_of::<More>(), 128);
+        assert_eq!(offset_of!(More, mat), 8);
+        assert!(OFF_MORE >= OFF_FFN + 192 && OFF_MORE + 128 <= 16384);
+    }
+}
+
 #[cfg(test)]
 mod ffn_layout {
     use super::*;

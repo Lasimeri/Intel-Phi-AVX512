@@ -510,7 +510,7 @@ int main(int argc, char **argv)
         size_t bytes = (size_t)n * 4;
 
         if (kernel == VPU_K_EXEC) status = vpu_exec_run(ctrl, blk, verbose);
-        else if (kernel == VPU_K_UPLOAD || kernel == VPU_K_MATMUL || kernel == VPU_K_FREE || kernel == VPU_K_MATMUL_ID || kernel == VPU_K_FFN)
+        else if (kernel == VPU_K_UPLOAD || kernel == VPU_K_MATMUL || kernel == VPU_K_FREE || kernel == VPU_K_MATMUL_ID || kernel == VPU_K_FFN || kernel == VPU_K_MATMUL_MORE)
             status = vpu_matmul_run(ctrl, kernel, threads, verbose, &compute_ns, &pull_ns, &push_ns, &live);
         else if (kernel != VPU_K_POLY30) status = VPU_E_KERNEL;
         else if (n <= 0 || (in_off | out_off | aux_off) % VPU_BLOCK != 0) status = VPU_E_REQUEST;
@@ -544,7 +544,8 @@ int main(int argc, char **argv)
          * write to a file on the host-backed disk), which a model's
          * hundreds of small multiplies per token pay each: the matrix
          * service's requests are logged at -v -v only. */
-        int service = kernel == VPU_K_UPLOAD || kernel == VPU_K_MATMUL || kernel == VPU_K_FREE || kernel == VPU_K_MATMUL_ID || kernel == VPU_K_FFN;
+        int service = kernel == VPU_K_UPLOAD || kernel == VPU_K_MATMUL || kernel == VPU_K_FREE || kernel == VPU_K_MATMUL_ID || kernel == VPU_K_FFN ||
+                      kernel == VPU_K_MATMUL_MORE;
         if (verbose > (service ? 1 : 0)) {
             printf("seq=%llu kernel=%u n=%ld threads=%d status=%d pull=%.3fms compute=%.3fms push=%.3fms\n",
                    (unsigned long long)seq, kernel, n, live, status,

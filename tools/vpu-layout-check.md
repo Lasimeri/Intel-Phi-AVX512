@@ -15,4 +15,6 @@ the same for the ring transport.
 
 It covers the feed-forward descriptor too (`struct vpu_ffn`,
 `VPU_K_FFN`, `VPU_OFF_FFN`, since 2026-09-23), and `matmul.b_type`, the
-activations' format, whose offset nothing pinned before.
+activations' format, whose offset nothing pinned before. And since
+2026-09-27 the further-matrices descriptor (`struct vpu_more`,
+`struct vpu_more_mat`, `VPU_K_MATMUL_MORE`, `VPU_OFF_MORE`, `VPU_MORE_MAX`).

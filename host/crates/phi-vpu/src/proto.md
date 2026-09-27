@@ -57,5 +57,11 @@ columns for the same run of the intermediate), the run, the shapes, the
 activations and the result, and `h_type`, the intermediate's format on
 the card (0 float32, 1 float16, which overflows past 65504). The unit
 test and `tools/vpu-layout-check.c` pin the offsets as for the others.
+`K_MATMUL_MORE` (8, since 2026-09-27) carries further matrices by the same
+activations in the same request as the matmul descriptor's own, listed
+in `More` (`struct vpu_more`, 128 bytes) at `OFF_MORE` (13632, just after
+the feed-forward one): up to `MORE_MAX` (3) `MoreMat` entries of 40 bytes,
+each a resident slice, its quantized type, its rows, its row stride and
+where its results go. The unit test and the layout check pin them too.
 `MM_SWIGLU` (98) is the diagnostic type that runs the card's SwiGLU
 alone (`card/vpu/vpu_matmul.md`).

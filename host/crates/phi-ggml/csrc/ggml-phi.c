@@ -34,6 +34,12 @@ int64_t phi_ggml_begin_id(const uint8_t *a, uint32_t a_type, uint64_t m, uint64_
 int phi_ggml_host_range(uint64_t i, uint64_t *from, uint64_t *to);
 int phi_ggml_end(uint8_t *d, uint64_t nb_d);
 int phi_ggml_end_id(uint8_t *d, uint64_t nb_d, uint64_t nb_d2);
+int64_t phi_ggml_begin_id_pair(const uint8_t *a, uint32_t a_type, const uint8_t *a2, uint32_t a2_type, uint64_t m, uint64_t k, uint64_t nb_a,
+                               uint64_t nb_a_2, const uint8_t *b, uint64_t n, uint64_t nb_b, uint64_t experts, uint64_t nb_a2,
+                               uint64_t nb_a2_2, const int32_t *ids, uint64_t n_used, uint64_t n_tokens, uint64_t ids_nb1,
+                               uint64_t b_rows, uint64_t nb_b2);
+int phi_ggml_host_range_of(uint32_t which, uint64_t i, uint64_t *from, uint64_t *to);
+int phi_ggml_end_id_pair(uint8_t *d, uint64_t nb_d, uint64_t nb_d2, uint8_t *d_2, uint64_t nb_d_2, uint64_t nb_d2_2);
 void phi_ggml_free_all(void);
 
 /* A feed-forward block for the fused path (Rust: ffn.rs, FfnArgs). */
@@ -185,6 +191,36 @@ static int host_rows_id(const struct ggml_tensor *node, int64_t from, int64_t to
     c->nb[3] = node->nb[3];
     struct ggml_cgraph *g = p_new_graph_custom(ctx, 64, false);
     p_build_forward_expand(g, c);
+    enum ggml_status st = p_backend_graph_compute(g_cpu, g);
+    p_free(ctx);
+    return st == GGML_STATUS_SUCCESS ? 0 : -1;
+}
+
+/* The host's rows of a pair of MUL_MAT_IDs by the same activations and
+ * ids (run_id_pair): each of `nodes[p]`'s ranges `ranges[p][r]` as a
+ * multiply of its own, all of them in one graph, so ggml's pool is woken
+ * once for the pair and not once per range. */
+static int host_rows_id_pair(struct ggml_tensor *const nodes[2], const uint64_t (*ranges)[2], const int *which, int nr)
+{
+    if (nr == 0) return 0;
+    struct ggml_init_params params = { p_tensor_overhead() * (8 + 8 * (size_t)nr) + p_graph_overhead_custom(64, false) + 4096, NULL, true };
+    struct ggml_context *ctx = p_init(params);
+    if (!ctx) return -1;
+    struct ggml_cgraph *g = p_new_graph_custom(ctx, 64, false);
+    for (int r = 0; r < nr; r++) {
+        const struct ggml_tensor *node = nodes[which[r]];
+        const struct ggml_tensor *src0 = node->src[0], *src1 = node->src[1], *ids = node->src[2];
+        int64_t from = (int64_t)ranges[r][0], rows = (int64_t)(ranges[r][1] - ranges[r][0]);
+        struct ggml_tensor *a = alias3(ctx, src0, from, rows);
+        struct ggml_tensor *b = alias3(ctx, src1, 0, src1->ne[1]);
+        struct ggml_tensor *i = alias(ctx, ids, 0, ids->ne[1]);
+        struct ggml_tensor *c = p_mul_mat_id(ctx, a, b, i);
+        c->data = (char *)node->data + from * 4;
+        c->nb[1] = node->nb[1];
+        c->nb[2] = node->nb[2];
+        c->nb[3] = node->nb[3];
+        p_build_forward_expand(g, c);
+    }
     enum ggml_status st = p_backend_graph_compute(g_cpu, g);
     p_free(ctx);
     return st == GGML_STATUS_SUCCESS ? 0 : -1;
@@ -557,6 +593,60 @@ static int run_ffn(struct ggml_tensor *const *nodes, const struct ffn_quad *q)
     return phi_ggml_ffn_end(down->data, down->nb[1]) == 0 ? 0 : -1;
 }
 
+/* ---- two mixtures by the same activations, in one request ---- */
+
+static int is_view(enum ggml_op op)
+{
+    return op == GGML_OP_NONE || op == GGML_OP_RESHAPE || op == GGML_OP_VIEW || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
+}
+
+/* The MUL_MAT_ID that can go to the cards in one request with node i, or
+ * -1: the next node that computes anything, reading the same activations
+ * and the same ids, its weight a card type of the same shape (a layer's
+ * gate right after its up, as llama.cpp builds them). Only the next one:
+ * computing it early is safe because nothing runs between the two, where
+ * the graph's allocator could otherwise have given its output the memory
+ * of a tensor still in use there. */
+static int id_pair(const struct ggml_cgraph *cg, int i)
+{
+    const struct ggml_tensor *x = cg->nodes[i];
+    int j = i + 1;
+    while (j < cg->n_nodes && is_view(cg->nodes[j]->op)) j++;
+    if (j >= cg->n_nodes) return -1;
+    const struct ggml_tensor *y = cg->nodes[j];
+    if (y->op != GGML_OP_MUL_MAT_ID || !(y->flags & GGML_TENSOR_FLAG_COMPUTE)) return -1;
+    if (y->src[1] != x->src[1] || y->src[2] != x->src[2]) return -1;
+    const struct ggml_tensor *w1 = x->src[0], *w2 = y->src[0];
+    if (w1->ne[0] != w2->ne[0] || w1->ne[1] != w2->ne[1] || w1->ne[2] != w2->ne[2]) return -1;
+    if (card_type(w1->type) < 2 || card_type(w2->type) < 2) return -1;
+    if (!strstr(w1->name, "weight") || !strstr(w2->name, "weight")) return -1;
+    return j;
+}
+
+/* The pair as one request per card (Rust, phi_ggml_begin_id_pair), the
+ * host's ranges of both in one graph, both results gathered. Returns 0,
+ * 1 when the pair cannot go together (the caller runs x alone and y in
+ * its turn, as without this; nothing has started), or -1. */
+static int run_id_pair(struct ggml_tensor *x, struct ggml_tensor *y)
+{
+    const struct ggml_tensor *w1 = x->src[0], *w2 = y->src[0], *src1 = x->src[1], *ids = x->src[2];
+    int64_t n = ids->ne[0] * ids->ne[1];
+    int64_t nr = phi_ggml_begin_id_pair(w1->data, (uint32_t)card_type(w1->type), w2->data, (uint32_t)card_type(w2->type),
+                                        (uint64_t)w1->ne[1], (uint64_t)w1->ne[0], w1->nb[1], w2->nb[1], src1->data, (uint64_t)n,
+                                        src1->nb[1], (uint64_t)w1->ne[2], w1->nb[2], w2->nb[2], (const int32_t *)ids->data,
+                                        (uint64_t)ids->ne[0], (uint64_t)ids->ne[1], ids->nb[1], (uint64_t)src1->ne[1], src1->nb[2]);
+    if (nr == -2) return 1;
+    if (nr < 0) return -1;
+    struct ggml_tensor *nodes[2] = { x, y };
+    uint64_t ranges[34][2];
+    int which[34], got = 0;
+    for (uint32_t w = 0; w < 2; w++)
+        for (uint64_t r = 0; got < 34 && phi_ggml_host_range_of(w, r, &ranges[got][0], &ranges[got][1]); r++)
+            if (ranges[got][1] > ranges[got][0]) which[got++] = (int)w;
+    if (host_rows_id_pair(nodes, (const uint64_t(*)[2])ranges, which, got) != 0) return -1;
+    return phi_ggml_end_id_pair(x->data, x->nb[1], x->nb[2], y->data, y->nb[1], y->nb[2]) == 0 ? 0 : -1;
+}
+
 /* ---- backend ---- */
 
 static const char *phi_backend_get_name(ggml_backend_t backend) { (void)backend; return "Phi"; }
@@ -622,6 +712,18 @@ static enum ggml_status phi_graph_compute(ggml_backend_t backend, struct ggml_cg
             if (run_mul_mat(node) != 0) return GGML_STATUS_FAILED;
             break;
         case GGML_OP_MUL_MAT_ID: {
+            /* With the next multiply of the same activations and ids, as one
+             * request per card when the Rust side takes the pair; the partner
+             * is then skipped where it stands (role 1). */
+            int j = id_pair(cgraph, i);
+            if (j >= 0) {
+                int r = run_id_pair(node, cgraph->nodes[j]);
+                if (r < 0) return GGML_STATUS_FAILED;
+                if (r == 0) {
+                    role[j] = 1;
+                    break;
+                }
+            }
             const struct ggml_tensor *src0 = node->src[0], *src1 = node->src[1], *ids = node->src[2];
             int keep = strstr(src0->name, "weight") != NULL;
             int64_t n = ids->ne[0] * ids->ne[1];

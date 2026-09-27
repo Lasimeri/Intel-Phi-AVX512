@@ -102,6 +102,16 @@ int main(void)
 	check("ffn.chunk", offsetof(struct vpu_ffn, chunk), 120);
 	check("ffn.h_type", offsetof(struct vpu_ffn, h_type), 128);
 	check("sizeof ffn", sizeof(struct vpu_ffn), 192);
+	check("VPU_K_MATMUL_MORE", VPU_K_MATMUL_MORE, 8);
+	check("VPU_OFF_MORE", VPU_OFF_MORE, 13632);
+	check("VPU_MORE_MAX", VPU_MORE_MAX, 3);
+	check("more_mat.a_type", offsetof(struct vpu_more_mat, a_type), 8);
+	check("more_mat.m", offsetof(struct vpu_more_mat, m), 16);
+	check("more_mat.nb_a", offsetof(struct vpu_more_mat, nb_a), 24);
+	check("more_mat.d_off", offsetof(struct vpu_more_mat, d_off), 32);
+	check("sizeof more_mat", sizeof(struct vpu_more_mat), 40);
+	check("more.mat", offsetof(struct vpu_more, mat), 8);
+	check("sizeof more", sizeof(struct vpu_more), 128);
 	check("VPU_OFF_SCRATCH", VPU_OFF_SCRATCH, 8);
 	check("VPU_OFF_REQ", VPU_OFF_REQ, 64);
 	check("VPU_OFF_REPLY", VPU_OFF_REPLY, 256);

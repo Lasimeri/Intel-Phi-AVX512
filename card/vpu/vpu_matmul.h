@@ -90,6 +90,36 @@ struct vpu_ffn {
 
 _Static_assert(sizeof(struct vpu_ffn) == 192, "feed-forward descriptor layout is shared with Rust");
 
+/* Further matrices by the same activations (and, for a mixture, the same
+ * ids) in the same request as the matmul descriptor's own
+ * (VPU_K_MATMUL_MORE): a layer's gate and up projections, which ggml asks
+ * for as two multiplies of one input. One pull, one dispatch over the
+ * rows of all of them, and each result pushed to its own d_off. The base
+ * descriptor says plain or mixture (n_used zero or not); every matrix is
+ * of a quantized type, k long, resident, and read at the base's nb_b.
+ * See vpu_matmul.md. */
+#define VPU_K_MATMUL_MORE 8
+#define VPU_OFF_MORE 13632   /* struct vpu_more, after the feed-forward descriptor */
+#define VPU_MORE_MAX 3
+
+struct vpu_more_mat {
+    uint64_t a_id;      /* the resident slice */
+    uint32_t a_type;    /* VPU_MM_*, quantized */
+    uint32_t pad;
+    uint64_t m;         /* its rows this request computes (a mixture: rows of each expert) */
+    uint64_t nb_a;      /* its row stride */
+    uint64_t d_off;     /* window offset for its n rows of m float32, whole blocks */
+};
+
+struct vpu_more {
+    uint32_t count;     /* further matrices, 1 to VPU_MORE_MAX */
+    uint32_t pad;
+    struct vpu_more_mat mat[VPU_MORE_MAX];
+};
+
+_Static_assert(sizeof(struct vpu_more_mat) == 40, "more-matrix layout is shared with Rust");
+_Static_assert(sizeof(struct vpu_more) == 128, "more descriptor layout is shared with Rust");
+
 /* Run one request of the three kinds; fills the reply's timings and the
  * number of slices run. Returns a VPU_OK / VPU_E_* status. */
 /* Small transfers through the mapped window (1, the default) or all

@@ -481,3 +481,34 @@ and KL divergence).
 `PHI_GGML_FRACTION` set still fixes one share for every tensor. A tensor
 offered after the shares are settled (a draft model's) takes its class's
 base share (`share_of`), fitted into what budget is left as before.
+
+## A layer's gate and up in one request (2026-09-27)
+
+A mixture-of-experts layer multiplies its activations by the gate and
+the up experts, two `MUL_MAT_ID`s with the same activations and the same
+ids that ggml builds one after the other, and each went to the cards as
+a request of its own. The glue now finds such a pair (`id_pair`,
+`csrc/ggml-phi.md`) and hands both to `phi_ggml_begin_id_pair`, which
+sends one request per card carrying both (`K_MATMUL_MORE`,
+`card/vpu/vpu_matmul.md`): one copy of the activations and ids into the
+window, one dispatch on the card, one reply, each matrix's results in
+its own part of the window; the host computes its rows of both in one
+graph and `phi_ggml_end_id_pair` gathers both.
+
+`begin` is two steps now so that a pair can be decided before anything
+starts: `prepare` (plan the tensor if new, which a second call repeats
+harmlessly, then every rule that keeps a multiply with the host, then
+the ranges) and `issue` (the activations, the descriptor, the doorbell).
+A pair goes as one only when both would go to the cards, to the same
+cards, with the activations in the same format and both results inside
+the window; and only offloaded or with the judgement off
+(`PHI_GGML_JUDGE=0`), because the judgement times each tensor alone.
+Otherwise `phi_ggml_begin_id_pair` returns -2 having started nothing,
+and the glue runs the two as it always has. A pair prints as one
+multiply in the verbose log, its card rows the two matrices' together.
+
+Offloaded, on the 35B-A3B (`docs/results/2026-09-27-gate-and-up-together.md`):
+40 pairs a token, 119 card requests where there were 158, generation
+8.9 to 9.6 tokens per second and the prompt 64 to 69, the text the same
+byte for byte as without the pair (which moves no row between the host
+and the cards).

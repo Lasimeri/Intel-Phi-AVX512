@@ -138,6 +138,24 @@ bytes per row, matrices) and whether it is a mixture's, and the Rust side
 sizes the cards' shares from them at the first multiply, the dense
 matrices first (`../src/lib.md`, "A share per class").
 
+## A layer's gate and up together (2026-09-27)
+
+`id_pair` finds, for a `MUL_MAT_ID` node, a partner the cards can take
+in the same request: the next node that computes anything (views and
+reshapes are free), itself a `MUL_MAT_ID` of the same activations and the
+same ids, its weight a card type of the same shape. Only the next one,
+because the partner is computed at the first's place, earlier than the
+graph put it: ggml's allocator gives a node's output memory freed by
+nodes before it, so between the two there must be nothing whose tensors
+could be that memory. llama.cpp builds a layer's up and gate exactly so
+(`build_moe_ffn`, `src/llama-graph.cpp`). `run_id_pair` calls
+`phi_ggml_begin_id_pair`, computes the host's ranges of both in one graph
+(`host_rows_id_pair`, so ggml's pool wakes once), and gathers both with
+`phi_ggml_end_id_pair`; the partner is then skipped where it stands. When
+the Rust side declines the pair (-2, nothing started) the first node runs
+alone and the partner in its turn, as before (`../src/lib.md`, "A layer's
+gate and up in one request").
+
 ## A device only when the cards open (2026-09-24)
 
 `phi_reg_get_device_count` opens the cards (`phi_ggml_open`) the first time
