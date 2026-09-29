@@ -21,7 +21,7 @@ use crate::ngram_cache::Caches;
 /// `n_predict` (or `max_tokens`) and `ignore_eos` and, under `"pld"`,
 /// any of `k_max`, `k_min`, `adapt`, `min_n`, `max_n`, `fold_max`,
 /// `pick` ("first" or "latest"), `drafter` ("exact", "cache" or "both"),
-/// `cache_k` and `learn`.
+/// `cache_k`, `learn` and `static`.
 pub fn params_for(base: &Params, body: &Value) -> Result<Params, String> {
     if body.get("temperature").and_then(Value::as_f64).is_some_and(|t| t > 0.0) {
         return Err("greedy only: temperature above 0 is not supported".into());
@@ -71,6 +71,9 @@ pub fn params_for(base: &Params, body: &Value) -> Result<Params, String> {
         }
         if let Some(v) = o.get("learn").and_then(Value::as_bool) {
             p.learn = v;
+        }
+        if let Some(v) = o.get("static").and_then(Value::as_bool) {
+            p.use_static = v;
         }
     }
     Ok(p)
@@ -228,6 +231,7 @@ mod tests {
             cache_k: 2,
             ignore_eos: false,
             learn: true,
+            use_static: true,
         }
     }
 

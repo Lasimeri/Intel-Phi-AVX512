@@ -21,8 +21,9 @@ come back:
 
 A request may carry `"pld": {...}` with any of `k_max`, `k_min`, `adapt`,
 `min_n`, `max_n`, `fold_max`, `pick`, `drafter` ("exact", "cache" or
-"both"), `cache_k` and `learn` (false: this request does not teach the
-dynamic cache) to change its drafting (`params_for`); and llama-server's
+"both"), `cache_k`, `learn` (false: this request does not teach the
+dynamic cache) and `static` (false: no static cache for this request)
+to change its drafting (`params_for`); and llama-server's
 `ignore_eos` at the top level.
 
 The server holds the caches across requests (`ngram_cache.md`): the

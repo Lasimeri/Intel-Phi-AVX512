@@ -41,9 +41,10 @@ exact match, and `both` from the caches only where the exact match finds
 nothing (`ngram_cache.md`); `-lcs` names a static cache built by
 llama.cpp's `llama-lookup-create`, `-lcd` a dynamic cache the server
 reads at start and writes after every request. On free code generation
-with the Q6_K on the cards none of the drafters pays (a verified token
-costs about 49 ms there); where a verified token costs under about 40 ms,
-`both` with `--cache-k 1` is the simulator's best
+with the Q6_K on the cards none of the drafters pays (timed: the caches
+with the static cache at one token 0.95 of drafting off, the exact match
+0.92; a verified token costs about 49 ms there); where a verified token
+costs under about 40 ms, `both` with `--cache-k 1` is the simulator's best
 ([the record](../../../../docs/results/2026-09-29-ngram-caches.md)).
 `--ignore-eos` runs every request to `-n` tokens (llama-server's
 `--ignore-eos`), for timing at a fixed length.
@@ -51,7 +52,7 @@ costs about 49 ms there); where a verified token costs under about 40 ms,
 The exact match's defaults are the simulator's best on three prompts
 with the Q4_K_M's cost ([the record](../../../../docs/results/2026-09-27-phi-pld.md)).
 Priced with the Q6_K's (now `simulate`'s default table), they lose 4
-percent on free code generation (0.956 of plain); on a copy, where every
+percent on free code generation (0.956 of plain; timed, 0.92); on a copy, where every
 draft is taken, the table (extended past 17 tokens by its last slope)
 still puts a 64-token draft at about 26 ms a token against 114. They are
 unchanged.

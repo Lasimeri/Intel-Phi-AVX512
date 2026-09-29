@@ -15,7 +15,7 @@ use std::time::Instant;
 use anyhow::{bail, ensure, Result};
 
 use crate::lookup::{Lookup, Pick};
-use crate::ngram_cache::{self, Cache, Caches, NGRAM_MAX};
+use crate::ngram_cache::{self, Cache, Caches, Static, NGRAM_MAX};
 
 /// Where drafts come from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,6 +86,10 @@ pub struct Params {
     /// caches learn at all, `Caches::learn`); off for a request that must
     /// not teach the ones after it, such as a repeat of a timed run.
     pub learn: bool,
+    /// The static cache drafts and weights (when the caller holds one); off
+    /// for a request that should draft from the context and dynamic caches
+    /// alone.
+    pub use_static: bool,
 }
 
 /// Steps, drafted and accepted tokens, for drafts copied after an n-gram
@@ -148,6 +152,8 @@ pub fn generate<M: Model>(m: &mut M, prompt: &[i32], p: &Params, caches: &mut Ca
     // The context cache and the history it drafts after, kept whenever the
     // caches draft or learn.
     let learn = caches.learn && p.learn;
+    let no_static = Static::default();
+    let statics = if p.use_static { &caches.statics } else { &no_static };
     let cached = p.drafter != Drafter::Exact || learn;
     let mut hist: Vec<i32> = Vec::new();
     let mut ctx = Cache::new();
@@ -199,7 +205,7 @@ pub fn generate<M: Model>(m: &mut M, prompt: &[i32], p: &Params, caches: &mut Ca
                 look.draft(k.min(room))
             };
             if exact.0.is_empty() && p.drafter != Drafter::Exact {
-                let d = ngram_cache::draft(&hist, p.cache_k.min(room), 1, NGRAM_MAX, &ctx, &caches.dynamic, &caches.statics);
+                let d = ngram_cache::draft(&hist, p.cache_k.min(room), 1, NGRAM_MAX, &ctx, &caches.dynamic, statics);
                 tiers = d.iter().map(|x| x.1 as usize).collect();
                 (d.into_iter().map(|x| x.0).collect(), 0)
             } else {

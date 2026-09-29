@@ -1,14 +1,13 @@
-# 2026-09-29: llama.cpp's n-gram caches in phi-pld, priced on the Q6_K with the cards
+# 2026-09-29: llama.cpp's n-gram caches in phi-pld, priced and timed on the Q6_K with the cards
 
-> **Read first.** Every speed ratio here is **modelled** (`phi-pld
-> simulate`, the generation phase only, against plain generation) for
-> **free code generation** (a program written from a description) by the
-> **35B-A3B Q6_K offloaded to both cards**, with that model's verification
-> cost measured on the cards today. No drafting configuration is faster
-> than plain generation there: the best is 0.974. No timed run with the
-> drafters was made (the host was paging; the last section). The
-> simulator has read about 10 percent optimistic before
-> (`2026-09-27-phi-pld.md`).
+> **Read first.** Every rate and ratio here is for **free code generation**
+> (a program written from a description) by the **35B-A3B Q6_K offloaded
+> to both cards**, the **generation phase** only. The first part prices
+> drafting options with `phi-pld simulate` (**modelled**); the last
+> section **times** them (1024 tokens a request, `ignore_eos`, two rounds
+> interleaved). No drafter is faster than plain generation: measured, the
+> best is **0.95** of drafting off (9.22 against 9.70 tokens per second),
+> phi-pld's default drafter 0.92; the simulator read 1 to 3 points high.
 
 Host: Ryzen 7 5800X, 31 GiB, kernel 7.2.6-1-cachyos, both cards up
 (workers at 114 threads). llama.cpp `build-native` at f5b9bd3, unchanged
@@ -226,11 +225,122 @@ host/target/release/phi-pld -m $M --drafter cache --cache-k 1 [-lcs static-25.bi
 `.prompt` files are llama-server's `/apply-template` renderings, the
 `.tokens.json` its `return_tokens`.
 
-## Not done: timed runs
+## Timed runs (measured, the same afternoon)
 
-The timing comparison is to be fixed-length (`ignore_eos`, now in
-phi-pld and llama-server alike) and interleaved. It was not run: with
-about 19.5 GiB available and phi-pld peaking at 19.0 GiB resident with
-the Q6_K, llama-server read 2.9 to 42.7 GiB from disk per request, so a timed run would measure
-the disk. It needs the host's memory freed first, and the model above
-says it would show no gain on this task at today's column cost.
+**What was run.** One phi-pld server (`serve`, the 35B-A3B Q6_K,
+`PHI_GGML_OFFLOAD=1`, `-t 12 -c 4096`, the static cache above loaded),
+drafting chosen per request. The five prompts whose own end lies past
+1024 tokens (wordfreq, calc, dijkstra, ringbuf, kvstore; crc32 ends at
+500 and was left out), each generated to **exactly 1024 tokens with
+`ignore_eos`**, so no run stops early and none runs past the model's own
+end. Five conditions:
+
+| condition | request's `pld` |
+| --- | --- |
+| off | `k_max 0` |
+| exact (phi-pld's default drafter) | defaults |
+| cache1 | `drafter cache, cache_k 1, static false` |
+| cache1s | `drafter cache, cache_k 1, static true` |
+| both1s | `drafter both, cache_k 1, static true` |
+
+`learn false` in every request, so the dynamic cache stays empty and a
+repeat never drafts from its own first run (the dynamic tier's online
+effect is the simulation's, above). Two rounds; per prompt the
+conditions back to back in an order rotated by prompt and round. Rates are
+the server's `predicted_per_second` (the generation phase); the client's
+whole-request rate (tokens over wall time) is within 2 percent of it
+throughout. Each request's disk reads are the server process's
+`/proc/PID/io` `read_bytes` across it.
+
+**Results** (tokens per second, the generation phase; ratios are each
+request over drafting off's for the same prompt and round, the geometric
+mean of the pairs):
+
+| condition | mean rate | against off, all 10 pairs | pairs where both read under 200 MiB | modelled (same 1024 tokens) | drafted | accepted |
+| --- | --- | --- | --- | --- | --- | --- |
+| off | **9.70** (9.20 to 9.86) | 1 | | | | |
+| exact | 8.97 | 0.923 | 0.918 (6) | 0.933 | 6506 | 2712 |
+| cache1 | 9.19 | 0.947 | 0.949 (7) | 0.961 | 3798 | 2370 |
+| cache1s | 9.22 | **0.950** | 0.943 (6) | 0.964 | 4428 | 2826 |
+| both1s | 8.69 | 0.895 | 0.893 (7) | 0.925 | 8004 | 3590 |
+
+Per prompt (round 1 / round 2):
+
+| prompt | off | exact | cache1 | cache1s | both1s |
+| --- | --- | --- | --- | --- | --- |
+| wordfreq | 9.20 / 9.78 | 8.34 / 8.47 | 8.88 / 8.83 | 8.59 / 8.86 | 7.95 / 8.12 |
+| calc | 9.86 / 9.79 | 9.53 / 10.16 | 9.69 / 9.82 | 9.50 / 9.56 | 9.31 / 9.26 |
+| dijkstra | 9.85 / 9.78 | 8.70 / 8.72 | 8.96 / 9.10 | 9.22 / 9.21 | 8.39 / 8.32 |
+| ringbuf | 9.69 / 9.50 | 9.38 / 9.36 | 9.09 / 9.14 | 9.04 / 9.50 | 9.26 / 9.35 |
+| kvstore | 9.79 / 9.75 | 8.55 / 8.45 | 9.20 / 9.20 | 9.33 / 9.37 | 8.37 / 8.58 |
+
+- **No drafter is faster than plain generation** on this task. The best,
+  llama.cpp's caches at one token with the static corpus, runs at 0.95 of
+  drafting off; phi-pld's default exact-match drafter at 0.92; the caches
+  behind the exact match at 0.90. Two requests of 40 were at or above
+  their drafting-off partner (calc, round 2: exact 10.16 and cache1 9.82
+  against 9.79), both on text that had parted from drafting off's at
+  token 76 (below).
+- **The simulator holds**: it reads 1 to 3 points high against the timed
+  ratios, the order of the conditions the same (cache1s, cache1, exact,
+  both1s).
+- **Drafting off is 9.70** (9.20 to 9.86), the 9.5 to 9.8 of llama-server
+  on 2026-09-27 (`2026-09-27-code-generation-q8.md`).
+- Disk: after the first request (7466 MiB, the host's part of the model
+  paged in after the load) requests read 1 to 1156 MiB, drafting off 536
+  MiB in its other nine, the drafters 874 to 2434 MiB in ten (a
+  verification brings more experts' rows in; the host has about 19.5 GiB
+  for a host part about as large).
+
+## Verified (timed runs)
+
+- **phi-pld's `ignore_eos` is llama-server's.** crc32 (its own end at
+  500), 600 tokens with `ignore_eos` and drafting off: phi-pld's tokens are
+  llama-server's, all 600 (and the first 499 are the natural run's).
+- **Drafting off is llama-server.** All ten drafting-off runs' 1024
+  tokens are llama-server's natural-end output's first 1024, token for
+  token.
+- **Where drafting changed the text, it was a near tie.** Every drafting
+  run parts from drafting off at a fixed token, the same in both rounds.
+  At each of the twelve distinct points `phi-pld margin` decoded drafting
+  off's output one token at a time and ranked the next token: the
+  drafting run had taken the **runner-up** every time, 0.01 to 0.24
+  logits behind, the third 0.25 to 8.2 behind the second (a verification batch
+  rounds differently from a single token, `decode.md`). Where several
+  conditions part at the same token they took the same token there:
+
+| prompt, condition | token | gap (logits) | first / second |
+| --- | --- | --- | --- |
+| calc, exact and cache1 | 76 | 0.24 | " parser" / " chars" |
+| calc, cache1s | 212 | 0.09 | " peek" / " current" |
+| calc, both1s | 302 | 0.11 | "(ch" / "('" |
+| dijkstra, all four | 159 | 0.05 | " swap" / " heap" |
+| wordfreq, exact, cache1, both1s | 130 | 0.01 | ")" / ")t" |
+| wordfreq, cache1s | 412 | 0.13 | " (" / " h" |
+| ringbuf, exact, cache1, cache1s | 398 | 0.04 | "<T" / "<'" |
+| ringbuf, both1s | 287 | 0.17 | "take" / "clone" |
+| kvstore, exact | 522 | 0.11 | "\n" / " else" |
+| kvstore, cache1s | 178 | 0.04 | " return" / "\n" |
+| kvstore, cache1 | 781 | 0.01 | " char" / " if" |
+| kvstore, both1s | 444 | 0.19 | "temp" / "tmp" |
+
+- **The cards did the work.** `xks ledger` over the first set's
+  `PHI_GGML_VERBOSE=1` log (same build and plan): 7.74 million of 19.08
+  million multiplies ran with both cards, 11.3 billion rows each, 1554 and
+  1526 s of compute on cards 0 and 1, the host 4348 s on its part and 580 s
+  waiting.
+
+**A first set was discarded.** It ran with `PHI_GGML_VERBOSE=1` for the
+ledger, which writes a line per multiply, into the scratch directory on
+`/tmp`: tmpfs, this host's RAM. The log grew to 4.36 GB over the fifty
+requests and pushed the model's pages out, so requests read up to 3.5 GiB
+from disk, more as the set went on. Its ratios came out close to these
+(exact 0.921, cache1 0.956, cache1s 0.961, both1s 0.902) but are not used.
+Never run a timed set with the verbose log on tmpfs.
+
+The timed runs' commands: the server as `phi-pld ... -n 1024
+--lookup-cache-static static-25.bin serve --bind 127.0.0.1:8098` under
+`PHI_GGML_OFFLOAD=1 scripts/phi-ggml.sh`; each request `POST /completion`
+with the rendered prompt, `n_predict 1024`, `ignore_eos true`,
+`temperature 0`, `return_tokens true` and the `pld` above; `phi-pld ...
+margin PROMPT OFF_TOKENS --at N` for the table.

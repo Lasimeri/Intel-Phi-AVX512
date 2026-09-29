@@ -100,6 +100,7 @@ cards, the Q4_K_M the one for correctness and for comparison):
 | the same, Q8_0 offloaded (37.8 GB, past the host's memory) | about 8 (8.04, 8.08) | same |
 | the same with a draft model, even the smallest (2B Q4_K_M with the Q6_K) | 6.89, 6.91: slower, not used | same |
 | the 9B Q8_0 dense, **entirely on the cards** (host 2.3 GiB) | about 8 (8.03, 7.99) | same |
+| writing code, Q6_K offloaded, phi-pld, 1024 tokens with `ignore_eos` (five prompts, twice) | 9.70 drafting off; the best drafter (n-gram caches, static corpus) 9.22, 0.95 of it: none pays | `docs/results/2026-09-29-ngram-caches.md` |
 | copying code from the prompt with prompt lookup, Q4_K_M, generation phase only | about 40 (whole request 6.5 with the 2385-token prompt) | same, and `2026-09-27-prompt-lookup-llama-server.md` |
 | Q8_0 offloaded, prompt | 72 (57.8 before the two-threads pool) | `docs/results/2026-09-27-two-threads-per-core.md` |
 
@@ -256,11 +257,13 @@ explained), so whole requests with long prompts are slower with it
 (`docs/results/2026-09-27-phi-pld.md`). These figures are the Q4_K_M.
 Since 2026-09-29 phi-pld also drafts from llama.cpp's n-gram caches
 (context, dynamic and static, the algorithm of Tirmazi's post;
-`--drafter cache|both`). Priced with the Q6_K's measured verification
-cost (about 49 ms for each token more), no drafter pays on free code
-generation (modelled: the caches 0.974 of plain, the exact-match
-defaults 0.956); drafting starts to pay below about 40 ms
-(`docs/results/2026-09-29-ngram-caches.md`).
+`--drafter cache|both`). On free code generation with the Q6_K on the
+cards no drafter pays, timed (1024 tokens, `ignore_eos`, five prompts
+twice, interleaved): the caches with a static code corpus 0.95 of
+drafting off (9.22 against 9.70 tokens per second), phi-pld's default
+exact-match drafter 0.92. A token more in a verification costs about 49
+ms there, and drafting starts to pay below about 40 ms (modelled;
+`docs/results/2026-09-29-ngram-caches.md`).
 
 A model larger than this host's 31 GiB runs from its file, the page
 cache holding what it can. By default the cards' rows are a copy, so

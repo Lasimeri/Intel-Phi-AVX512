@@ -67,8 +67,8 @@ the host alone as with the cards (`docs/results/2026-09-27-prompt-lookup-llama-s
 **Drafts from the caches.** With `drafter` `Cache`, every draft comes from
 llama.cpp's n-gram caches (`ngram_cache.md`): the context cache, which
 this request keeps from its prompt and every token decided, then the
-dynamic and static caches the caller holds (`Caches`), `cache_k` tokens
-at most (fixed: the adaptation above is the exact match's). With `Both`,
+dynamic and static caches the caller holds (`Caches`; the static left
+out of a request with `use_static` off), `cache_k` tokens at most (fixed: the adaptation above is the exact match's). With `Both`,
 the exact match drafts when it finds one and the caches otherwise. After
 the request, when `Caches::learn` is set, the context cache is merged into
 the dynamic one, as llama.cpp's lookup example does, so a later request

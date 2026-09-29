@@ -284,6 +284,7 @@ mod tests {
             cache_k: 2,
             ignore_eos: false,
             learn: true,
+            use_static: true,
         }
     }
 

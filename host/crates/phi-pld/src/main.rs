@@ -214,6 +214,7 @@ fn params(d: &DraftArgs) -> Params {
         cache_k: d.cache_k,
         ignore_eos: d.ignore_eos,
         learn: true,
+        use_static: true,
     }
 }
 
