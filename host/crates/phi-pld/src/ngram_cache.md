@@ -66,7 +66,9 @@ in its list, which starts at n 1.
 Files are llama.cpp's format (`common_ngram_cache_save`: a 4-token key
 padded with -1, the number of followers, then each follower's token and
 count, all 32-bit), so `llama-lookup-create`'s output loads here, and a
-dynamic cache written here loads in llama.cpp (`-lcd`). `Cache::save`
+dynamic cache written here is in the format llama.cpp's `-lcd` reads
+(only the first direction has been exercised: files written here have
+been read back here, not yet by llama.cpp). `Cache::save`
 writes a temporary file and renames it over the old one.
 
 ## Where it differs from llama.cpp

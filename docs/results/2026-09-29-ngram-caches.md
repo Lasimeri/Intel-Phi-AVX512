@@ -194,6 +194,38 @@ Withdrawn during the work: a scratch pricer read 1.17 to 1.21 for the
 caches at 2 tokens; it carried only the accepted tokens after a rejection,
 not `cur`, one 49 ms column short on every rejection.
 
+## Commands
+
+From this repository, with `M=~/models/Qwen3.8-35B-A3B/Qwen3.8-35B-A3B-Q6_K.gguf`
+and `B=~/llama.cpp/build-native/bin`:
+
+```
+# the outputs (then /apply-template and /completion per prompt, as above)
+PHI_GGML_OFFLOAD=1 scripts/phi-ggml.sh $B/llama-server -m $M --no-repack -t 12 -c 4096 \
+    -b 512 -ub 512 -np 1 --reasoning off --port 8097
+# verification cost, runs 1, 2 and 3 (run 2 under /usr/bin/time -v; run 3
+# with /proc/PID/io and /proc/PID/stat sampled every second)
+PHI_GGML_OFFLOAD=1 scripts/phi-ggml.sh host/target/release/phi-pld -m $M -t 12 -c 4096 \
+    verify-cost vc-prompt.txt --ks 0,1,2,3,4,6,8,16 --reps 5
+    ... --ks 0,1,2,3,4,6,8,16 --reps 9
+    ... --ks 0,1,2,3,4,8 --reps 9
+# one snapshot
+PHI_GGML_OFFLOAD=1 scripts/phi-ggml.sh host/target/release/phi-pld -m $M -t 12 -c 4096 \
+    --rs-seq 1 verify-cost vc-prompt.txt --ks 0,1,2 --reps 9
+# the static cache
+$B/llama-lookup-create -m ~/models/Qwen3.8-2B-Distill/Qwen3.8-2B-Q4_K_M.gguf \
+    -f code-25.txt -lcs static-25.bin -c 512
+# pricing (the table is simulate's default; the scaled rows pass --decode-ms)
+host/target/release/phi-pld -m $M --drafter cache --cache-k 1 [-lcs static-25.bin] \
+    simulate crc32.prompt crc32.tokens.json wordfreq.prompt wordfreq.tokens.json \
+    calc.prompt calc.tokens.json dijkstra.prompt dijkstra.tokens.json \
+    ringbuf.prompt ringbuf.tokens.json kvstore.prompt kvstore.tokens.json
+```
+
+`vc-prompt.txt` is the wordfreq prompt followed by its output; the
+`.prompt` files are llama-server's `/apply-template` renderings, the
+`.tokens.json` its `return_tokens`.
+
 ## Not done: timed runs
 
 The timing comparison is to be fixed-length (`ignore_eos`, now in
