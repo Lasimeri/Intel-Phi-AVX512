@@ -1,4 +1,5 @@
-//! Greedy generation with prompt lookup drafts (`lookup.rs`) verified by
+//! Greedy generation with prompt lookup drafts (`lookup.rs`, or llama.cpp's
+//! n-gram caches in `ngram_cache.rs`) verified by
 //! the model: each step decodes the last token and the draft together,
 //! keeps the longest prefix of the draft the model agrees with plus the
 //! model's own next token, and takes the rest back. On a model with a
@@ -14,6 +15,18 @@ use std::time::Instant;
 use anyhow::{bail, ensure, Result};
 
 use crate::lookup::{Lookup, Pick};
+use crate::ngram_cache::{self, Cache, Caches, NGRAM_MAX};
+
+/// Where drafts come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Drafter {
+    /// Copied after the longest exact match (`lookup.rs`).
+    Exact,
+    /// llama.cpp's n-gram caches (`ngram_cache.rs`).
+    Cache,
+    /// The exact match when there is one, else the caches.
+    Both,
+}
 
 /// What generation needs of a model.
 pub trait Model {
@@ -25,6 +38,9 @@ pub trait Model {
     /// Tokens per `llama_decode`, and per physical step.
     fn batch(&self) -> (usize, usize);
     fn is_eog(&self, t: i32) -> bool;
+    /// Greedy choices skip the end-of-generation tokens (`ignore_eos`);
+    /// a replay has nothing to skip.
+    fn ban_eog(&mut self, _on: bool) {}
     /// Forget everything (a new request).
     fn clear(&mut self);
     /// Decode `tokens` at positions `pos0..` and return the greedy choice
@@ -58,6 +74,18 @@ pub struct Params {
     /// Test only: every draft is wrong (tokens the model is known not to
     /// have chosen), so every step takes its draft back.
     pub junk: bool,
+    /// Where drafts come from, and the length of a draft from the caches
+    /// (fixed: the adaptation above is the exact match's).
+    pub drafter: Drafter,
+    pub cache_k: usize,
+    /// Generate `n_predict` tokens whatever the model would end on:
+    /// llama-server's `ignore_eos`, its end-of-generation tokens never
+    /// chosen.
+    pub ignore_eos: bool,
+    /// This request's context joins the dynamic cache afterwards (when the
+    /// caches learn at all, `Caches::learn`); off for a request that must
+    /// not teach the ones after it, such as a repeat of a timed run.
+    pub learn: bool,
 }
 
 /// Steps, drafted and accepted tokens, for drafts copied after an n-gram
@@ -87,21 +115,29 @@ pub struct Outcome {
     pub restores: usize,
     pub carried: usize,
     pub flushes: usize,
-    /// The same, by the length of the n-gram the draft followed (index n).
+    /// The same, by the length of the n-gram the draft followed (index n),
+    /// for exact-match drafts.
     pub by_n: Vec<Order>,
+    /// Drafted and accepted tokens from the caches, by the cache each
+    /// token came from (context, dynamic, static); `steps` counts the
+    /// steps whose draft began in that cache.
+    pub by_tier: [Order; 3],
     /// Time spent drafting (the lookup), in total.
     pub draft_us: f64,
     /// Whether generation ended at an end-of-generation token.
     pub eog: bool,
 }
 
-/// Generate greedily after `prompt`.
-pub fn generate<M: Model>(m: &mut M, prompt: &[i32], p: &Params) -> Result<Outcome> {
+/// Generate greedily after `prompt`, drafting from the context and from
+/// `caches` (whose dynamic cache learns this request's context when set
+/// to).
+pub fn generate<M: Model>(m: &mut M, prompt: &[i32], p: &Params, caches: &mut Caches) -> Result<Outcome> {
     let mut o = Outcome {
         prompt_n: prompt.len(),
         ..Outcome::default()
     };
     m.clear();
+    m.ban_eog(p.ignore_eos);
     let n_ctx = m.n_ctx();
     let t0 = Instant::now();
     let mut cur = prefill(m, prompt)?;
@@ -109,6 +145,22 @@ pub fn generate<M: Model>(m: &mut M, prompt: &[i32], p: &Params) -> Result<Outco
     let t1 = Instant::now();
     let mut look = Lookup::new(p.min_n, p.max_n, p.pick);
     look.extend(prompt);
+    // The context cache and the history it drafts after, kept whenever the
+    // caches draft or learn.
+    let learn = caches.learn && p.learn;
+    let cached = p.drafter != Drafter::Exact || learn;
+    let mut hist: Vec<i32> = Vec::new();
+    let mut ctx = Cache::new();
+    if cached {
+        hist.extend_from_slice(prompt);
+        ctx.update(&hist, hist.len(), 1, NGRAM_MAX);
+    }
+    let seen = move |t: i32, hist: &mut Vec<i32>, ctx: &mut Cache| {
+        if cached {
+            hist.push(t);
+            ctx.update(hist, 1, 1, NGRAM_MAX);
+        }
+    };
     // `pos` tokens come before `cur`; the last `pending.len()` of them are
     // decided but not in the context (kept from a rejected draft), and
     // `ckpt` holds the state the context has before them.
@@ -120,6 +172,7 @@ pub fn generate<M: Model>(m: &mut M, prompt: &[i32], p: &Params) -> Result<Outco
         // `cur` is the model's next token, not yet in its context.
         o.tokens.push(cur);
         look.push(cur);
+        seen(cur, &mut hist, &mut ctx);
         if m.is_eog(cur) {
             o.eog = true;
             break;
@@ -131,16 +184,31 @@ pub fn generate<M: Model>(m: &mut M, prompt: &[i32], p: &Params) -> Result<Outco
         // successor, and the context.
         let room = (p.n_predict - o.tokens.len() - 1).min(n_ctx - pos - 1);
         let td = Instant::now();
+        // `tiers`: the cache each token came from, for a draft from the
+        // caches; empty for an exact match.
+        let mut tiers = Vec::new();
         let (mut draft, n) = if p.k_max == 0 || room == 0 {
             (Vec::new(), 0)
         } else if p.junk {
             // Never what the model chose: it chose `cur`, so repeat another.
             (vec![(cur + 1) % 1000; k.min(room)], 0)
         } else {
-            look.draft(k.min(room))
+            let exact = if p.drafter == Drafter::Cache {
+                (Vec::new(), 0)
+            } else {
+                look.draft(k.min(room))
+            };
+            if exact.0.is_empty() && p.drafter != Drafter::Exact {
+                let d = ngram_cache::draft(&hist, p.cache_k.min(room), 1, NGRAM_MAX, &ctx, &caches.dynamic, &caches.statics);
+                tiers = d.iter().map(|x| x.1 as usize).collect();
+                (d.into_iter().map(|x| x.0).collect(), 0)
+            } else {
+                exact
+            }
         };
         o.draft_us += td.elapsed().as_secs_f64() * 1e6;
         draft.truncate(room);
+        tiers.truncate(room);
         // Carried tokens ride in front of this batch, unless it would grow
         // past `fold_max`: each rejection in a row carries them again.
         if !draft.is_empty() && !pending.is_empty() && pending.len() + 1 + draft.len() > p.fold_max {
@@ -175,11 +243,19 @@ pub fn generate<M: Model>(m: &mut M, prompt: &[i32], p: &Params) -> Result<Outco
         o.steps += 1;
         o.draft_n += draft.len();
         o.draft_accepted += j;
-        if o.by_n.len() <= n {
-            o.by_n.resize(n + 1, Order::default());
+        if tiers.is_empty() {
+            if o.by_n.len() <= n {
+                o.by_n.resize(n + 1, Order::default());
+            }
+            let b = &mut o.by_n[n];
+            (b.steps, b.drafted, b.accepted) = (b.steps + 1, b.drafted + draft.len(), b.accepted + j);
+        } else {
+            o.by_tier[tiers[0]].steps += 1;
+            for (i, &t) in tiers.iter().enumerate() {
+                o.by_tier[t].drafted += 1;
+                o.by_tier[t].accepted += usize::from(i < j);
+            }
         }
-        let b = &mut o.by_n[n];
-        (b.steps, b.drafted, b.accepted) = (b.steps + 1, b.drafted + draft.len(), b.accepted + j);
         // Take back what was not accepted: positions after `cur` and the
         // accepted draft. Through the checkpoint, the batch's decided part
         // (carried, `cur`, the accepted draft) is carried to the next.
@@ -203,6 +279,7 @@ pub fn generate<M: Model>(m: &mut M, prompt: &[i32], p: &Params) -> Result<Outco
         for &t in &draft[..j] {
             o.tokens.push(t);
             look.push(t);
+            seen(t, &mut hist, &mut ctx);
             if m.is_eog(t) {
                 o.eog = true;
                 stop = true;
@@ -214,7 +291,7 @@ pub fn generate<M: Model>(m: &mut M, prompt: &[i32], p: &Params) -> Result<Outco
         if stop {
             break;
         }
-        if p.adapt {
+        if p.adapt && tiers.is_empty() {
             // Everything accepted: try twice as long. Something rejected: the
             // next draft no longer than what was accepted, and one more.
             k = if j == draft.len() {
@@ -225,6 +302,9 @@ pub fn generate<M: Model>(m: &mut M, prompt: &[i32], p: &Params) -> Result<Outco
         }
     }
     o.predicted_ms = t1.elapsed().as_secs_f64() * 1e3;
+    if learn && !ctx.is_empty() {
+        caches.dynamic.merge(&ctx);
+    }
     Ok(o)
 }
 

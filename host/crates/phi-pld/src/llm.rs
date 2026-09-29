@@ -124,6 +124,10 @@ pub struct Llm {
     /// to 0 for an architecture that cannot roll back).
     pub rs_seq: u32,
     pub opts: Options,
+    /// The end-of-generation tokens, and whether the greedy choice skips
+    /// them (`ignore_eos`, as llama-server biases them to minus infinity).
+    eog: Vec<i32>,
+    ban_eog: bool,
 }
 
 // SAFETY: the context is used by one thread at a time (the server holds it
@@ -158,6 +162,7 @@ impl Llm {
             let rs_seq = sys::llama_n_rs_seq(c.as_ptr());
             let batch_cap = opts.batch as usize;
             let batch = sys::llama_batch_init(batch_cap as i32, 0, 1);
+            let eog = (0..n_vocab as i32).filter(|&t| sys::llama_vocab_is_eog(vocab, t)).collect();
             Ok(Self {
                 model: m,
                 ctx: c,
@@ -168,6 +173,8 @@ impl Llm {
                 recurrent: is_recurrent(m),
                 rs_seq,
                 opts,
+                eog,
+                ban_eog: false,
             })
         }
     }
@@ -335,6 +342,10 @@ impl Model for Llm {
         unsafe { sys::llama_vocab_is_eog(self.vocab, token) }
     }
 
+    fn ban_eog(&mut self, on: bool) {
+        self.ban_eog = on;
+    }
+
     fn clear(&mut self) {
         // SAFETY: plain call on this context's memory.
         unsafe { sys::llama_memory_clear(sys::llama_get_memory(self.ctx.as_ptr()), true) };
@@ -343,7 +354,8 @@ impl Model for Llm {
     /// One `llama_decode` per `batch` tokens.
     fn decode(&mut self, tokens: &[i32], pos0: usize, want: &[usize]) -> Result<Vec<i32>> {
         let mut out = Vec::with_capacity(want.len());
-        self.rows(tokens, pos0, want, &mut |logits| out.push(argmax(logits)))?;
+        let ban = if self.ban_eog { self.eog.clone() } else { Vec::new() };
+        self.rows(tokens, pos0, want, &mut |logits| out.push(argmax_without(logits, &ban)))?;
         Ok(out)
     }
 
@@ -427,6 +439,24 @@ impl Drop for Vocab {
     }
 }
 
+/// `argmax` over the tokens not in `ban` (a short list): the first choice
+/// unless it is banned, else the best of the rest.
+pub fn argmax_without(v: &[f32], ban: &[i32]) -> i32 {
+    let best = argmax(v);
+    if !ban.contains(&best) {
+        return best;
+    }
+    let mut best = -1;
+    let mut top = f32::NEG_INFINITY;
+    for (i, &x) in v.iter().enumerate() {
+        if x > top && !ban.contains(&(i as i32)) {
+            top = x;
+            best = i as i32;
+        }
+    }
+    best
+}
+
 /// The index of the largest value (the first of equals, as llama.cpp's
 /// greedy sampler takes it).
 pub fn argmax(v: &[f32]) -> i32 {
@@ -449,5 +479,8 @@ mod tests {
     fn argmax_takes_the_first_of_equals() {
         assert_eq!(argmax(&[0.0, 3.0, 1.0, 3.0]), 1);
         assert_eq!(argmax(&[-5.0]), 0);
+        assert_eq!(argmax_without(&[0.0, 3.0, 1.0, 3.0], &[1]), 3);
+        assert_eq!(argmax_without(&[0.0, 3.0, 1.0, 2.0], &[1, 3]), 2);
+        assert_eq!(argmax_without(&[0.0, 3.0], &[]), 1);
     }
 }

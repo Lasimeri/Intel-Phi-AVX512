@@ -12,13 +12,25 @@ come back:
   `predicted_n`, `predicted_ms`, `predicted_per_second`, `draft_n`,
   `draft_n_accepted`, and this engine's `steps`, `restores`, `carried`,
   `flushes` (`decode.md`), `by_n` (steps, drafted and accepted by the
-  length of the n-gram matched) and `draft_us_per_token`.
+  length of the n-gram matched, for exact-match drafts), `by_tier` (the
+  same for drafts from the caches, by the cache each token came from,
+  `ngram_cache.md`) and `draft_us_per_token`.
 - `POST /v1/chat/completions`: `messages`, `max_tokens`, `temperature`;
   rendered with the model's template (`llm.md`, `render_chat`), replied as
   one choice with the same `timings`.
 
 A request may carry `"pld": {...}` with any of `k_max`, `k_min`, `adapt`,
-`min_n`, `max_n`, `fold_max`, `pick` to change its drafting (`params_for`).
+`min_n`, `max_n`, `fold_max`, `pick`, `drafter` ("exact", "cache" or
+"both"), `cache_k` and `learn` (false: this request does not teach the
+dynamic cache) to change its drafting (`params_for`); and llama-server's
+`ignore_eos` at the top level.
+
+The server holds the caches across requests (`ngram_cache.md`): the
+static cache read at start, and the dynamic cache, which learns every
+request's context (prompt and output) when the caches draft or a
+dynamic file is named, and is written to that file after every request
+(a temporary file renamed over the old one), so a restarted server
+keeps what it learned.
 
 Greedy only: a `temperature` above 0 is refused with 400, since
 verification here compares the draft with the model's greedy choice and

@@ -8,7 +8,7 @@ scripts/phi-ggml.sh env PHI_GGML_OFFLOAD=1 host/target/release/phi-pld \
     -m ~/models/Qwen3.8-35B-A3B/Qwen3.8-35B-A3B-Q4_K_M.gguf serve --bind 127.0.0.1:8098
 phi-pld -m MODEL run prompt.txt                 # one rendered prompt: text on stdout, timings on stderr
 phi-pld -m MODEL verify-cost prompt.txt         # what verifying 1 + k tokens costs
-phi-pld -m MODEL simulate prompt.txt out.json   # the drafting options priced without the model
+phi-pld -m MODEL simulate prompt.txt out.json [prompt2.txt out2.json ...]   # priced without the model
 ```
 
 Under `scripts/phi-ggml.sh` the model's weight multiplies go to the
@@ -30,11 +30,31 @@ says), `serve --bind` (127.0.0.1:8098), and the drafter's:
 | `--fixed` (every draft `--k-max`) | off: adapting | on |
 | `--pick first\|latest` | first | first |
 | `--fold-max` (`decode.md`) | 8 | |
+| `--drafter exact\|cache\|both` | exact | |
+| `--cache-k` (a draft from the caches) | 2 | |
+| `--lookup-cache-static` (`-lcs`) | none | |
+| `--lookup-cache-dynamic` (`-lcd`) | none | |
+| `--ignore-eos` | off | |
 
-The defaults are the simulator's best on three prompts with the cards'
-measured cost ([the record](../../../../docs/results/2026-09-27-phi-pld.md)):
-the Q4_K_M's cost. The Q8_0, the model for speed with the cards, is not
-yet measured here, and its costs differ, so the defaults may move.
+`--drafter cache` drafts from llama.cpp's n-gram caches instead of the
+exact match, and `both` from the caches only where the exact match finds
+nothing (`ngram_cache.md`); `-lcs` names a static cache built by
+llama.cpp's `llama-lookup-create`, `-lcd` a dynamic cache the server
+reads at start and writes after every request. On free code generation
+with the Q6_K on the cards none of the drafters pays (a verified token
+costs about 49 ms there); where a verified token costs under about 40 ms,
+`both` with `--cache-k 1` is the simulator's best
+([the record](../../../../docs/results/2026-09-29-ngram-caches.md)).
+`--ignore-eos` runs every request to `-n` tokens (llama-server's
+`--ignore-eos`), for timing at a fixed length.
+
+The exact match's defaults are the simulator's best on three prompts
+with the Q4_K_M's cost ([the record](../../../../docs/results/2026-09-27-phi-pld.md)).
+Priced with the Q6_K's (now `simulate`'s default table), they lose 4
+percent on free code generation (0.956 of plain); on a copy, where every
+draft is taken, the table (extended past 17 tokens by its last slope)
+still puts a 64-token draft at about 26 ms a token against 114. They are
+unchanged.
 
 Two things to know before quoting a rate. The timings' generation rate
 (`predicted_per_second`) is the generation phase alone; a long prompt's
@@ -59,10 +79,12 @@ their logits: whether two runs that part at N part at a near tie
 
 `simulate` takes the rendered prompt and the tokens the model generated
 after it with drafting off (a JSON array, llama-server's `/completion`
-with `return_tokens`), loads the model's vocabulary alone, and runs the
-engine with the given drafting options against a replay of those tokens
+with `return_tokens`), or several such pairs, run in order as requests
+to one server (the dynamic cache learning each); it loads the model's
+vocabulary alone, and runs the engine with the given drafting options against a replay of those tokens
 (`sim.md`), each decode priced from a cost table (`--decode-ms n:ms,...`,
-`--checkpoint-ms`, `--restore-ms`; default the 35B-A3B Q4_K_M on both
-cards). One JSON line: the counts, the modelled time and the speedup over
-plain generation. A quarter of a second a run, so a sweep of hundreds of
-option sets takes minutes where the cards would take days.
+`--checkpoint-ms`, `--restore-ms`; default the 35B-A3B Q6_K on both
+cards, `sim.md`). One JSON line a pair: the counts, the modelled time and
+the speedup over plain generation; and the total for several. A
+quarter of a second a run, so a sweep of hundreds of option sets takes
+minutes where the cards would take days.

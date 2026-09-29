@@ -11,6 +11,7 @@ use anyhow::{ensure, Result};
 use serde_json::{json, Value};
 
 use crate::decode::{generate, Model, Outcome, Params};
+use crate::ngram_cache::Caches;
 
 /// What the model's calls cost, in milliseconds: a decode of n tokens
 /// with every row's choice read (`verify-cost`), linear between the
@@ -23,22 +24,25 @@ pub struct Cost {
 }
 
 impl Cost {
-    /// The 35B-A3B Q4_K_M offloaded to both cards, `-t 12`, no snapshots
-    /// (`phi-pld verify-cost`, docs/results/2026-09-27-phi-pld.md).
+    /// The 35B-A3B Q6_K (the model for speed with the cards) offloaded to
+    /// both cards, `-t 12`, no snapshots, 1563 tokens into the context: the
+    /// mean of two `phi-pld verify-cost` runs (medians of 5 and 9 repeats)
+    /// (docs/results/2026-09-29-ngram-caches.md); past 17 tokens, the line
+    /// through the last two points. The Q4_K_M's of 2026-09-27 is in sim.md.
     pub fn measured() -> Self {
         Self {
             decode: vec![
-                (1, 117.0),
-                (2, 135.0),
-                (3, 153.0),
-                (5, 185.0),
-                (9, 275.0),
-                (17, 494.0),
-                (33, 801.0),
-                (49, 1084.0),
+                (1, 114.0),
+                (2, 163.0),
+                (3, 206.0),
+                (4, 207.0),
+                (5, 238.0),
+                (7, 292.0),
+                (9, 330.0),
+                (17, 523.0),
             ],
-            checkpoint: 10.0,
-            restore: 10.0,
+            checkpoint: 10.2,
+            restore: 10.8,
         }
     }
 
@@ -193,8 +197,8 @@ impl Model for Replay {
 
 /// `p` run on the replay of `output` after `prompt`: the outcome, checked
 /// to be `output` itself, and the replay's price.
-pub fn simulate(r: &mut Replay, prompt: &[i32], output: &[i32], p: &Params) -> Result<Outcome> {
-    let o = generate(r, prompt, p)?;
+pub fn simulate(r: &mut Replay, prompt: &[i32], output: &[i32], p: &Params, caches: &mut Caches) -> Result<Outcome> {
+    let o = generate(r, prompt, p, caches)?;
     ensure!(
         o.tokens == output,
         "the engine's output left the model's at token {}",
@@ -223,13 +227,34 @@ pub fn report(r: &Replay, o: &Outcome) -> Value {
         "by_n": o.by_n.iter().enumerate().filter(|(_, b)| b.steps > 0)
             .map(|(n, b)| json!({"n": n, "steps": b.steps, "drafted": b.drafted, "accepted": b.accepted}))
             .collect::<Vec<_>>(),
+        "by_tier": by_tier(o),
     })
+}
+
+/// Drafts from the caches, by the cache each token came from.
+pub fn by_tier(o: &Outcome) -> Value {
+    let names = ["context", "dynamic", "static"];
+    Value::Object(
+        o.by_tier
+            .iter()
+            .zip(names)
+            .filter(|(b, _)| b.drafted > 0)
+            .map(|(b, n)| {
+                (
+                    n.to_string(),
+                    json!({"steps": b.steps, "drafted": b.drafted, "accepted": b.accepted}),
+                )
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decode::Drafter;
     use crate::lookup::Pick;
+    use crate::ngram_cache::Caches;
 
     /// An output that repeats parts of its prompt and of itself, with
     /// stretches of its own: drafts are taken whole, in part, and not at all.
@@ -255,6 +280,51 @@ mod tests {
             pick: Pick::First,
             fold_max,
             junk,
+            drafter: Drafter::Exact,
+            cache_k: 2,
+            ignore_eos: false,
+            learn: true,
+        }
+    }
+
+    /// The caches' drafts go through the same rollback paths and leave the
+    /// output the model's; a third request drafts from what the first two
+    /// taught the dynamic cache (its strict thresholds want an n-gram seen
+    /// at least twice).
+    #[test]
+    fn cache_drafts_keep_the_output_and_learn() {
+        let (prompt, out) = text();
+        for drafter in [Drafter::Cache, Drafter::Both] {
+            for (recurrent, rs_seq) in [(false, 0), (true, 0), (true, 4)] {
+                for cache_k in [1, 2, 8] {
+                    for fold_max in [0, 8] {
+                        let mut caches = Caches {
+                            learn: true,
+                            ..Caches::default()
+                        };
+                        let p = Params {
+                            drafter,
+                            cache_k,
+                            ..params(8, true, fold_max, false)
+                        };
+                        let mut r = Replay::new(&prompt, &out, vec![999], recurrent, rs_seq, Cost::measured());
+                        let first = simulate(&mut r, &prompt, &out, &p, &mut caches).unwrap();
+                        assert!(first.eog);
+                        assert!(!caches.dynamic.is_empty());
+                        let mut third = first.clone();
+                        for _ in 0..2 {
+                            let mut r = Replay::new(&prompt, &out, vec![999], recurrent, rs_seq, Cost::measured());
+                            third = simulate(&mut r, &prompt, &out, &p, &mut caches).unwrap();
+                        }
+                        let cached = |o: &Outcome| o.by_tier.iter().map(|b| b.accepted).sum::<usize>();
+                        if drafter == Drafter::Cache {
+                            assert!(cached(&first) > 0);
+                            assert_eq!(first.by_tier[1].drafted, 0);
+                            assert!(third.by_tier[1].accepted > 0, "the dynamic cache drafted nothing");
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -277,7 +347,7 @@ mod tests {
                                 if recurrent { rs_seq } else { 0 },
                                 Cost::measured(),
                             );
-                            let o = simulate(&mut r, &prompt, &out, &params(k, adapt, fold_max, junk)).unwrap();
+                            let o = simulate(&mut r, &prompt, &out, &params(k, adapt, fold_max, junk), &mut Caches::default()).unwrap();
                             assert!(o.eog);
                             if !recurrent || k <= rs_seq {
                                 assert_eq!(o.restores, 0);
@@ -298,7 +368,7 @@ mod tests {
         let (prompt, out) = text();
         let run = |fold_max| {
             let mut r = Replay::new(&prompt, &out, vec![999], true, 0, Cost::measured());
-            let o = simulate(&mut r, &prompt, &out, &params(4, false, fold_max, true)).unwrap();
+            let o = simulate(&mut r, &prompt, &out, &params(4, false, fold_max, true), &mut Caches::default()).unwrap();
             (o, r.calls, r.ms)
         };
         let (o, calls, ms) = run(8);

@@ -13,7 +13,11 @@ One model and one context (sequence 0) over llama.cpp's C API, as
   snapshots (below).
 - `decode` sends a run of tokens in `llama_decode`s of at most `batch`
   tokens and returns the greedy choice (`argmax`, the first of equals, as
-  llama.cpp's greedy sampler takes it) after each position asked for.
+  llama.cpp's greedy sampler takes it) after each position asked for;
+  with `ban_eog` set (`ignore_eos`), the best token that is not one of the
+  vocabulary's end-of-generation tokens (`argmax_without`; the list is
+  read once at load), as llama-server's `ignore_eos` biases them to minus
+  infinity.
 - `truncate` takes the sequence back from a position
   (`llama_memory_seq_rm`); it fails on a model with a recurrent state
   asked to go back further than its snapshots. `checkpoint` and `restore`

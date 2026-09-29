@@ -253,9 +253,14 @@ own output. Its generation phase matches llama-server's on the copy
 llama-server's best) and 3 percent under plain on a free answer; but it
 reads prompts 25 to 40 percent slower than llama-server (not yet
 explained), so whole requests with long prompts are slower with it
-(`docs/results/2026-09-27-phi-pld.md`). These figures are the Q4_K_M; the
-Q8_0, the model for speed with the cards, is still to be measured with
-prompt lookup.
+(`docs/results/2026-09-27-phi-pld.md`). These figures are the Q4_K_M.
+Since 2026-09-29 phi-pld also drafts from llama.cpp's n-gram caches
+(context, dynamic and static, the algorithm of Tirmazi's post;
+`--drafter cache|both`). Priced with the Q6_K's measured verification
+cost (about 49 ms for each token more), no drafter pays on free code
+generation (modelled: the caches 0.974 of plain, the exact-match
+defaults 0.956); drafting starts to pay below about 40 ms
+(`docs/results/2026-09-29-ngram-caches.md`).
 
 A model larger than this host's 31 GiB runs from its file, the page
 cache holding what it can. By default the cards' rows are a copy, so

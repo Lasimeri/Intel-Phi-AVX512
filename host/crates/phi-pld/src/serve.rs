@@ -6,19 +6,22 @@
 //! is refused rather than approximated. One request at a time, as one
 //! llama-server slot. See serve.md.
 
+use std::path::Path;
 use std::sync::Mutex;
 
 use anyhow::Result;
 use serde_json::{json, Value};
 
-use crate::decode::{generate, Outcome, Params};
+use crate::decode::{generate, Drafter, Outcome, Params};
 use crate::llm::Llm;
 use crate::lookup::Pick;
+use crate::ngram_cache::Caches;
 
 /// A request's drafting: the server's defaults, then the request's own
-/// `n_predict` (or `max_tokens`) and, under `"pld"`, any of `k_max`,
-/// `k_min`, `adapt`, `min_n`, `max_n`, `fold_max`, `pick` ("first" or
-/// "latest").
+/// `n_predict` (or `max_tokens`) and `ignore_eos` and, under `"pld"`,
+/// any of `k_max`, `k_min`, `adapt`, `min_n`, `max_n`, `fold_max`,
+/// `pick` ("first" or "latest"), `drafter` ("exact", "cache" or "both"),
+/// `cache_k` and `learn`.
 pub fn params_for(base: &Params, body: &Value) -> Result<Params, String> {
     if body.get("temperature").and_then(Value::as_f64).is_some_and(|t| t > 0.0) {
         return Err("greedy only: temperature above 0 is not supported".into());
@@ -26,6 +29,9 @@ pub fn params_for(base: &Params, body: &Value) -> Result<Params, String> {
     let mut p = base.clone();
     if let Some(n) = body.get("n_predict").or_else(|| body.get("max_tokens")).and_then(Value::as_u64) {
         p.n_predict = n as usize;
+    }
+    if let Some(v) = body.get("ignore_eos").and_then(Value::as_bool) {
+        p.ignore_eos = v;
     }
     if let Some(o) = body.get("pld") {
         let u = |k: &str| o.get(k).and_then(Value::as_u64).map(|v| v as usize);
@@ -53,6 +59,19 @@ pub fn params_for(base: &Params, body: &Value) -> Result<Params, String> {
             Some(other) => return Err(format!("pick: {other}? first or latest")),
             None => {}
         }
+        match o.get("drafter").and_then(Value::as_str) {
+            Some("exact") => p.drafter = Drafter::Exact,
+            Some("cache") => p.drafter = Drafter::Cache,
+            Some("both") => p.drafter = Drafter::Both,
+            Some(other) => return Err(format!("drafter: {other}? exact, cache or both")),
+            None => {}
+        }
+        if let Some(v) = u("cache_k") {
+            p.cache_k = v;
+        }
+        if let Some(v) = o.get("learn").and_then(Value::as_bool) {
+            p.learn = v;
+        }
     }
     Ok(p)
 }
@@ -76,6 +95,7 @@ pub fn timings(o: &Outcome) -> Value {
         "by_n": o.by_n.iter().enumerate().filter(|(_, b)| b.steps > 0)
             .map(|(n, b)| json!({"n": n, "steps": b.steps, "drafted": b.drafted, "accepted": b.accepted}))
             .collect::<Vec<_>>(),
+        "by_tier": crate::sim::by_tier(o),
         "draft_us_per_token": if n > 0 { o.draft_us / n as f64 } else { 0.0 },
     })
 }
@@ -86,8 +106,10 @@ fn reply(req: tiny_http::Request, status: u16, body: &Value) {
     let _ = req.respond(tiny_http::Response::from_string(data).with_status_code(status).with_header(header));
 }
 
-/// Serve on `addr` until the process is stopped.
-pub fn serve(llm: Llm, base: Params, addr: &str) -> Result<()> {
+/// Serve on `addr` until the process is stopped, drafting from `caches`
+/// too; when `dynamic` names a file, the dynamic cache is written there
+/// after every request.
+pub fn serve(llm: Llm, base: Params, mut caches: Caches, dynamic: Option<&Path>, addr: &str) -> Result<()> {
     let server = tiny_http::Server::http(addr).map_err(|e| anyhow::anyhow!("{addr}: {e}"))?;
     eprintln!("phi-pld: serving on http://{addr} (POST /completion, POST /v1/chat/completions, GET /health)");
     let llm = Mutex::new(llm);
@@ -157,7 +179,13 @@ pub fn serve(llm: Llm, base: Params, addr: &str) -> Result<()> {
                 continue;
             }
         };
-        match generate(&mut *llm, &tokens, &p) {
+        let done = generate(&mut *llm, &tokens, &p, &mut caches);
+        if let (Some(f), true) = (dynamic, caches.learn) {
+            if let Err(e) = caches.dynamic.save(f) {
+                eprintln!("phi-pld: the dynamic cache was not written: {e:#}");
+            }
+        }
+        match done {
             Ok(mut o) => {
                 o.text = llm.text(&o.tokens);
                 let t = timings(&o);
@@ -196,6 +224,10 @@ mod tests {
             pick: Pick::First,
             fold_max: 16,
             junk: false,
+            drafter: Drafter::Exact,
+            cache_k: 2,
+            ignore_eos: false,
+            learn: true,
         }
     }
 
@@ -209,6 +241,8 @@ mod tests {
         assert_eq!((p.n_predict, p.k_max, p.adapt, p.pick, p.min_n), (7, 16, true, Pick::Latest, 2));
         let p = params_for(&base(), &json!({"max_tokens": 9})).unwrap();
         assert_eq!(p.n_predict, 9);
+        let p = params_for(&base(), &json!({"ignore_eos": true})).unwrap();
+        assert!(p.ignore_eos);
     }
 
     #[test]

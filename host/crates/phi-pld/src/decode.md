@@ -1,6 +1,7 @@
 # decode.rs
 
-Greedy generation with drafts from `lookup.rs`, verified by the model.
+Greedy generation with drafts from `lookup.rs` or `ngram_cache.rs`,
+verified by the model.
 `generate` is written against the `Model` trait: llama.cpp's context
 (`llm.rs`) in use, a replay of a known output (`sim.rs`) in the tests and
 the simulator, the same code either way.
@@ -62,6 +63,22 @@ verification batch can differ from the one plain generation chooses at a
 near tie; the text is then the model's greedy output under slightly
 different arithmetic. llama-server's own speculation shows the same, on
 the host alone as with the cards (`docs/results/2026-09-27-prompt-lookup-llama-server.md`).
+
+**Drafts from the caches.** With `drafter` `Cache`, every draft comes from
+llama.cpp's n-gram caches (`ngram_cache.md`): the context cache, which
+this request keeps from its prompt and every token decided, then the
+dynamic and static caches the caller holds (`Caches`), `cache_k` tokens
+at most (fixed: the adaptation above is the exact match's). With `Both`,
+the exact match drafts when it finds one and the caches otherwise. After
+the request, when `Caches::learn` is set, the context cache is merged into
+the dynamic one, as llama.cpp's lookup example does, so a later request
+drafts from this one. Cache drafts are counted in `Outcome.by_tier`, by
+the cache each token came from.
+
+**`ignore_eos`.** The model is told to skip its end-of-generation tokens
+(`Model::ban_eog`: the best other token is chosen, as llama-server's
+`ignore_eos` biases them to minus infinity), so a request runs to
+`n_predict`: fixed-length runs for timing.
 
 `junk` (a hidden flag, `--junk`) proposes drafts the model never chose,
 so every step takes its draft back: the test of the rollback paths.

@@ -9,18 +9,21 @@
 mod decode;
 mod llm;
 mod lookup;
+mod ngram_cache;
 mod serve;
 mod sim;
 mod sys;
 
+use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context as _, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::decode::{Model, Params};
+use crate::decode::{Drafter, Model, Params};
 use crate::llm::{Llm, Options, Vocab};
 use crate::lookup::Pick;
+use crate::ngram_cache::{Cache, Caches, Static};
 use crate::sim::{Cost, Replay};
 
 #[derive(Parser)]
@@ -102,12 +105,40 @@ struct DraftArgs {
     /// Test only: every draft wrong, every step taken back.
     #[arg(long, global = true, hide = true)]
     junk: bool,
+    /// Where drafts come from: the exact match (`lookup.rs`), llama.cpp's
+    /// n-gram caches (`ngram_cache.rs`), or the exact match when there is
+    /// one and the caches otherwise.
+    #[arg(long, value_enum, default_value_t = DrafterArg::Exact, global = true)]
+    drafter: DrafterArg,
+    /// The length of a draft from the caches (fixed).
+    #[arg(long, default_value_t = 2, global = true)]
+    cache_k: usize,
+    /// A static cache: 2-grams of a corpus, built by llama.cpp's
+    /// `llama-lookup-create` (its `-lcs`).
+    #[arg(long = "lookup-cache-static", visible_alias = "lcs", global = true)]
+    cache_static: Option<String>,
+    /// A dynamic cache (llama.cpp's `-lcd` format): read at start when it
+    /// exists; the server adds every request's context to it and writes it
+    /// back after each.
+    #[arg(long = "lookup-cache-dynamic", visible_alias = "lcd", global = true)]
+    cache_dynamic: Option<String>,
+    /// Generate `-n` tokens whatever the model would end on (llama-server's
+    /// `--ignore-eos`: its end-of-generation tokens are never chosen).
+    #[arg(long, global = true)]
+    ignore_eos: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
 enum PickArg {
     First,
     Latest,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum DrafterArg {
+    Exact,
+    Cache,
+    Both,
 }
 
 #[derive(Subcommand)]
@@ -133,10 +164,12 @@ enum Cmd {
     /// The drafting options priced without the model: the rendered prompt,
     /// and the tokens the model generated after it with drafting off (a
     /// JSON array, llama-server's `return_tokens`); the engine runs against
-    /// a replay of them, each decode priced from the cost table.
+    /// a replay of them, each decode priced from the cost table. Several
+    /// prompt and output pairs run in order, as requests to one server:
+    /// the dynamic cache learns each for the ones after it.
     Simulate {
-        prompt: String,
-        output: String,
+        #[arg(required = true, num_args = 2.., value_names = ["PROMPT", "OUTPUT"])]
+        pairs: Vec<String>,
         /// `n:ms,...`: a decode of n tokens (`verify-cost`'s `tokens` and
         /// `verify_ms`). Default: the 35B-A3B Q4_K_M on both cards.
         #[arg(long)]
@@ -173,7 +206,40 @@ fn params(d: &DraftArgs) -> Params {
         },
         fold_max: d.fold_max,
         junk: d.junk,
+        drafter: match d.drafter {
+            DrafterArg::Exact => Drafter::Exact,
+            DrafterArg::Cache => Drafter::Cache,
+            DrafterArg::Both => Drafter::Both,
+        },
+        cache_k: d.cache_k,
+        ignore_eos: d.ignore_eos,
+        learn: true,
     }
+}
+
+/// The static and dynamic caches the options name, the dynamic learning
+/// each request's context when `learn`.
+fn caches(d: &DraftArgs, learn: bool) -> Result<Caches> {
+    let mut c = Caches {
+        learn,
+        ..Caches::default()
+    };
+    if let Some(f) = &d.cache_static {
+        let t = Instant::now();
+        c.statics = Static::load(Path::new(f))?;
+        anyhow::ensure!(!c.statics.is_empty(), "{f}: an empty static cache");
+        eprintln!(
+            "phi-pld: static cache {f}: {} 2-grams, {:.0} MB, read in {:.1} s",
+            c.statics.len(),
+            c.statics.bytes() as f64 / 1e6,
+            t.elapsed().as_secs_f64()
+        );
+    }
+    if let Some(f) = &d.cache_dynamic {
+        c.dynamic = Cache::load(Path::new(f))?;
+        eprintln!("phi-pld: dynamic cache {f}: {} n-grams", c.dynamic.len());
+    }
+    Ok(c)
 }
 
 fn model_path(m: &ModelArgs) -> Result<String> {
@@ -208,13 +274,19 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let m = &cli.model;
     match &cli.cmd {
-        Cmd::Serve { bind } => serve::serve(load(m)?, params(&m.draft), bind),
+        Cmd::Serve { bind } => {
+            // The dynamic cache learns when it is drafted from or kept.
+            let p = params(&m.draft);
+            let learn = p.drafter != Drafter::Exact || m.draft.cache_dynamic.is_some();
+            let c = caches(&m.draft, learn)?;
+            serve::serve(load(m)?, p, c, m.draft.cache_dynamic.as_deref().map(Path::new), bind)
+        }
         Cmd::Run { prompt } => {
             let text = std::fs::read_to_string(prompt).with_context(|| prompt.clone())?;
             let mut llm = load(m)?;
             let tokens = llm.tokenize(&text)?;
             anyhow::ensure!(!tokens.is_empty(), "an empty prompt");
-            let o = decode::generate(&mut llm, &tokens, &params(&m.draft))?;
+            let o = decode::generate(&mut llm, &tokens, &params(&m.draft), &mut caches(&m.draft, false)?)?;
             print!("{}", llm.text(&o.tokens));
             eprintln!("{}", serve::timings(&o));
             Ok(())
@@ -256,32 +328,48 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Simulate {
-            prompt,
-            output,
+            pairs,
             decode_ms,
             checkpoint_ms,
             restore_ms,
         } => {
+            anyhow::ensure!(pairs.len() % 2 == 0, "prompt and output files in pairs");
             let vocab = Vocab::load(&model_path(m)?, &backend_dir(m))?;
-            let text = std::fs::read_to_string(prompt).with_context(|| prompt.clone())?;
-            let tokens = vocab.tokenize(&text)?;
-            let out: Vec<i32> = serde_json::from_str(&std::fs::read_to_string(output).with_context(|| output.clone())?)
-                .with_context(|| format!("{output}: a JSON array of tokens"))?;
-            anyhow::ensure!(!out.is_empty(), "{output}: no tokens");
             let mut cost = Cost::measured();
             if let Some(s) = decode_ms {
                 cost.decode = Cost::parse_decode(s)?;
             }
             cost.checkpoint = checkpoint_ms.unwrap_or(cost.checkpoint);
             cost.restore = restore_ms.unwrap_or(cost.restore);
-            let eog: Vec<i32> = out.iter().copied().filter(|&t| vocab.is_eog(t)).collect();
-            let recurrent = vocab.recurrent;
-            let rs_seq = if recurrent { m.rs_seq as usize } else { 0 };
-            let mut r = Replay::new(&tokens, &out, eog, recurrent, rs_seq, cost);
-            let mut p = params(&m.draft);
-            p.n_predict = out.len();
-            let o = sim::simulate(&mut r, &tokens, &out, &p)?;
-            println!("{}", sim::report(&r, &o));
+            let mut caches = caches(&m.draft, true)?;
+            let (mut model_ms, mut plain_ms) = (0.0, 0.0);
+            for pair in pairs.chunks(2) {
+                let (prompt, output) = (&pair[0], &pair[1]);
+                let text = std::fs::read_to_string(prompt).with_context(|| prompt.clone())?;
+                let tokens = vocab.tokenize(&text)?;
+                let out: Vec<i32> = serde_json::from_str(&std::fs::read_to_string(output).with_context(|| output.clone())?)
+                    .with_context(|| format!("{output}: a JSON array of tokens"))?;
+                anyhow::ensure!(!out.is_empty(), "{output}: no tokens");
+                let eog: Vec<i32> = out.iter().copied().filter(|&t| vocab.is_eog(t)).collect();
+                let recurrent = vocab.recurrent;
+                let rs_seq = if recurrent { m.rs_seq as usize } else { 0 };
+                let mut r = Replay::new(&tokens, &out, eog, recurrent, rs_seq, cost.clone());
+                let mut p = params(&m.draft);
+                p.n_predict = out.len();
+                let o = sim::simulate(&mut r, &tokens, &out, &p, &mut caches)?;
+                let mut rep = sim::report(&r, &o);
+                model_ms += rep["model_ms"].as_f64().unwrap_or(0.0);
+                plain_ms += rep["plain_ms"].as_f64().unwrap_or(0.0);
+                rep["output"] = serde_json::json!(output);
+                println!("{rep}");
+            }
+            if pairs.len() > 2 {
+                println!(
+                    "{}",
+                    serde_json::json!({"total": {"model_ms": model_ms, "plain_ms": plain_ms,
+                                                 "speedup": (plain_ms / model_ms * 1000.0).round() / 1000.0}})
+                );
+            }
             Ok(())
         }
         Cmd::Margin { prompt, tokens, at } => {
