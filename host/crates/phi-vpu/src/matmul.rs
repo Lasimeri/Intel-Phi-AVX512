@@ -496,7 +496,10 @@ fn check_one(w: &Window, threads: u32, t: u32, m: u64, k: u64, n: u64, id: u64, 
 /// `m` rows kept as one slice, `n_used` of them picked per token, against
 /// the host's own dot products. `b_rows` is 1 when every expert of a
 /// token reads the same activation row (a gate or up projection) and
-/// `n_used` when each has its own (a down projection).
+/// `n_used` when each has its own (a down projection). With `holes`,
+/// every third column has no expert (id -1, the mark of a column another
+/// card holds under a whole-expert placement): the card computes and
+/// writes nothing for it, and the reference skips it.
 #[allow(clippy::too_many_arguments)]
 fn check_id(
     w: &Window,
@@ -510,6 +513,7 @@ fn check_id(
     b_rows: u64,
     id: u64,
     rng: &mut Rng,
+    holes: bool,
 ) -> Result<Duration> {
     let nb_a = row_bytes(t, k);
     let nb_b = act_row_bytes(k) + 256;
@@ -522,7 +526,12 @@ fn check_id(
         a.extend_from_slice(&bytes);
         rows.push(vals);
     }
-    let ids: Vec<i32> = (0..n).map(|_| (rng.next() % experts) as i32).collect();
+    let mut ids: Vec<i32> = (0..n).map(|_| (rng.next() % experts) as i32).collect();
+    if holes {
+        for p in (1..n as usize).step_by(3) {
+            ids[p] = -1;
+        }
+    }
     let b: Vec<f32> = act_round((0..b_rows * n_tokens * k).map(|_| rng.unit()).collect());
     w.put(OFF_A, &a);
     let up = Matmul {
@@ -577,6 +586,9 @@ fn check_id(
     )?;
     let mut bad = 0;
     for (p, &idx) in ids.iter().enumerate().take(n as usize) {
+        if idx < 0 {
+            continue;
+        }
         let e = idx as u64;
         let col = p as u64 % n_used;
         let tok = p as u64 / n_used;
@@ -1039,9 +1051,15 @@ pub fn check(
             // The last two put many columns on one expert, so the card
             // groups them eight and four at a time with their activation
             // rows scattered; the first four leave groups of one.
-            check_id(w, threads, t, 61, 512, experts, n_used, n_tokens, b_rows, id, &mut rng)?;
+            check_id(w, threads, t, 61, 512, experts, n_used, n_tokens, b_rows, id, &mut rng, false)?;
             id += 1;
         }
+        // Columns without an expert (id -1), through both groupings: the
+        // insertion sort of a few columns and the counting sort of many.
+        check_id(w, threads, t, 61, 512, 8, 3, 5, 1, id, &mut rng, true)?;
+        id += 1;
+        check_id(w, threads, t, 61, 512, 2, 2, 32, 1, id, &mut rng, true)?;
+        id += 1;
         // Rows enough for every core's threads to share them when the pool
         // has two per core (114 slices: a core's pair takes alternate rows,
         // or four columns each of a group of eight), which 61 rows never
@@ -1051,7 +1069,7 @@ pub fn check(
                 check_one(w, threads, t, 128, 512, n, id, &mut rng, 1)?;
                 id += 1;
             }
-            check_id(w, threads, t, 128, 512, 8, 3, 5, 1, id, &mut rng)?;
+            check_id(w, threads, t, 128, 512, 8, 3, 5, 1, id, &mut rng, false)?;
             id += 1;
         }
         // Further matrices in the same request (K_MATMUL_MORE), quantized

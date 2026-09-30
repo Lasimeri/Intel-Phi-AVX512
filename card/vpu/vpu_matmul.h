@@ -46,7 +46,9 @@ struct vpu_matmul {
      * matrices of m rows, one after another; n is n_used * n_tokens, and
      * column p = j + t * n_used multiplies expert ids[p] by b's row
      * (j % b_rows) + t * b_rows. The ids are n int32 at b_off, the rows
-     * follow at b_off + ids_bytes. */
+     * follow at b_off + ids_bytes. An id of -1 is a column without an
+     * expert on this card (the host places whole experts, each on one
+     * card): nothing is computed or written for it. */
     uint64_t n_used;
     uint64_t n_tokens;
     uint64_t b_rows;

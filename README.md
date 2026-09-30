@@ -101,6 +101,7 @@ cards, the Q4_K_M the one for correctness and for comparison):
 | the same with a draft model, even the smallest (2B Q4_K_M with the Q6_K) | 6.89, 6.91: slower, not used | same |
 | the 9B Q8_0 dense, **entirely on the cards** (host 2.3 GiB) | about 8 (8.03, 7.99) | same |
 | writing code, Q6_K offloaded, phi-pld, 1024 tokens with `ignore_eos` (five prompts, twice) | 9.70 drafting off; the best drafter (n-gram caches, static corpus) 9.22, 0.95 of it: none pays | `docs/results/2026-09-29-ngram-caches.md` |
+| Q6_K offloaded with **whole experts placed by use** (`PHI_GGML_EXPERTS`), code and prose prompts, this host short of memory (every run paging) | **7.1 to 7.9** against 5.8 to 6.5 with the row share, interleaved (+20 percent); the prompt 48 to 57 against 55 to 64 | `docs/results/2026-09-29-expert-placement.md` |
 | copying code from the prompt with prompt lookup, Q4_K_M, generation phase only | about 40 (whole request 6.5 with the 2385-token prompt) | same, and `2026-09-27-prompt-lookup-llama-server.md` |
 | Q8_0 offloaded, prompt | 72 (57.8 before the two-threads pool) | `docs/results/2026-09-27-two-threads-per-core.md` |
 

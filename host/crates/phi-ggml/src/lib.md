@@ -529,3 +529,55 @@ Offloaded, on the 35B-A3B (`docs/results/2026-09-27-gate-and-up-together.md`):
 8.9 to 9.6 tokens per second and the prompt 64 to 69, the text the same
 byte for byte as without the pair (which moves no row between the host
 and the cards).
+
+## Whole experts, the most used first (2026-09-29)
+
+A mixture's experts were shared by rows only: each card kept the same
+12.5 percent of every expert (the 35B-A3B at Q6_K, 4.4 GB a card), so
+whatever a token was routed to, the host read 75 percent of the bytes
+of every expert it chose, about 0.62 GB a token at this host's 20 GB/s.
+Routing is not uniform. Logged over a 7035-token C source prefill
+(`PHI_GGML_IDS=1`, `tools/expert-placement.c`), the 64 most used of a
+layer's 256 experts took 71 percent of its selections, where uniform
+routing gives 27; placed from that text and measured on a 6592-token
+prose prefill they still took 56 percent, and the prose's own 64 took 51
+of the code's (`docs/results/2026-09-29-expert-placement.md`).
+
+`PHI_GGML_EXPERTS=<file>`, with `PHI_GGML_OFFLOAD=1`, places whole
+experts instead of slices:
+
+- The file is `layer N: e e e ...`, each layer's experts in descending
+  order of use, as `tools/expert-placement.c rank` writes it from a
+  run's `PHI_GGML_IDS` lines (the glue passes each weight's layer from
+  its name, `blk.N.`, with the offer, `phi_ggml_note_weight`).
+- Sizing (`size_whole`): the dense matrices first at their share, as
+  before; then the most whole experts a card can keep of every expert
+  tensor within the budget, the same count for every tensor and layer
+  and never more than an equal split between the cards. The 35B-A3B at
+  Q6_K: 34 a card a layer, 68 of 256, 4.21 GB.
+- Placement (`plan_whole`): the ranks alternate between the cards; a
+  card's slice is its experts whole, one after another, so an expert's
+  index in the slice is its id on the card (the card finds expert `i` at
+  `i * m * nb_a` with the request's `m` every row). Experts the file
+  does not list follow in index order. The host keeps the rest whole,
+  and the offload drops the cards' experts' pages.
+- A request (`issue`): each card holding any of the tensor gets the ids
+  with its own experts by their index in its slice and -1 elsewhere
+  (`card/vpu/vpu_matmul.md`: a column at -1 is neither computed nor
+  written), and is rung only when a column is its own; the host's ids
+  (`phi_ggml_host_ids`, the glue's `alias_ids`) name, in place of a
+  card's expert, a host-held expert of the same token, so that ggml's
+  own `MUL_MAT_ID` over all rows of the host's experts reads no page
+  the cards own, at the price of one wasted column for a token whose
+  experts are all on the cards; the gather copies only the columns
+  whose id was that card's. A gate and up pair goes as one request only
+  when both are placed alike. Nothing is judged: offloaded only.
+
+Measured on the 35B-A3B Q6_K offloaded, both cards, interleaved with
+the row share on a host short of memory for it
+(`docs/results/2026-09-29-expert-placement.md`): generation 7.1 to 7.8
+tokens a second against 5.8 to 6.5, the prompt 48 to 55 against 55 to
+64. The prompt is slower because the host computes every column of a
+batch (its substituted ids, a third more expert work than its share)
+and each card pushes every column's rows, the -1 ones included; a
+compaction of each card's columns is the next thing, not done.

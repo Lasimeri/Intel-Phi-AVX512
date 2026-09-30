@@ -48,6 +48,10 @@ repository's, so two builds can be compared interleaved),
 larger than its memory; needs `--load-mode mmap`, below),
 `PHI_GGML_ALL_ROWS` (1, with the offload: the cards may keep every row,
 the host none, for a model that fits them),
+`PHI_GGML_EXPERTS` (a placement file, with the offload: the cards keep
+whole experts of a mixture, the most used first, instead of a slice of
+every one; `tools/expert-placement.md` makes the file from a run with
+`PHI_GGML_IDS=1`, which logs every layer's routing),
 `PHI_GGML_SPIN_US` (the wait for a card spins this many microseconds,
 then sleeps between looks; unset, it spins throughout),
 `PHI_GGML_JUDGE` (0: no tensor is moved by its timings; with

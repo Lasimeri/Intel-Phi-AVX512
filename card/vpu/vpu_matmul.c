@@ -804,14 +804,17 @@ static uint64_t groups_mixture(struct group *gs, const struct job *j, uint64_t e
 {
     uint32_t *count = order, *at = order + experts;
     memset(count, 0, experts * sizeof *count);
-    for (uint64_t p = 0; p < j->n; p++) count[j->ids[p]]++;
+    /* An id of -1 is a column without an expert (the host placed that
+     * column's expert on another card, vpu_matmul.md): no group, nothing
+     * computed or written for it. */
+    for (uint64_t p = 0; p < j->n; p++) if (j->ids[p] >= 0) count[j->ids[p]]++;
     uint32_t sum = 0;
     for (uint64_t e = 0; e < experts; e++) {
         uint32_t c = count[e];
         count[e] = sum;
         sum += c;
     }
-    for (uint64_t p = 0; p < j->n; p++) at[count[j->ids[p]]++] = (uint32_t)p;
+    for (uint64_t p = 0; p < j->n; p++) if (j->ids[p] >= 0) at[count[j->ids[p]]++] = (uint32_t)p;
     /* count[e] is now the end of expert e's run; walk the runs. */
     uint64_t ng = 0, start = 0;
     for (uint64_t e = 0; e < experts; e++) {
@@ -851,8 +854,10 @@ static uint64_t groups_own(struct group *gs, const struct job *j, uint32_t *scra
         return groups_mixture(gs, j, (uint64_t)top + 1, scratch);
     }
     uint32_t order[32];
+    uint64_t nv = 0;   /* the columns with an expert: an id of -1 has none (groups_mixture) */
     for (uint64_t p = 0; p < n; p++) {
-        uint64_t q = p;
+        if (j->ids[p] < 0) continue;
+        uint64_t q = nv++;
         while (q > 0 && j->ids[order[q - 1]] > j->ids[p]) {
             order[q] = order[q - 1];
             q--;
@@ -860,10 +865,10 @@ static uint64_t groups_own(struct group *gs, const struct job *j, uint32_t *scra
         order[q] = (uint32_t)p;
     }
     uint64_t ng = 0;
-    for (uint64_t s = 0; s < n;) {
+    for (uint64_t s = 0; s < nv;) {
         int32_t e = j->ids[order[s]];
         uint64_t end = s;
-        while (end < n && j->ids[order[end]] == e) end++;
+        while (end < nv && j->ids[order[end]] == e) end++;
         while (s < end) {
             int T = group_of(end - s);
             gs[ng].a = j->a + (uint64_t)e * j->a_stride;
@@ -1516,9 +1521,10 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
         uint64_t have = (mm.a_id != 0) ? g_cache[cache_find(mm.a_id)].bytes : g_a.cap;
         experts = j.a_stride ? have / j.a_stride : 0;
         for (uint64_t p = 0; p < mm.n; p++)
-            /* Negative too: the quantized path counts by id before any
-             * thread runs, and -1 would write before its buffer. */
-            if (j.ids[p] < 0 || j.ids[p] >= (int32_t)experts) return VPU_E_REQUEST;
+            /* -1 is a column without an expert, skipped by the grouping;
+             * any other negative would index before the buffer, and the
+             * quantized path counts by id before any thread runs. */
+            if (j.ids[p] < -1 || j.ids[p] >= (int32_t)experts) return VPU_E_REQUEST;
     }
     if (more) {
         /* Every matrix a job of its own, sharing the activations and, for a
@@ -1542,7 +1548,7 @@ int vpu_matmul_run(volatile unsigned char *ctrl, uint32_t kernel, int threads, i
                 jx->a_stride = e->m * e->nb_a;
                 ex[x + 1] = more_have[x] / jx->a_stride;
                 for (uint64_t p = 0; p < mm.n; p++)
-                    if (j.ids[p] < 0 || j.ids[p] >= (int32_t)ex[x + 1]) return VPU_E_REQUEST;
+                    if (j.ids[p] < -1 || j.ids[p] >= (int32_t)ex[x + 1]) return VPU_E_REQUEST;
                 if (ex[x + 1] > most) most = ex[x + 1];
             }
         }

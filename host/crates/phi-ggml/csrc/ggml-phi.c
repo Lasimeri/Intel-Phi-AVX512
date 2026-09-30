@@ -24,7 +24,8 @@
 
 int phi_ggml_open(void);
 int phi_ggml_supports(uint32_t a_type, uint64_t m, uint64_t k, uint64_t nb_a, uint64_t nb_b, uint64_t n);
-void phi_ggml_note_weight(const uint8_t *data, uint64_t m, uint64_t nb_a, uint64_t experts, int mixture);
+void phi_ggml_note_weight(const uint8_t *data, uint64_t m, uint64_t nb_a, uint64_t experts, int mixture, int layer);
+const int32_t *phi_ggml_host_ids(void);
 int64_t phi_ggml_begin(const uint8_t *a, uint32_t a_type, uint64_t m, uint64_t k, uint64_t nb_a, int keep,
                        const uint8_t *b, uint64_t n, uint64_t nb_b);
 int64_t phi_ggml_begin_id(const uint8_t *a, uint32_t a_type, uint64_t m, uint64_t k, uint64_t nb_a, int keep,
@@ -171,9 +172,27 @@ static struct ggml_tensor *alias3(struct ggml_context *ctx, const struct ggml_te
     return l;
 }
 
+/* The expert ids the host's rows of a MUL_MAT_ID use: the node's own, or
+ * the backend's substitution (phi_ggml_host_ids: with whole experts on the
+ * cards, a slot naming a card's expert names a host-held expert of the
+ * same token instead, and the gather overwrites that slot afterwards),
+ * n_used per token, contiguous. */
+static struct ggml_tensor *alias_ids(struct ggml_context *ctx, const struct ggml_tensor *ids)
+{
+    struct ggml_tensor *l = alias(ctx, ids, 0, ids->ne[1]);
+    const int32_t *sub = phi_ggml_host_ids();
+    if (sub) {
+        l->data = (void *)sub;
+        l->nb[1] = (size_t)ids->ne[0] * sizeof(int32_t);
+        l->nb[2] = l->nb[1] * (size_t)ids->ne[1];
+        l->nb[3] = l->nb[2];
+    }
+    return l;
+}
+
 /* The host's rows of one MUL_MAT_ID: the same three leaves, with the
- * expert list passed through untouched, and ggml's own kernel choosing
- * the expert per column exactly as it would have. */
+ * expert list passed through (or substituted, alias_ids), and ggml's own
+ * kernel choosing the expert per column exactly as it would have. */
 static int host_rows_id(const struct ggml_tensor *node, int64_t from, int64_t to)
 {
     const struct ggml_tensor *src0 = node->src[0], *src1 = node->src[1], *ids = node->src[2];
@@ -183,7 +202,7 @@ static int host_rows_id(const struct ggml_tensor *node, int64_t from, int64_t to
     if (!ctx) return -1;
     struct ggml_tensor *a = alias3(ctx, src0, from, r0);
     struct ggml_tensor *b = alias3(ctx, src1, 0, src1->ne[1]);
-    struct ggml_tensor *i = alias(ctx, ids, 0, ids->ne[1]);
+    struct ggml_tensor *i = alias_ids(ctx, ids);
     struct ggml_tensor *c = p_mul_mat_id(ctx, a, b, i);
     c->data = (char *)node->data + from * 4;
     c->nb[1] = node->nb[1];
@@ -213,7 +232,7 @@ static int host_rows_id_pair(struct ggml_tensor *const nodes[2], const uint64_t 
         int64_t from = (int64_t)ranges[r][0], rows = (int64_t)(ranges[r][1] - ranges[r][0]);
         struct ggml_tensor *a = alias3(ctx, src0, from, rows);
         struct ggml_tensor *b = alias3(ctx, src1, 0, src1->ne[1]);
-        struct ggml_tensor *i = alias(ctx, ids, 0, ids->ne[1]);
+        struct ggml_tensor *i = alias_ids(ctx, ids);
         struct ggml_tensor *c = p_mul_mat_id(ctx, a, b, i);
         c->data = (char *)node->data + from * 4;
         c->nb[1] = node->nb[1];
@@ -371,6 +390,15 @@ static int host_ffn(struct ggml_tensor *const *nodes, const struct ffn_quad *q, 
 /* ---- what the cards take ---- */
 
 /* ggml's type to the card service's code (proto.rs MM_*), or -1. */
+/* The layer a weight belongs to, from its name (llama.cpp names them
+ * blk.N.<what>.weight), or -1: what a whole-expert placement is keyed by
+ * (Rust, PHI_GGML_EXPERTS). */
+static int layer_of(const char *name)
+{
+    int l;
+    return sscanf(name, "blk.%d.", &l) == 1 ? l : -1;
+}
+
 static int card_type(enum ggml_type t)
 {
     switch (t) {
@@ -421,7 +449,7 @@ static bool phi_supports_mul_mat_id(const struct ggml_tensor *op)
      * mixture's weights are sized as a class of their own (Rust, settle_fraction) */
     if (phi_ggml_supports((uint32_t)t, (uint64_t)src0->ne[1], (uint64_t)src0->ne[0], src0->nb[1], src1->nb[1],
                              (uint64_t)(src1->ne[1] * src1->ne[2])) == 0) return false;
-    phi_ggml_note_weight(src0->data, (uint64_t)src0->ne[1], src0->nb[1], (uint64_t)src0->ne[2], 1);
+    phi_ggml_note_weight(src0->data, (uint64_t)src0->ne[1], src0->nb[1], (uint64_t)src0->ne[2], 1, layer_of(src0->name));
     return true;
 }
 
@@ -442,7 +470,7 @@ static bool phi_supports_mul_mat(const struct ggml_tensor *op)
     if (!strstr(src0->name, "weight")) return false;
     if (phi_ggml_supports((uint32_t)t, (uint64_t)src0->ne[1], (uint64_t)src0->ne[0], src0->nb[1], src1->nb[1], (uint64_t)src1->ne[1]) == 0) return false;
     /* what the cards could hold, by shape, for sizing their share (Rust, settle_fraction) */
-    phi_ggml_note_weight(src0->data, (uint64_t)src0->ne[1], src0->nb[1], 1, 0);
+    phi_ggml_note_weight(src0->data, (uint64_t)src0->ne[1], src0->nb[1], 1, 0, layer_of(src0->name));
     return true;
 }
 

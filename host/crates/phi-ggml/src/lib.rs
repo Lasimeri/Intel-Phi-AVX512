@@ -63,6 +63,22 @@ struct Split {
     /// address a freed one had must be planned again, or the rows its
     /// cards were given no longer fit it.
     shape: [u64; 4],
+    /// A mixture placed whole expert by expert (`PHI_GGML_EXPERTS`) rather
+    /// than by rows: then `r0` is `m` and `cards` is empty.
+    whole: Option<Whole>,
+}
+
+/// A mixture tensor's experts placed whole (`PHI_GGML_EXPERTS`, lib.md
+/// "Whole experts"): the card holding each expert, or -1 for the host; the
+/// expert's index in that card's slice, which is its id there; the cards
+/// holding any; and a host-held expert to name in a token whose experts
+/// are all on the cards (-1 when the cards hold every expert).
+#[derive(Clone, PartialEq)]
+struct Whole {
+    card_of: Vec<i8>,
+    local: Vec<u32>,
+    holders: Vec<usize>,
+    host_any: i32,
 }
 
 /// Which tensor and batch class the multiply in flight belongs to, and
@@ -189,6 +205,17 @@ struct Ctx {
     file_maps: Vec<(usize, usize)>,
     /// Whether the offload has said the model is not mapped from its file.
     unmapped_said: bool,
+    /// Whole-expert placement (`PHI_GGML_EXPERTS`): each layer's experts in
+    /// descending order of use at calibration, and how many whole experts
+    /// of every expert tensor each card keeps (`size_whole`; 0: experts
+    /// are shared by rows as always).
+    placement: HashMap<u32, Vec<u32>>,
+    whole_k: u64,
+    /// The host's ids of the multiply begun last when its experts are
+    /// placed whole (`issue`): a slot naming a card's expert names a
+    /// host-held expert of the same token instead, `n_used` per token,
+    /// contiguous; empty otherwise (`phi_ggml_host_ids`).
+    host_ids: Vec<i32>,
 }
 
 static CTX: Mutex<Option<Ctx>> = Mutex::new(None);
@@ -283,6 +310,19 @@ pub extern "C" fn phi_ggml_open() -> i32 {
         say("PHI_GGML_ALL_ROWS needs PHI_GGML_OFFLOAD=1 (the judgement needs host rows): ignored");
     }
     let all_rows = all_rows && offload;
+    // Whole experts: only with the offload, since the host never reads a
+    // card's expert back (the judgement moves rows, which nothing here can).
+    let mut placement = HashMap::new();
+    if let Ok(path) = std::env::var("PHI_GGML_EXPERTS") {
+        if !offload {
+            say("PHI_GGML_EXPERTS needs PHI_GGML_OFFLOAD=1 (a whole expert on a card is not the host's to compute): ignored");
+        } else {
+            match load_placement(&path) {
+                Ok(p) => placement = p,
+                Err(e) => say(&format!("PHI_GGML_EXPERTS: {e}; the experts are shared by rows")),
+            }
+        }
+    }
     set_spin(std::env::var("PHI_GGML_SPIN_US").ok().and_then(|s| s.parse::<u64>().ok()));
     // A fixed share is held to the same cap as a sized one (`share_cap`).
     let cap = share_cap(cards.len(), all_rows);
@@ -351,8 +391,38 @@ pub extern "C" fn phi_ggml_open() -> i32 {
         host_read: 0,
         file_maps: Vec::new(),
         unmapped_said: false,
+        placement,
+        whole_k: 0,
+        host_ids: Vec::new(),
     });
     n
+}
+
+/// The placement file `PHI_GGML_EXPERTS` names: lines `layer N: e e e ...`,
+/// each layer's experts in descending order of use, as
+/// `tools/expert-placement.c rank` writes them from a run's `PHI_GGML_IDS`
+/// lines. Experts a layer's line leaves out come after the listed ones, in
+/// index order (`plan_whole`).
+fn load_placement(path: &str) -> Result<HashMap<u32, Vec<u32>>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    let mut out = HashMap::new();
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("layer ") else {
+            continue;
+        };
+        let Some((n, list)) = rest.split_once(':') else {
+            continue;
+        };
+        let Ok(layer) = n.trim().parse::<u32>() else {
+            continue;
+        };
+        let experts: Vec<u32> = list.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+        out.insert(layer, experts);
+    }
+    if out.is_empty() {
+        return Err(format!("{path}: no 'layer N: e e ...' line"));
+    }
+    Ok(out)
 }
 
 /// Whether `addr..addr + len` lies in a mapping of a file (a model
@@ -572,6 +642,9 @@ struct Offer {
     nb_a: u64,
     experts: u64,
     mixture: bool,
+    /// The layer, from the tensor's name (`blk.N.`), or -1: what a
+    /// placement (`PHI_GGML_EXPERTS`) is keyed by.
+    layer: i32,
 }
 
 /// A weight tensor the glue has just accepted a multiply of, noted for
@@ -582,7 +655,7 @@ struct Offer {
 /// arriving later is fitted into what budget is left, as any tensor past
 /// the budget is.
 #[no_mangle]
-pub extern "C" fn phi_ggml_note_weight(data: *const u8, m: u64, nb_a: u64, experts: u64, mixture: i32) {
+pub extern "C" fn phi_ggml_note_weight(data: *const u8, m: u64, nb_a: u64, experts: u64, mixture: i32, layer: i32) {
     if data.is_null() {
         return;
     }
@@ -594,6 +667,7 @@ pub extern "C" fn phi_ggml_note_weight(data: *const u8, m: u64, nb_a: u64, exper
                 nb_a,
                 experts: experts.max(1),
                 mixture: mixture != 0,
+                layer,
             };
             ctx.offered.insert(data as usize, offer);
         }
@@ -767,9 +841,18 @@ fn settle_fraction(ctx: &mut Ctx) {
         return;
     }
     let budget = ctx.cards.iter().map(|c| c.budget).min().unwrap_or(0);
-    let cap = share_cap(ctx.cards.len(), ctx.all_rows);
+    let ncards = ctx.cards.len();
+    let cap = share_cap(ncards, ctx.all_rows);
     let offers: Vec<(usize, Offer)> = ctx.offered.iter().map(|(a, o)| (*a, *o)).collect();
-    let (f_dense, f_experts, shares) = size_shares(&offers, ctx.cards.len(), cap, budget, ctx.min_bytes);
+    // Placed whole, the experts are not shared by rows: the dense matrices
+    // are sized alone, and whole experts fill what is left (`size_whole`).
+    let whole = !ctx.placement.is_empty();
+    let sized: Vec<(usize, Offer)> = if whole {
+        offers.iter().filter(|(_, o)| !o.mixture).copied().collect()
+    } else {
+        offers.clone()
+    };
+    let (f_dense, f_experts, shares) = size_shares(&sized, ncards, cap, budget, ctx.min_bytes);
     let gb = |mixture: bool| {
         offers
             .iter()
@@ -782,13 +865,26 @@ fn settle_fraction(ctx: &mut Ctx) {
         .iter()
         .filter(|(a, o)| o.mixture && shares.get(a).is_some_and(|&f| f > f_experts))
         .count();
-    let mut per_card = vec![0u64; ctx.cards.len()];
-    for (a, o) in &offers {
+    let mut per_card = vec![0u64; ncards];
+    for (a, o) in &sized {
         add_cost(&mut per_card, o, shares[a], ctx.min_bytes);
     }
     ctx.fraction = f_dense;
-    ctx.fraction_experts = f_experts;
+    ctx.fraction_experts = if whole { 0.0 } else { f_experts };
     ctx.shares = shares;
+    if whole {
+        let (k, most, used) = size_whole(&offers, ncards, budget, &per_card);
+        ctx.whole_k = k;
+        say(&format!(
+            "{:.1} GB of dense weights and {:.1} GB of experts offered to the cards: each keeps {:.1}% of every dense matrix's rows \
+             and {k} whole experts of each layer's {most} (the most used first, PHI_GGML_EXPERTS), {:.2} GB",
+            gb(false),
+            gb(true),
+            f_dense * 100.0,
+            used.iter().copied().max().unwrap_or(0) as f64 / 1e9
+        ));
+        return;
+    }
     say(&format!(
         "{:.1} GB of dense weights and {:.1} GB of experts offered to the cards: each keeps {:.1}% of every dense matrix's rows \
          and {:.1}% of the experts' ({stepped} expert tensors a step more), {:.2} GB",
@@ -798,6 +894,39 @@ fn settle_fraction(ctx: &mut Ctx) {
         f_experts * 100.0,
         per_card.iter().copied().max().unwrap_or(0) as f64 / 1e9
     ));
+}
+
+/// How many whole experts of every mixture tensor each card keeps under a
+/// placement: the most for which every card's dense rows (`dense_used`)
+/// and its whole experts of every mixture tensor fit `budget`, never more
+/// than an equal split of a tensor's experts between the cards. Returns it
+/// with the largest expert count seen and each card's use.
+fn size_whole(offers: &[(usize, Offer)], ncards: usize, budget: u64, dense_used: &[u64]) -> (u64, u64, Vec<u64>) {
+    let most = offers.iter().filter(|(_, o)| o.mixture).map(|(_, o)| o.experts).max().unwrap_or(0);
+    let per = |k: u64| -> Vec<u64> {
+        let mut v = dense_used.to_vec();
+        for (_, o) in offers.iter().filter(|(_, o)| o.mixture) {
+            let kk = k.min(o.experts / ncards as u64);
+            if kk > 0 {
+                for c in v.iter_mut() {
+                    *c += card_cost(kk * o.m * o.nb_a);
+                }
+            }
+        }
+        v
+    };
+    let fits = |k: u64| per(k).iter().all(|&c| c <= budget);
+    let (mut lo, mut hi) = (0u64, most / ncards.max(1) as u64);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let used = per(lo);
+    (lo, most, used)
 }
 
 /// The share of the tensor at `key`: its own once the shares are settled,
@@ -1001,6 +1130,135 @@ unsafe fn plan(ctx: &mut Ctx, a: *const u8, a_type: u32, m: u64, nb_a: u64, expe
         bad: [0; 2],
         avoid: [false; 2],
         shape: [m, nb_a, u64::from(a_type), experts],
+        whole: None,
+    }
+}
+
+/// Place a mixture tensor's experts whole (`PHI_GGML_EXPERTS`): the layer's
+/// experts in descending order of use, card `c` taking the ranks `c`,
+/// `c + ncards`, ... up to `whole_k` of them, each expert's matrix whole
+/// and one after another in the card's slice, so that its id on the card
+/// is its index there (the card finds expert `i` at `i * m * nb_a`, the
+/// request's `m` being every row). The host keeps the rest whole; the
+/// offload drops the cards' experts' pages. Experts the placement does
+/// not list follow the listed ones in index order.
+///
+/// # Safety
+/// `a` must be `experts` matrices of `m` rows of `nb_a` bytes, `nb_a2` apart.
+#[allow(clippy::too_many_arguments)]
+unsafe fn plan_whole(ctx: &mut Ctx, a: *const u8, a_type: u32, m: u64, nb_a: u64, experts: u64, nb_a2: u64, layer: i32) -> Split {
+    let ncards = ctx.cards.len();
+    let listed = ctx.placement.get(&(layer.max(0) as u32)).cloned().unwrap_or_default();
+    let mut seen = vec![false; experts as usize];
+    let mut rank: Vec<u32> = Vec::with_capacity(experts as usize);
+    for e in listed.into_iter().chain(0..experts as u32) {
+        if (e as u64) < experts && !seen[e as usize] {
+            seen[e as usize] = true;
+            rank.push(e);
+        }
+    }
+    let slice = m * nb_a;
+    let k = ctx.whole_k.min(experts / ncards.max(1) as u64).min(A_MAX / slice.max(1)) as usize;
+    let mut lists: Vec<Vec<u32>> = vec![Vec::new(); ncards];
+    for (i, &e) in rank.iter().enumerate() {
+        let c = i % ncards;
+        if lists[c].len() < k {
+            lists[c].push(e);
+        }
+    }
+    let mut card_of = vec![-1i8; experts as usize];
+    let mut local = vec![0u32; experts as usize];
+    let mut holders = Vec::new();
+    for (ci, card) in ctx.cards.iter_mut().enumerate() {
+        let list = &lists[ci];
+        if card.full || list.is_empty() {
+            continue;
+        }
+        let bytes = list.len() as u64 * slice;
+        let cost = card_cost(bytes);
+        if card.uploaded + cost > card.budget {
+            card.full = true;
+            say(&format!(
+                "card {}: its budget is spent at {:.2} GB resident",
+                card.index,
+                card.uploaded as f64 / 1e9
+            ));
+            continue;
+        }
+        for (idx, &e) in list.iter().enumerate() {
+            // SAFETY: expert e's m rows; the window area is A_MAX, which k respects.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    a.add((e as u64 * nb_a2) as usize),
+                    card.w.ptr(OFF_A + idx as u64 * slice, slice as usize),
+                    slice as usize,
+                )
+            };
+        }
+        let id = card.next_id;
+        let mm = Matmul {
+            a_id: id,
+            a_off: OFF_A,
+            bytes: matmul::round_up(bytes),
+            ..Matmul::default()
+        };
+        let seq = ring(card, K_UPLOAD, &mm);
+        match wait(card, seq, Duration::from_secs(120)) {
+            Ok(_) => {
+                card.next_id += 1;
+                card.ids.insert(a as usize, id);
+                card.uploaded += cost;
+                for (idx, &e) in list.iter().enumerate() {
+                    card_of[e as usize] = ci as i8;
+                    local[e as usize] = idx as u32;
+                }
+                holders.push(ci);
+                if ctx.verbose {
+                    say(&format!(
+                        "card {}: keeps {} whole experts of layer {layer}'s {experts} {} {}x{} matrices ({:.1} MiB; {:.2} GB resident)",
+                        card.index,
+                        list.len(),
+                        matmul::type_name(a_type),
+                        m,
+                        nb_a,
+                        bytes as f64 / 1048576.0,
+                        card.uploaded as f64 / 1e9
+                    ));
+                }
+            }
+            Err(e) => {
+                say(&format!("upload of {bytes} bytes refused, the card keeps no more: {e}"));
+                card.full = true;
+            }
+        }
+    }
+    if ctx.offload && !holders.is_empty() {
+        let mut dropped = 0;
+        for (e, &c) in card_of.iter().enumerate() {
+            if c >= 0 {
+                dropped += drop_pages(&mut ctx.file_maps, a as usize + (e as u64 * nb_a2) as usize, slice as usize);
+            }
+        }
+        if ctx.verbose {
+            say(&format!(
+                "offload: {:.1} MiB of the host's pages dropped",
+                dropped as f64 / 1048576.0
+            ));
+        }
+    }
+    let host_any = card_of.iter().position(|&c| c < 0).map_or(-1, |e| e as i32);
+    Split {
+        r0: m,
+        cards: Vec::new(),
+        bad: [0; 2],
+        avoid: [false; 2],
+        shape: [m, nb_a, u64::from(a_type), experts],
+        whole: Some(Whole {
+            card_of,
+            local,
+            holders,
+            host_any,
+        }),
     }
 }
 
@@ -1009,7 +1267,7 @@ unsafe fn plan(ctx: &mut Ctx, a: *const u8, a_type: u32, m: u64, nb_a: u64, expe
 /// it computed and how many columns. For a mixture, column `p` is
 /// `j + t * n_used` and its result belongs at `j * nb_d` plus
 /// `t * nb_d2` in the destination.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Pending {
     seq: u64,
     lo: u64,
@@ -1020,6 +1278,10 @@ struct Pending {
     /// of the card's slice of it, the rows computed, and where in the
     /// window its results are.
     more: Option<(u64, u64, u64)>,
+    /// With whole experts, the ids this card was sent: a column at -1 is
+    /// another card's or the host's, and the gather leaves it alone. Empty
+    /// otherwise.
+    ids: Vec<i32>,
 }
 
 /// A mixture's columns, as the caller describes them: nothing for an
@@ -1161,6 +1423,10 @@ struct Ready {
     work: Vec<(usize, u64, u64)>,
     read_back: u64,
     on_cards: u64,
+    /// The tensor's experts are placed whole (`Split::whole`): `work` names
+    /// every card holding any, all rows; `ranges` is every row for the
+    /// host, over substituted ids (`issue`).
+    whole: bool,
 }
 
 /// Decide a multiply without starting it: plan the tensor's rows if it is
@@ -1233,19 +1499,25 @@ unsafe fn prepare(
         // shares were sized with). A mixture's card part grows with its
         // columns, so it is planned as always.
         let f = share_of(ctx, key, mixture);
+        let layer = ctx.offered.get(&key).map_or(-1, |o| o.layer);
         let offer = Offer {
             m,
             nb_a,
             experts: mix.experts,
             mixture,
+            layer,
         };
-        let split = if declined(&offer, f, ctx.cards.len(), ctx.min_bytes) {
+        let split = if mixture && ctx.whole_k > 0 && layer >= 0 {
+            // SAFETY: the caller's contract.
+            unsafe { plan_whole(ctx, a, a_type, m, nb_a, mix.experts, mix.nb_a2, layer) }
+        } else if declined(&offer, f, ctx.cards.len(), ctx.min_bytes) {
             Split {
                 r0: m,
                 cards: Vec::new(),
                 bad: [0; 2],
                 avoid: [false; 2],
                 shape,
+                whole: None,
             }
         } else {
             // SAFETY: the caller's contract.
@@ -1263,6 +1535,40 @@ unsafe fn prepare(
     // worth a card's latency at a batch is often not worth it at one
     // token (`Split::avoid`).
     let class = if (if mixture { mix.n_tokens } else { n }) >= 8 { 1 } else { 0 };
+    // Experts placed whole: every card holding any of them takes all rows
+    // of the columns naming its experts, and the host all rows of the rest
+    // (its ids substituted in `issue`). Nothing is judged: offloaded only.
+    if let Some(w) = &ctx.splits[&key].whole {
+        if !mixture {
+            return host("a whole-expert tensor asked for as a plain multiply", true);
+        }
+        let work: Vec<(usize, u64, u64)> = w.holders.iter().map(|&ci| (ci, 0, m)).collect();
+        if work.is_empty() {
+            return host("no card holds an expert of it", false);
+        }
+        let ranges = if w.host_any >= 0 { vec![(0, m)] } else { Vec::new() };
+        return Prep::Cards(Ready {
+            key,
+            a_type,
+            m,
+            k,
+            nb_a,
+            n,
+            nb_b,
+            class,
+            mixture,
+            ids_bytes,
+            b_rows,
+            half,
+            card_nb_b,
+            touched,
+            ranges,
+            work,
+            read_back: 0,
+            on_cards: m,
+            whole: true,
+        });
+    }
     // Float weights at a batch are the card's worst case and the host's
     // ordinary one. At one token the card's float path is its best
     // (52.5 GB/s of weights against 21 for Q4_K, since nothing is
@@ -1339,6 +1645,7 @@ unsafe fn prepare(
         work,
         read_back,
         on_cards,
+        whole: false,
     })
 }
 
@@ -1425,6 +1732,48 @@ unsafe fn issue(ctx: &mut Ctx, r: &Ready, b: *const u8, mix: &Mixture, second: O
             adapts: r.class == 1 && !r.mixture,
         })
     };
+    // The expert of slot j of token t, as the program routed it.
+    let id_at = |t: u64, j: u64| -> i32 {
+        // SAFETY: ids is n_used int32 per token, ids_nb1 bytes apart.
+        unsafe { *mix.ids.add((t * mix.ids_nb1 / 4 + j) as usize) }
+    };
+    // `PHI_GGML_IDS`: the experts a layer's pair was routed to, one line per
+    // request, for the placement tool (`tools/expert-placement.c`). A
+    // calibration instrument, not a benchmark line.
+    if r.mixture && second.is_some() && std::env::var_os("PHI_GGML_IDS").is_some() {
+        let mut s = String::with_capacity((mix.n_tokens * mix.n_used * 4) as usize);
+        for t in 0..mix.n_tokens {
+            for j in 0..mix.n_used {
+                s.push(' ');
+                s.push_str(&id_at(t, j).to_string());
+            }
+        }
+        let layer = ctx.offered.get(&r.key).map_or(-1, |o| o.layer);
+        say(&format!("ids layer {layer} tokens {} used {}:{s}", mix.n_tokens, mix.n_used));
+    }
+    // Whole experts: the host's ids name, in place of a card's expert, a
+    // host-held expert of the same token (any slot of it that is the
+    // host's, else `host_any`), so that ggml's own MUL_MAT_ID over the
+    // host's rows reads no page the cards own; the gather then overwrites
+    // those slots with the cards' results. A token whose experts are all
+    // on the cards costs the host one expert's worth of wasted work.
+    let whole = if r.whole {
+        ctx.splits.get(&r.key).and_then(|s| s.whole.clone())
+    } else {
+        None
+    };
+    let on_host = |w: &Whole, e: i32| e >= 0 && (e as usize) < w.card_of.len() && w.card_of[e as usize] < 0;
+    if let Some(w) = &whole {
+        let mut host_ids = Vec::with_capacity(r.n as usize);
+        for t in 0..mix.n_tokens {
+            let any = (0..mix.n_used).map(|j| id_at(t, j)).find(|&e| on_host(w, e)).unwrap_or(w.host_any);
+            for j in 0..mix.n_used {
+                let e = id_at(t, j);
+                host_ids.push(if on_host(w, e) { e } else { any });
+            }
+        }
+        ctx.host_ids = host_ids;
+    }
     let first = r.work[0].0;
     let d2 = OFF_D + round_up(r.n * r.work.iter().map(|w| w.2).max().unwrap_or(0) * 4);
     for (w_i, &(ci, lo, rows)) in r.work.iter().enumerate() {
@@ -1434,8 +1783,34 @@ unsafe fn issue(ctx: &mut Ctx, r: &Ready, b: *const u8, mix: &Mixture, second: O
         if w_i > 0 {
             copy_window(&ctx.cards, first, ci, OFF_B + r.ids_bytes, r.b_rows * card_nb_b);
         }
+        // With whole experts, this card's ids: its experts by their index in
+        // its slice, -1 for a column that is another card's or the host's.
+        let mut card_ids: Vec<i32> = Vec::new();
+        let mut any = true;
+        if let Some(w) = &whole {
+            card_ids = vec![-1; r.n as usize];
+            any = false;
+            for t in 0..mix.n_tokens {
+                for j in 0..mix.n_used {
+                    let e = id_at(t, j);
+                    if e >= 0 && (e as usize) < w.card_of.len() && w.card_of[e as usize] == ci as i8 {
+                        card_ids[(t * mix.n_used + j) as usize] = w.local[e as usize] as i32;
+                        any = true;
+                    }
+                }
+            }
+        }
         let card = &mut ctx.cards[ci];
-        if r.mixture {
+        if r.mixture && !card_ids.is_empty() {
+            // SAFETY: n int32 into the ids area, which ids_bytes covers.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    card_ids.as_ptr() as *const u8,
+                    card.w.ptr(OFF_B, r.n as usize * 4),
+                    r.n as usize * 4,
+                )
+            };
+        } else if r.mixture {
             // The expert each column picks, one token's after another.
             for t in 0..mix.n_tokens {
                 // SAFETY: ids is n_used int32 per token, ids_nb1 apart.
@@ -1452,6 +1827,10 @@ unsafe fn issue(ctx: &mut Ctx, r: &Ready, b: *const u8, mix: &Mixture, second: O
         if w_i == 0 && !half {
             // SAFETY: as above.
             unsafe { put_rows(card, b, r.b_rows, r.k, r.nb_b, mix, OFF_B + r.ids_bytes, card_nb_b, half) };
+        }
+        // None of this card's experts in this request: nothing to ring it for.
+        if !any {
+            continue;
         }
         let mm = Matmul {
             a_id: card.ids[&r.key],
@@ -1500,6 +1879,7 @@ unsafe fn issue(ctx: &mut Ctx, r: &Ready, b: *const u8, mix: &Mixture, second: O
             cols: r.n,
             n_used: mix.n_used,
             more,
+            ids: card_ids,
         });
     }
     ctx.host_ranges = r.ranges.clone();
@@ -1518,6 +1898,7 @@ unsafe fn begin(a: *const u8, a_type: u32, m: u64, k: u64, nb_a: u64, keep: i32,
     settle_fraction(ctx);
     ctx.t_begin = Instant::now();
     ctx.host_ranges2.clear();
+    ctx.host_ids.clear();
     // SAFETY: the caller's contract.
     match unsafe { prepare(ctx, a, a_type, m, k, nb_a, keep, n, nb_b, &mix) } {
         Prep::Cards(r) => unsafe { issue(ctx, &r, b, &mix, None) },
@@ -1595,9 +1976,15 @@ pub unsafe extern "C" fn phi_ggml_begin_id_pair(
     if !same_cards || r1.half != r2.half || round_up(n * rows1 * 4) + n * rows2 * 4 > D_MAX {
         return -2;
     }
+    // Placed whole, both must hold the same experts on the same cards: one
+    // set of ids per card serves the pair, and one substitution the host.
+    if r1.whole != r2.whole || (r1.whole && ctx.splits[&r1.key].whole != ctx.splits[&r2.key].whole) {
+        return -2;
+    }
     ctx.calls += 1;
     ctx.pairs += 1;
     ctx.t_begin = Instant::now();
+    ctx.host_ids.clear();
     // SAFETY: the caller's contract.
     unsafe { issue(ctx, r1, b, &mix, Some(Second { r: r2 })) }
 }
@@ -1651,6 +2038,20 @@ pub unsafe extern "C" fn phi_ggml_host_range(i: u64, from: *mut u64, to: *mut u6
     }
 }
 
+/// The host's ids of the multiply begun last, or null when they are the
+/// program's own: with whole experts on the cards (`issue`), each slot
+/// naming a card's expert names a host-held expert of the same token
+/// instead, `n_used` per token, contiguous. The glue points ggml's
+/// MUL_MAT_ID at them for the host's rows. Valid until the next begin.
+#[no_mangle]
+pub extern "C" fn phi_ggml_host_ids() -> *const i32 {
+    let guard = CTX.lock().unwrap_or_else(|e| e.into_inner());
+    match guard.as_ref() {
+        Some(ctx) if !ctx.host_ids.is_empty() => ctx.host_ids.as_ptr(),
+        _ => std::ptr::null(),
+    }
+}
+
 /// Wait for the cards' rows and put them into `d` (n rows of `nb_d`
 /// bytes, m floats each; a mixture's column `j + t * n_used` goes to
 /// `j * nb_d + t * nb_d2`). Returns 0, or -1 after a message.
@@ -1686,13 +2087,18 @@ pub unsafe extern "C" fn phi_ggml_end_id_pair(d: *mut u8, nb_d: u64, nb_d2: u64,
 /// A card's `cols` runs of `rows` floats at window offset `off` into `d`,
 /// from row `lo`: an ordinary multiply has one destination row per column,
 /// a mixture one per (expert slot, token), column `p` at
-/// `(p % n_used) * nb_d + (p / n_used) * nb_d2`.
+/// `(p % n_used) * nb_d + (p / n_used) * nb_d2`. With `ids` (whole
+/// experts), a column whose id is -1 was not this card's and is left as
+/// it is.
 ///
 /// # Safety
 /// `d` must hold every row the columns address, `lo + rows` floats each.
 #[allow(clippy::too_many_arguments)]
-unsafe fn gather(card: &Card, off: u64, lo: u64, rows: u64, cols: u64, n_used: u64, d: *mut u8, nb_d: u64, nb_d2: u64) {
+unsafe fn gather(card: &Card, off: u64, lo: u64, rows: u64, cols: u64, n_used: u64, d: *mut u8, nb_d: u64, nb_d2: u64, ids: &[i32]) {
     for p in 0..cols {
+        if ids.get(p as usize).is_some_and(|&e| e < 0) {
+            continue;
+        }
         let at = if n_used > 0 {
             (p % n_used) * nb_d + (p / n_used) * nb_d2
         } else {
@@ -1731,6 +2137,7 @@ unsafe fn end(d: *mut u8, nb_d: u64, nb_d2: u64, second: Option<(*mut u8, u64, u
             cols,
             n_used,
             more,
+            ids,
         }) = card.pending.take()
         else {
             continue;
@@ -1744,11 +2151,11 @@ unsafe fn end(d: *mut u8, nb_d: u64, nb_d2: u64, second: Option<(*mut u8, u64, u
             }
         };
         // SAFETY: the caller's contract; the card wrote its rows at OFF_D.
-        unsafe { gather(card, OFF_D, lo, rows, cols, n_used, d, nb_d, nb_d2) };
+        unsafe { gather(card, OFF_D, lo, rows, cols, n_used, d, nb_d, nb_d2, &ids) };
         let mut all_rows = rows;
         if let (Some((lo2, rows2, off2)), Some((d_2, nb_d_2, nb_d2_2))) = (more, second) {
             // SAFETY: as above; the second matrix's rows are at `off2`.
-            unsafe { gather(card, off2, lo2, rows2, cols, n_used, d_2, nb_d_2, nb_d2_2) };
+            unsafe { gather(card, off2, lo2, rows2, cols, n_used, d_2, nb_d_2, nb_d2_2, &ids) };
             all_rows += rows2;
         }
         card.busy += rep_time(&rep);
@@ -1951,7 +2358,40 @@ mod tests {
             nb_a,
             experts,
             mixture: experts > 1,
+            layer: -1,
         }
+    }
+
+    /// Whole experts: the dense matrices at their share, then as many whole
+    /// experts of every expert tensor as fit, never more than an equal split
+    /// between the cards; the 35B-A3B's Q6_K shapes at a 4.4 GB budget give
+    /// each card 34 of every layer's 256, within the budget.
+    #[test]
+    fn whole_experts_fill_what_the_dense_matrices_leave() {
+        let mut offers = vec![(1, offer(248_320, 1680, 1))];
+        for i in 0..8 {
+            offers.push((10 + i, offer(8192, 1680, 1)));
+        }
+        for l in 0..40 {
+            offers.push((1000 + 3 * l, offer(512, 1680, 256)));
+            offers.push((1001 + 3 * l, offer(512, 1680, 256)));
+            offers.push((1002 + 3 * l, offer(2048, 420, 256)));
+        }
+        let budget = 4_400_000_000;
+        let dense: Vec<(usize, Offer)> = offers.iter().filter(|(_, o)| !o.mixture).copied().collect();
+        let (f_dense, _, shares) = size_shares(&dense, 2, share_cap(2, false), budget, 4_000_000);
+        let dense_used = used(&dense, &shares, 2, 4_000_000);
+        let (k, most, per_card) = size_whole(&offers, 2, budget, &dense_used);
+        assert_eq!(f_dense, share_cap(2, false));
+        assert_eq!(most, 256);
+        assert!((30..=40).contains(&k), "{k}");
+        assert!(per_card.iter().all(|&c| c <= budget), "{per_card:?}");
+        // one more expert of every tensor would not fit
+        let (k2, _, over) = size_whole(&offers, 2, budget + 3 * 40 * card_cost(512 * 1680), &dense_used);
+        assert!(k2 > k && over.iter().all(|&c| c <= budget + 3 * 40 * card_cost(512 * 1680)));
+        // a budget too small for the dense matrices leaves the experts none
+        let (k0, _, _) = size_whole(&offers, 2, 100_000_000, &dense_used);
+        assert_eq!(k0, 0);
     }
 
     fn used(offers: &[(usize, Offer)], shares: &HashMap<usize, f64>, ncards: usize, min_bytes: u64) -> Vec<u64> {

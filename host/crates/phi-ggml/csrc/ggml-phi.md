@@ -189,3 +189,18 @@ not used and the program runs on the CPU.
 `PHI_GGML_OFFLOAD` is set: the fused path keeps its rows on the host and
 hands a declined block back to the host whole, the opposite of the
 offload's contract.
+
+## The host's ids substituted (2026-09-29)
+
+With whole experts on the cards (`PHI_GGML_EXPERTS`, `src/lib.md` "Whole
+experts"), the host's rows of a `MUL_MAT_ID` are all rows of the experts
+it holds, and the ids it multiplies by must name none of the cards'.
+`alias_ids` builds the ids leaf: the node's own, or, when
+`phi_ggml_host_ids` returns them, the backend's substitution (each slot
+naming a card's expert names a host-held expert of the same token
+instead, `n_used` per token, contiguous), which `host_rows_id` and
+`host_rows_id_pair` multiply by exactly as ggml would have; the gather
+overwrites the substituted slots with the cards' results afterwards.
+`phi_ggml_note_weight` carries each weight's layer, from its name
+(`layer_of`: llama.cpp names them `blk.N.<what>.weight`), which the
+placement file is keyed by.

@@ -444,3 +444,12 @@ the worker's `-m` sets (activations and results up to 2 MiB through the
 mapping, 1, the default; or all on the block device, 0), and
 `vpu_marks[8]`, the time stamps a request's stages leave (`MARK(i)`: 1
 to 5 here, 0, 6 and 7 the worker's own) for its `-t` trace.
+
+An id of -1 is a column without an expert on this card (2026-09-29): the
+host places whole experts, each on one card (`host/crates/phi-ggml/src/lib.md`,
+"Whole experts"), and sends each card the request's columns with its own
+experts by their index in its slice and -1 for the others. Both
+groupings skip such a column (`groups_mixture`, `groups_own`), so
+nothing is computed or written for it; the ids check refuses anything
+else negative as before. `phi-vpu matmul-check` covers it with every
+third column of two mixtures at -1, through both groupings.
