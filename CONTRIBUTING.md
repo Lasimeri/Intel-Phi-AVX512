@@ -9,17 +9,21 @@ sections are the same in every repository of the family (see
 
 - **Rust** for everything that can be Rust: all host-side software and all
   tooling that runs on the host.
-- **Assembly** for the card worker (`card/vpu`): x86-64 GNU `as` on the
-  host, no libc, the vector instructions through `mvex.inc`, the binary
-  audited for what Knights Corner runs (`card/vpu/build.md`). The C worker
-  it replaced is in the history before commit `6484cf0`
-  (`docs/results/2026-09-30-worker-assembly.md`).
+- **Assembly** for the card worker (`card/vpu`) and the ggml backend
+  (`host/asm/ggml-phi` with `host/asm/common`): x86-64 GNU `as`, no
+  libc, the card's vector instructions through `mvex.inc`, the card
+  binary audited for what Knights Corner runs (`card/vpu/build.md`),
+  the backend a shared object whose ggml calls are undefined symbols
+  (`host/asm/README.md`). The C worker it replaced is in the history
+  before commit `6484cf0` (`docs/results/2026-09-30-worker-assembly.md`),
+  the Rust backend before the commit of
+  `docs/results/2026-09-30-backend-assembly.md`; their design notes stay
+  as `.md` files beside where the sources were.
 - **C** only where neither is an option: the card's protocol headers
   (`card/vpu/*.h`, the readable contract the layout checkers read), the
-  card examples, the glue a C interface of an upstream project requires
-  (ggml's backend tables, `host/crates/phi-ggml/csrc`), and small helpers
-  under `tools/` that must see the C headers as C sees them, compiled and
-  run with `tcc`.
+  card examples, and small helpers under `tools/` that must see the C
+  headers as C sees them (ggml's, llama.cpp's, the protocol's), compiled
+  and run with `tcc`.
 - **Shell** (`sh`, POSIX where practical, `bash` when arrays are needed) for
   scripts that orchestrate the stack's tools and the card worker.
 - **Never Python or JavaScript** for anything here.

@@ -3,7 +3,7 @@
 The window areas and the six request kinds of the card's matrix-multiply
 service (`K_UPLOAD`, `K_MATMUL`, `K_MATMUL_ID`, `K_FREE`, `K_FFN`,
 `K_MATMUL_MORE`; `card/vpu/vpu_matmul.md`), shared by the ggml backend
-(`host/crates/phi-ggml`) and the driver's `matmul-check`:
+(`host/asm/ggml-phi`) and the driver's `matmul-check`:
 
 | item | what |
 | --- | --- |

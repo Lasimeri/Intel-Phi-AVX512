@@ -1,0 +1,22 @@
+{
+	global:
+		ggml_backend_init;
+		ggml_backend_phi_reg;
+		phi_ggml_open;
+		phi_ggml_supports;
+		phi_ggml_note_weight;
+		phi_ggml_host_ids;
+		phi_ggml_begin;
+		phi_ggml_begin_id;
+		phi_ggml_begin_id_pair;
+		phi_ggml_host_range;
+		phi_ggml_host_range_of;
+		phi_ggml_end;
+		phi_ggml_end_id;
+		phi_ggml_end_id_pair;
+		phi_ggml_free_all;
+		phi_ggml_ffn_begin;
+		phi_ggml_ffn_end;
+	local:
+		*;
+};

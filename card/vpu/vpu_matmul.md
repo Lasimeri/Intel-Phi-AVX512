@@ -6,7 +6,7 @@ the design, the measurements and the defects recorded here stand, and
 the assembly keeps every mechanism named. The C files are in the history
 before commit `6484cf0`.
 
-The service behind the ggml backend (`host/crates/phi-ggml`): six
+The service behind the ggml backend (`host/asm/ggml-phi`): six
 request kinds on the worker's doorbell, with a descriptor
 (`struct vpu_matmul`, 128 bytes) in the control area at
 `VPU_OFF_MATMUL`: the four below, `VPU_K_FFN` (7, a feed-forward block,

@@ -25,8 +25,8 @@ static by `ld` with no libc (173000 bytes), audited by the stack's
 instructions, nothing Knights Corner does not run). The 41 kernels are
 hand-maintained macro lines over `mvex.inc`, an encoder of the card's
 MVEX prefix as assembler macros, which the first step gated byte for
-byte against the generated file it replaced. The plan is
-`docs/README.md`'s port entry; the steps and their commits:
+byte against the generated file it replaced. The plan of 2026-09-30 (the whole repository to assembly, the card
+worker first) set the steps and their gates; the steps and their commits:
 
 | step | what | gate | commit |
 | --- | --- | --- | --- |

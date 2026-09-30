@@ -1,5 +1,11 @@
 # ggml-phi.c: the ggml glue
 
+**The C this documents was replaced by the assembly glue on 2026-09-30**
+(`host/asm/ggml-phi/glue.S` and its `glue.md`, the ggml layout from
+`tools/ggml-layout-check.c`; `docs/results/2026-09-30-backend-assembly.md`);
+what it explains stands, slot for slot. The C source is in the history
+before the commit that removed it.
+
 The C ggml's backend interface requires, modelled on ggml's own BLAS
 backend: a device of type ACCEL named "Phi" that shares the CPU's host
 buffers (so the model's weights need no copy on the host and ggml's

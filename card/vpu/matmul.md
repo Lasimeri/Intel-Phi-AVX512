@@ -1,7 +1,7 @@
 # matmul.S and matmul.inc: the matrix service
 
 The card as a matrix-multiply engine for the ggml backend
-(`host/crates/phi-ggml`), in assembly: the request kinds `VPU_K_UPLOAD`
+(`host/asm/ggml-phi`), in assembly: the request kinds `VPU_K_UPLOAD`
 (keep a tensor by id), `VPU_K_MATMUL` (d = a . b^T), `VPU_K_MATMUL_ID` (a
 mixture of experts, one matrix per column), `VPU_K_MATMUL_MORE` (several
 matrices by the same activations in one request), `VPU_K_FFN` (a

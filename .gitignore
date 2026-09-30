@@ -10,3 +10,4 @@
 .idea/
 *.swp
 .DS_Store
+/host/asm/out/

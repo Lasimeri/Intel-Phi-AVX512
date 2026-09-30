@@ -5,7 +5,6 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/phi-ggml",
     "crates/knc-mvex",
     "crates/avx512-xlate",
     "crates/phi512",
@@ -16,7 +15,6 @@ members = [
 # by default; `make` adds it (`--workspace`) where llama.cpp is found, and
 # `cargo build -p phi-pld` builds it alone.
 default-members = [
-    "crates/phi-ggml",
     "crates/knc-mvex",
     "crates/avx512-xlate",
     "crates/phi512",

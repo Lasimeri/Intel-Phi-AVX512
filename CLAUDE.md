@@ -11,12 +11,13 @@ Read `CONTRIBUTING.md` first; it is the authority. The non-obvious rules:
   `scripts/phi512.sh`, `scripts/phi-vpu.sh`,
   `host/target/release/libggml_phi.so` and the `PHI_GGML_*` /
   `PHI_VPU_*` variables: add, do not rename.
-- Rust first on the host. The card worker is assembly (`card/vpu`, GNU
-  `as` on the host, audited for what Knights Corner runs). C only for
-  the card's protocol headers (`card/vpu/*.h`), the card examples,
-  `tcc`-compiled layout helpers, and the glue a C interface of an
-  upstream project requires (`host/crates/phi-ggml/csrc`). No Python or
-  JavaScript, ever.
+- Rust on the host for what is not yet ported. The card worker
+  (`card/vpu`) and the ggml backend (`host/asm/ggml-phi`,
+  `host/asm/common`) are assembly: GNU `as` on the host, no libc, the
+  card binary audited for what Knights Corner runs, layouts from `tcc`
+  checkers never by hand (`host/asm/README.md`). C only for the card's
+  protocol headers (`card/vpu/*.h`), the card examples and the
+  `tcc`-compiled layout helpers. No Python or JavaScript, ever.
 - Every code file gets a sibling `.md` with the same stem, written in the
   same change. No em or en dashes anywhere. A sibling repository's file is
   a GitHub link, not a bare path.

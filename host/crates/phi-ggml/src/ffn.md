@@ -1,5 +1,11 @@
 # ffn.rs: a feed-forward block as one request per card
 
+**The Rust this documents was replaced by the assembly backend on 2026-09-30**
+(`host/asm/ggml-phi/ffn.S` and its `ffn.md`;
+`docs/results/2026-09-30-backend-assembly.md`); the design and the
+measurements recorded here stand. The Rust source is in the history
+before the commit that removed it.
+
 A SwiGLU feed-forward block is three multiplies and the SwiGLU between
 them: `gate` and `up` of the block's input, `h = silu(gate) * up`, and
 `down` of `h`. Sent as three multiplies (lib.rs), each card gets the

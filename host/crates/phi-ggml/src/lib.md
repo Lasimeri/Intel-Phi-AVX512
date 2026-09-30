@@ -1,5 +1,12 @@
 # lib.rs: the cards beside the host, one multiply at a time
 
+**The Rust this documents was replaced by the assembly backend on 2026-09-30**
+(`host/asm/ggml-phi/backend.S`, `ffn.S` and `glue.S`, with their `.md`
+siblings; `docs/results/2026-09-30-backend-assembly.md`); the design, the
+measurements and the decisions recorded here stand, and the assembly keeps
+every mechanism and every printed line named. The Rust and C sources are in
+the history before the commit that removed them.
+
 `libggml_phi.so`, loaded by an unmodified llama.cpp through
 `GGML_BACKEND_PATH` (`scripts/phi-ggml.sh` sets it). ggml's scheduler
 gives the backend every `MUL_MAT` and `MUL_MAT_ID` whose weight type

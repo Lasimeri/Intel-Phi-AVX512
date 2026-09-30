@@ -36,7 +36,7 @@ if [ -z "$lib" ]; then
         [ -f "$cand" ] && { lib=$cand; break; }
     done
 fi
-[ -n "$lib" ] || { echo "$0: libggml_phi.so not found; build it: (cd host && cargo build --release -p phi-ggml)" >&2; exit 1; }
+[ -n "$lib" ] || { echo "$0: libggml_phi.so not found; build it: host/asm/ggml-phi/build.sh --install (make build)" >&2; exit 1; }
 # The cards: those named, else every card with a window (card 0's is
 # /dev/shm/phi-hostmem, card N's phi-hostmem-N); each worker started when
 # it is not polling.

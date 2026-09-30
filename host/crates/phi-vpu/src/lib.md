@@ -15,4 +15,4 @@ the explicit driver and the service's check. The card's matrix kernels
 are hand-maintained assembly since 2026-09-30 (`card/vpu/kernels.md`);
 the generator that wrote them (`kernelgen`) is gone. The other users of
 the library: `libphi512` (`cards`, `proto`, `window`, for the seamless
-path) and `libggml_phi.so` (all four, host/crates/phi-ggml).
+path) and `libggml_phi.so` (all four, host/asm/ggml-phi).

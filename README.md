@@ -111,7 +111,7 @@ generation phase, the prompt's time not in it.
 The instruction-level path above is exact but pays a fixed cost per
 region, and a program like llama.cpp has millions of tiny regions per
 token (`docs/results/2026-09-22-full-avx512.md`). For it the cards are
-used the way GPUs are: whole operators at a time. `host/crates/phi-ggml`
+used the way GPUs are: whole operators at a time. `host/asm/ggml-phi`
 builds `libggml_phi.so`, a ggml backend that an unmodified llama.cpp
 loads through `GGML_BACKEND_PATH`; its scheduler hands the backend
 every matrix multiply it accepts (`MUL_MAT` and `MUL_MAT_ID`, the
@@ -125,7 +125,7 @@ the host computes the rest with ggml's own CPU kernels; the results are
 gathered per multiply. A card is asked only when it would finish the
 multiply sooner: three rules decide that, one of them from what the
 backend times on each weight tensor as it runs
-(`host/crates/phi-ggml/src/lib.md`). The program itself is an ordinary
+(`host/asm/ggml-phi/backend.md`; the design in `host/crates/phi-ggml/src/lib.md`). The program itself is an ordinary
 build for this host.
 
 ```
@@ -299,7 +299,7 @@ same ones).
 | `host/crates/avx512-xlate` | EVEX to MVEX: the byte-level rewriter for the seamless path and the builder-based translator for kernels |
 | `host/crates/knc-mvex` | the MVEX encoder the translator builds on |
 | `host/crates/phi-vpu` | the protocol with the card worker, the shared window, the explicit driver |
-| `host/crates/phi-ggml` | `libggml_phi.so`, the ggml backend: matrix multiplies shared by rows between the host and the cards |
+| `host/asm/ggml-phi` | `libggml_phi.so`, the ggml backend in assembly (with `host/asm/common`): matrix multiplies shared by rows between the host and the cards; `host/crates/phi-ggml` keeps the Rust design notes |
 | `host/crates/phi-pld` | `phi-pld`, prompt lookup decoding over libllama (llama.cpp unchanged), served as llama-server serves; its simulator; built where llama.cpp is found |
 | `card/vpu` | the card-side worker: the exec engine, the explicit path's thread pool and the matrix-multiply service; built by `scripts/phi-vpu.sh deploy`, on the host with the stack's cross toolchain when it has one (`card/vpu/build.md`) |
 | `card/examples` | the AVX-512 kernel and its translation the explicit path and the ground-truth check use |

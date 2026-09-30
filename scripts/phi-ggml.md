@@ -6,7 +6,7 @@ scripts/phi-ggml.sh [--card N[,M...]] [--verbose] <command> [args...]   # also -
 
 Runs an ordinary build of a ggml program (llama.cpp, unmodified, built
 for this host) with the cards as a ggml device: `GGML_BACKEND_PATH` names
-this repository's `libggml_phi.so` (`host/crates/phi-ggml`), which ggml
+this repository's `libggml_phi.so` (`host/asm/ggml-phi`), which ggml
 loads at start and lists as the accelerator "Phi". llama.cpp's scheduler
 then gives it every `MUL_MAT` and `MUL_MAT_ID` it accepts (float32,
 float16, Q4_K, Q5_K, Q6_K, Q8_0 or IQ4_XS weights, float32 activations,
@@ -24,7 +24,7 @@ this CPU, and the AVX-512 work is what the backend ships to the cards,
 whole operators at a time, the way a GPU is used, beside the CPU rather
 than instead of it.
 
-Settings, all environment variables (`host/crates/phi-ggml/src/lib.md`):
+Settings, all environment variables (`host/asm/ggml-phi/backend.md`):
 `PHI_GGML_CARDS` (which cards; default every card whose window exists;
 `--card N[,M...]`, also `-c` or `--card=`, names the cards, one or a comma-separated list), `PHI_GGML_FRACTION` (rows per card; unset,
 the backend sizes it to fill the budget, below; either way at most an
@@ -61,7 +61,7 @@ card daemons a CPU each, and give the program the same `-t`),
 `PHI_GGML_THREADS` (card threads, 114: two per core),
 `PHI_GGML_ACT` (1: activations cross as float16; 0: float32),
 `PHI_GGML_MIN_BYTES` (below), `PHI_GGML_GRAPH=N` (print the first N
-sub-graphs the scheduler hands over, `host/crates/phi-ggml/csrc/ggml-phi.md`). `--verbose`
+sub-graphs the scheduler hands over, `host/asm/ggml-phi/glue.md`). `--verbose`
 (`PHI_GGML_VERBOSE=1`) prints every multiply with the host part, the wait
 and each card's timings, and every slice kept resident. The script
 starts each card's worker with `PHI_VPU_HUGEPAGES` at 2400 unless set and
