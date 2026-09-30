@@ -27,6 +27,7 @@ trace_every:	.skip 4
 spin_ns:	.skip 8
 idle_us:	.skip 8
 exec_pages:	.skip 4
+	.globl map_small
 map_small:	.skip 4
 nthreads:	.skip 4			# pool threads; the dispatcher is one more
 busy_cores:	.skip 4

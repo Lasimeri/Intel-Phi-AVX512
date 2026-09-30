@@ -8,11 +8,6 @@
 	.include "proto.inc"
 
 	.text
-	.globl vpu_matmul_run
-vpu_matmul_run:
-	movl $E_KERNEL, %eax
-	ret
-
 	.globl vpu_exec_run
 vpu_exec_run:
 	movl $E_KERNEL, %eax
