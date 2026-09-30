@@ -29,7 +29,7 @@ Weight types (`VPU_MM_*`, `a_type`): float32 and float16 rows use the
 dot kernels `phi_dot*_f16/f32` (one row against one or four activation
 rows, float16 up-converted by the load). The quantized formats of
 llama.cpp, Q4_K, Q5_K, Q6_K, Q8_0 and IQ4_XS, use the superblock kernels
-`phi_<fmt>_<1|4|8>` (`host/crates/phi-vpu/src/bin/kernelgen/quant.md`):
+`phi_<fmt>_<1|4|8>` (`card/vpu/kernels.md`):
 one 256-weight superblock against 1, 4 or 8 activation rows, the format
 decoded on the vector unit, the scales too. The reference each format
 reproduces is ggml-quants.c's `dequantize_row_<fmt>`; `phi-vpu
@@ -138,7 +138,7 @@ The kernels take the group's activation rows as an **array of pointers**
 (`rdx`), not a stride, because the columns that chose an expert belong
 to whichever tokens chose it. That costs nothing: the prologue loads
 T - 1 pointers where it used to compute T - 1 addresses
-(`kernelgen/quant.md`).
+(`kernels.md`).
 
 Measured on card 0, the mixture multiply of the 35B-A3B at 512 tokens:
 the card's compute fell from 39.2 ms to 20.4 ms. What it did not do is
@@ -183,7 +183,7 @@ sends float32 for them (`host/crates/phi-ggml/src/lib.md`).
 
 Nothing about this costs the card anything: the up-conversion is a field
 of the memory operand, so the same 128 fused multiply-adds per eight-row
-call read half the bytes (`kernelgen/quant.md` has the rates).
+call read half the bytes (`kernels.md` has the rates).
 
 ## A feed-forward block in one request (VPU_K_FFN)
 
@@ -214,7 +214,7 @@ the block's output, and one round trip replaces three.
    `rows_range_q` (the quantized loop with an explicit row range; the
    old `rows_slice_q` is now that plus `slice_rows`), then the SwiGLU of
    exactly those rows (`swiglu_range`: whole vectors, and the vector
-   holding either end under a lane mask, `kernelgen/glu.md`). No other
+   holding either end under a lane mask, `kernels.md`). No other
    thread writes those rows, so the three steps need no barrier.
 2. The down projection over `h`, an ordinary quantized multiply through
    `rows_slice` whose activations are `h`'s columns.
@@ -261,7 +261,7 @@ pushing against 195 ms computing, and the host waited 65 ms for it.
 
 `pull_data` and `push_data` now move the data through the worker's
 mapping of the window instead, in whole 64-byte vectors
-(`kernelgen/copy.md`):
+(`kernels.md`):
 
 | transfer | how |
 | --- | --- |

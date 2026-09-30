@@ -141,7 +141,7 @@ flight. The mapping is uncached, so the width of an access is the width
 of its transaction: 64-byte vector stores write 16 KiB in 29 us (557
 MB/s), and the same copy split across the pool, one load in flight per
 core, reads and writes at 2.6 GB/s by 1 MiB, ahead of the block device
-(`kernelgen/copy.md`, `vpu_matmul.md`). A multiply's activations and
+(`kernels.md`, `vpu_matmul.md`). A multiply's activations and
 results up to 2 MiB now go that way (`pull_data`, `push_data`, and the
 pull inside a small request's dispatch); uploads and window-resident
 weights stay on the block device; `-m 0` puts everything back on it.

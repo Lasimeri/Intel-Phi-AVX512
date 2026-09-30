@@ -15,14 +15,11 @@ by hand.)
 
 `-c N` picks the card (else `$PHI_CARD`, else 0). Each card has its own
 host-memory window (`/dev/shm/phi-hostmem` for card 0, `phi-hostmem-N`
-for card N) and its own SSH forward (`127.0.0.1:2222+N`), so each runs
-its own worker, and the script reaches it over its own port with the
-pinned host key; no `~/.ssh/config` stanza is needed. OpenSSH 10 warns
-on every connection that does not use a post-quantum key exchange, which
-the card's dropbear lacks; the forward is loopback to the card over PCIe,
-so the script passes `WarnWeakCrypto=no-pq-kex` when the local ssh knows
-that option (checked with `ssh -G`; an older ssh would refuse it and the
-script then passes nothing). Needs the card up (`phi -c N status`); the
+for card N) and runs its own worker. Since 2026-09-30 the script reaches
+the card over the stack's control socket only (`phi -c N run`, `put`,
+`get`: the daemon's rpc ring across PCIe), so nothing here needs SSH,
+a forward or a key; `PHI` names the stack's `phi` script when it is not
+the one next to `PHI_STACK_ROOT`. Needs the card up (`phi -c N status`); the
 card's own toolchain (`cc` on its disk) only when the host has no stack
 cross toolchain and no other card is up (below, "Where the worker is
 built"). The worker lives in `/opt/phi/vpu` on the card
@@ -62,10 +59,10 @@ worker then falls back to 4 KiB pages for buffers that do not fit.
   refuses: run `phi -c N run swapoff /dev/phiblk1` first; `swapon` puts
   it back.
 - **`stop` uses `pkill -f 'phi-vpu-worke[r]'`.** The bracket class keeps
-  the pattern from matching the ssh command line that carries it, which
-  is what happens with the plain name and kills the ssh session instead
-  of the worker. The kill and the start are separate ssh calls for the
-  same reason: a `pkill` in the same command line as `./phi-vpu-worker`
+  the pattern from matching the shell command line that carries it,
+  which is what happens with the plain name and kills that shell instead
+  of the worker. The kill and the start are separate `phi run` calls for
+  the same reason: a `pkill` in the same command line as `./phi-vpu-worker`
   matches its own shell and nothing starts, while the host still sees the
   dead worker's readiness word (the driver now clears that word and waits
   for a live worker to re-assert it, so this fails in five seconds with a
@@ -74,9 +71,11 @@ worker then falls back to 4 KiB pages for buffers that do not fit.
 ## Backgrounding on the card
 
 `start` runs the worker under `setsid`, with its output to
-`worker.log`, and a `sleep 1` in the same ssh command. Without the sleep
-the ssh session closes before the process has detached and takes it
-along.
+`worker.log` and its input from `/dev/null`, and a `sleep 1` in the same
+command line. The card agent's exec relays the command's output until
+the command exits, so the worker's descriptors must not be the relay's
+(they are the log's), and the sleep lets it detach before the shell
+returns.
 
 ## Where the worker lives (2026-09-22)
 
@@ -100,7 +99,7 @@ buffers.
 
 `deploy` no longer builds on the card it deploys to unless it must. In
 order: on the host with the stack's cross toolchain (`toolchain/env.sh`
-puts `knc-cc` on PATH; the five sources (vpu_worker.c, vpu_exec.c, vpu_matmul.c, vpu_matmul_kernel.S and the examples' avx512_poly.S) compile in parallel and link
+puts `knc-cc` on PATH; the five sources (vpu_worker.c, vpu_exec.c, vpu_matmul.c, kernels.S and the examples' avx512_poly.S) compile in parallel and link
 statically, under a second, and the binary is pushed), else on another
 card that is up (`PHI_VPU_BUILD_CARD`, default the first other index;
 `build-here` is the verb it uses there, and the binary comes back

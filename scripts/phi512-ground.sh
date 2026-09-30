@@ -53,16 +53,16 @@ if ! diff -q card_kernel.S "$root/card/examples/avx512_poly.S" >/dev/null; then
 fi
 echo "   translated output matches the committed card/examples/avx512_poly.S"
 
-# OpenSSH 10 warns on stderr that the card's dropbear has no post-quantum
-# key exchange; card.out collects stderr, and its first line is reported,
-# so that warning is turned off where this ssh knows the option.
-nopq=()
-if ssh -G -o WarnWeakCrypto=no-pq-kex phi >/dev/null 2>&1; then
-    nopq=(-o WarnWeakCrypto=no-pq-kex)
-fi
-ssh "${nopq[@]}" -o ConnectTimeout=10 phi 'mkdir -p /tmp/ground' >/dev/null
-scp "${nopq[@]}" -O -q "$root/card/examples/avx512_poly.c" card_kernel.S x.bin coef.bin poly_expected.bin phi:/tmp/ground/
-if ssh "${nopq[@]}" phi 'cd /tmp/ground && cc -O2 -o poly avx512_poly.c card_kernel.S -lpthread && ./poly 65536 1' > card.out 2>&1; then
+# The card over the stack's control socket (`phi run`, `phi put`: the
+# daemon's rpc ring, no SSH), the card phi512.sh uses (PHI512_CARD, else 0).
+. "$here/stack.sh"
+PHI=${PHI:-$PHI_STACK_ROOT/scripts/phi.sh}
+card=${PHI512_CARD:-0}
+"$PHI" -c "$card" run mkdir -p /tmp/ground < /dev/null >/dev/null
+for f in "$root/card/examples/avx512_poly.c" card_kernel.S x.bin coef.bin poly_expected.bin; do
+    "$PHI" -c "$card" put "$f" "/tmp/ground/$(basename "$f")" < /dev/null >/dev/null 2>&1
+done
+if "$PHI" -c "$card" run sh -c 'cd /tmp/ground && cc -O2 -o poly avx512_poly.c card_kernel.S -lpthread && ./poly 65536 1' < /dev/null > card.out 2>&1; then
     echo "   $(head -1 card.out)"
 else
     echo "   ${red}FAILED on the card${off}"; cat card.out; exit 1

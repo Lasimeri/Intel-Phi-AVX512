@@ -24,28 +24,28 @@ set -- "${PHI_ARGS[@]}"
 dir=${PHI_VPU_DIR:-/opt/phi/vpu}
 threads_default=114   # two threads on each of the 57 cores (card/vpu/vpu_worker.md, "Two threads per core")
 
-# The card over its own SSH forward, with the pinned host key: every card
-# boots the same image and presents the same key, so one alias covers all.
-# The forward is loopback to the card over PCIe and the card's dropbear has
-# no post-quantum key exchange, so OpenSSH 10's warning about that is
-# turned off where this ssh knows the option (an older one would refuse it).
-nopq=()
-if ssh -G -o WarnWeakCrypto=no-pq-kex phi >/dev/null 2>&1; then
-    nopq=(-o WarnWeakCrypto=no-pq-kex)
-fi
+# The card over the stack's control socket (`phi run`, `phi put`, `phi get`:
+# the daemon's rpc ring across PCIe, no network, no SSH). `ssh_` runs one
+# shell command line on the card and relays its output and exit status;
+# `put_` copies files into a directory there; `get_` brings one back.
+PHI=${PHI:-$PHI_STACK_ROOT/scripts/phi.sh}
 ssh_() {
-    ssh "${nopq[@]}" -o BatchMode=yes -o ConnectTimeout=10 -p "$PHI_PORT" -o IdentitiesOnly=yes -i "$HOME/.ssh/phi_ed25519" \
-        -o UserKnownHostsFile="$HOME/.ssh/known_hosts_phi" -o HostKeyAlias=phi -o StrictHostKeyChecking=accept-new \
-        root@127.0.0.1 "$@"
+    "$PHI" -c "$PHI_CARD" run sh -c "$*" < /dev/null
 }
-scp_() {
-    scp "${nopq[@]}" -O -q -P "$PHI_PORT" -o IdentitiesOnly=yes -i "$HOME/.ssh/phi_ed25519" \
-        -o UserKnownHostsFile="$HOME/.ssh/known_hosts_phi" -o HostKeyAlias=phi -o StrictHostKeyChecking=accept-new "$@"
+put_() {
+    local dst=$1 f
+    shift
+    for f in "$@"; do
+        "$PHI" -c "$PHI_CARD" put "$f" "$dst/$(basename "$f")" < /dev/null
+    done
+}
+get_() {
+    "$PHI" -c "${3:-$PHI_CARD}" get "$1" "$2" < /dev/null
 }
 
-# The worker's name inside a bracket class, so that pgrep -f over ssh does
-# not match the ssh command line that carries the pattern itself. A plain
-# `pkill -f phi-vpu-worker` kills the ssh session it is typed into.
+# The worker's name inside a bracket class, so that pgrep -f does not match
+# the shell that carries the pattern itself. A plain `pkill -f
+# phi-vpu-worker` kills that shell too.
 pat='phi-vpu-worke[r]'
 
 running() { ssh_ "pgrep -f '$pat' >/dev/null"; }
@@ -78,10 +78,10 @@ cmd=${1:-}; shift || true
 case "$cmd" in
     deploy)
         ssh_ "mkdir -p '$dir'"
-        scp_ "$root/card/vpu/vpu_proto.h" "$root/card/vpu/vpu_exec.h" "$root/card/vpu/vpu_exec_regs.h" \
+        put_ "$dir" "$root/card/vpu/vpu_proto.h" "$root/card/vpu/vpu_exec.h" "$root/card/vpu/vpu_exec_regs.h" \
             "$root/card/vpu/vpu_worker.c" "$root/card/vpu/vpu_exec.c" "$root/card/vpu/build.sh" \
-            "$root/card/vpu/vpu_matmul.h" "$root/card/vpu/vpu_matmul.c" "$root/card/vpu/vpu_matmul_kernel.S" \
-            "$root/card/examples/avx512_poly.S" "root@127.0.0.1:$dir/"
+            "$root/card/vpu/vpu_matmul.h" "$root/card/vpu/vpu_matmul.c" "$root/card/vpu/kernels.S" "$root/card/vpu/mvex.inc" \
+            "$root/card/examples/avx512_poly.S"
         # Built on the host with the stack's cross toolchain when it is there
         # (the files in parallel, under a second), else on another card that
         # is up (PHI_VPU_BUILD_CARD, default: the other one), else on this
@@ -96,11 +96,11 @@ case "$cmd" in
                 knc-cc -O2 -I. -c vpu_exec.c -o "$work/vpu_exec.o" &
                 knc-cc -O2 -I. -c ../examples/avx512_poly.S -o "$work/avx512_poly.o" &
                 knc-cc -O2 -I. -c vpu_matmul.c -o "$work/vpu_matmul.o" &
-                knc-cc -O2 -I. -c vpu_matmul_kernel.S -o "$work/vpu_matmul_kernel.o" &
+                knc-cc -O2 -I. -c kernels.S -o "$work/kernels.o" &
                 wait
-                knc-cc -static -o "$work/phi-vpu-worker" "$work/vpu_worker.o" "$work/vpu_exec.o" "$work/avx512_poly.o" "$work/vpu_matmul.o" "$work/vpu_matmul_kernel.o" -lpthread
+                knc-cc -static -o "$work/phi-vpu-worker" "$work/vpu_worker.o" "$work/vpu_exec.o" "$work/avx512_poly.o" "$work/vpu_matmul.o" "$work/kernels.o" -lpthread
             ) 2>"$work/build.log"; then
-                scp_ "$work/phi-vpu-worker" "root@127.0.0.1:$dir/phi-vpu-worker.new"
+                "$PHI" -c "$PHI_CARD" put "$work/phi-vpu-worker" "$dir/phi-vpu-worker.new" < /dev/null
                 ssh_ "mv -f '$dir/phi-vpu-worker.new' '$dir/phi-vpu-worker'"
                 echo "built on the host ($(nproc) cores), pushed to card $PHI_CARD"
                 built=host
@@ -118,11 +118,8 @@ case "$cmd" in
             if [ -n "$other" ] && "$0" -c "$other" build-here "$dir" 2>/dev/null; then
                 # The binary from the other card, through the host.
                 work=$(mktemp -d)
-                PHI_PORT_OTHER=$((2222 + other))
-                scp "${nopq[@]}" -O -q -P "$PHI_PORT_OTHER" -o IdentitiesOnly=yes -i "$HOME/.ssh/phi_ed25519" \
-                    -o UserKnownHostsFile="$HOME/.ssh/known_hosts_phi" -o HostKeyAlias=phi -o StrictHostKeyChecking=accept-new \
-                    "root@127.0.0.1:$dir/phi-vpu-worker" "$work/phi-vpu-worker"
-                scp_ "$work/phi-vpu-worker" "root@127.0.0.1:$dir/phi-vpu-worker.new"
+                get_ "$dir/phi-vpu-worker" "$work/phi-vpu-worker" "$other"
+                "$PHI" -c "$PHI_CARD" put "$work/phi-vpu-worker" "$dir/phi-vpu-worker.new" < /dev/null
                 ssh_ "mv -f '$dir/phi-vpu-worker.new' '$dir/phi-vpu-worker'"
                 rm -rf "$work"
                 echo "built on card $other, pushed to card $PHI_CARD"
@@ -140,10 +137,10 @@ case "$cmd" in
         # another card).
         d=${1:-$dir}
         ssh_ "mkdir -p '$d'"
-        scp_ "$root/card/vpu/vpu_proto.h" "$root/card/vpu/vpu_exec.h" "$root/card/vpu/vpu_exec_regs.h" \
+        put_ "$d" "$root/card/vpu/vpu_proto.h" "$root/card/vpu/vpu_exec.h" "$root/card/vpu/vpu_exec_regs.h" \
             "$root/card/vpu/vpu_worker.c" "$root/card/vpu/vpu_exec.c" "$root/card/vpu/build.sh" \
-            "$root/card/vpu/vpu_matmul.h" "$root/card/vpu/vpu_matmul.c" "$root/card/vpu/vpu_matmul_kernel.S" \
-            "$root/card/examples/avx512_poly.S" "root@127.0.0.1:$d/"
+            "$root/card/vpu/vpu_matmul.h" "$root/card/vpu/vpu_matmul.c" "$root/card/vpu/kernels.S" "$root/card/vpu/mvex.inc" \
+            "$root/card/examples/avx512_poly.S"
         ssh_ "cd '$d' && PATH=/opt/phi/bin:\$PATH sh build.sh"
         ;;
     start)

@@ -13,7 +13,7 @@ stays with the host and this table does not apply to it):
 | who | rows | how |
 | --- | --- | --- |
 | the host | the first `r0`, and at prompt sizes the gaps below | ggml's own CPU kernels on a private CPU backend (the C glue), started after the cards |
-| each card | a share of the top rows, resident in its memory | uploaded once (`plan`), then `K_MATMUL` on the card's threads with the kernels of `card/vpu/vpu_matmul_kernel.S` |
+| each card | a share of the top rows, resident in its memory | uploaded once (`plan`), then `K_MATMUL` on the card's threads with the kernels of `card/vpu/kernels.S` |
 
 The three calls of one multiply are `phi_ggml_begin` (plan and upload
 the weight's shares on first sight; copy the activations into each

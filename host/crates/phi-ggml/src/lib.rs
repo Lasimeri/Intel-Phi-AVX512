@@ -6,7 +6,7 @@
 //! first rows and computes them with ggml's own CPU kernels (the C glue,
 //! on a private CPU backend), each card keeps a share of the rows resident
 //! in its memory (uploaded once, by identity) and computes them with the
-//! kernels of `card/vpu/vpu_matmul_kernel.S` while the host works, then
+//! kernels of `card/vpu/kernels.S` while the host works, then
 //! the results are gathered. This is the card as a GPU for AVX-512 that
 //! pulls weight bandwidth and arithmetic beside the CPU instead of after
 //! it (`docs/results/2026-09-23-quantized-kernels.md` has the rates that
@@ -521,7 +521,7 @@ const PP_WINDOW: u32 = 8;
 
 /// Write `n` floats as float16 into the card's window. The card's
 /// memory operands up-convert `{float16}` for no instruction
-/// (`kernelgen/quant.md`), so this halves what crosses the link and
+/// (`kernels.md`), so this halves what crosses the link and
 /// halves the activation bytes a core reads per call, which is worth 11
 /// percent at eight columns and 16 at sixty-four
 /// (`docs/results/2026-09-23-mixture-of-experts.md`). It is also more

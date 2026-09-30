@@ -28,13 +28,10 @@ also refuses to run if the translator's output differs from the
 committed `card/examples/avx512_poly.S`, because then it would be testing
 something other than what ships.
 
-Needs the card up and reachable as `ssh phi`, the card's worker deployed
-(`scripts/phi-vpu.sh deploy`, for leg 2), the host workspace built
-(`make build`: `host/target/debug/avx512-xlate`), `tcc` and `gcc` on the
-host, and the card's own `cc` (leg 3 compiles there).
-
-The card's dropbear has no post-quantum key exchange, and OpenSSH 10
-warns about that on stderr, which the script collects into the card's
-output and reports the first line of; so `ssh` and `scp` get
-`-o WarnWeakCrypto=no-pq-kex` where this host's ssh knows the option
-(an older one would refuse it), as `phi-vpu.sh` does.
+Needs the card up (`phi -c N status`; `PHI512_CARD` picks it, else card
+0), the card's worker deployed (`scripts/phi-vpu.sh deploy`, for leg 2),
+the host workspace built (`make build`: `host/target/debug/avx512-xlate`),
+`tcc` and `gcc` on the host, and the card's own `cc` (leg 3 compiles
+there). Since 2026-09-30 leg 3 reaches the card over the stack's control
+socket (`phi run`, `phi put`, found through `scripts/stack.sh`), not SSH,
+as `phi-vpu.sh` does.

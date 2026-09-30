@@ -3,7 +3,7 @@
  * id in the card's memory), then each MUL_MAT of the model is one MATMUL
  * request and each MUL_MAT_ID a MATMUL_ID one (a mixture of experts, one
  * matrix per column): d[n][m] = a[m][k] . b[n][k]. The rows of a are
- * split across the threads; each dot product is a kernel of vpu_matmul_kernel.S (the
+ * split across the threads; each dot product is a kernel of kernels.S (the
  * card's 16-lane fused multiply-adds), whose 16 partial sums are added
  * here.
  *
@@ -40,11 +40,11 @@ void phi_dot4_f16(const void *a, const float *b, long k16, float *out, uint64_t 
 void phi_dot4_f32(const void *a, const float *b, long k16, float *out, uint64_t nb);
 
 /* The quantized kernels: one superblock (256 weights) of a row against
- * 1, 4 or 8 activation rows (kernelgen/quant.md has the convention). */
+ * 1, 4 or 8 activation rows (kernels.md has the convention). */
 /* `rows` is the array of T activation rows, whose first entry is also
  * passed in `x`: a mixture's columns are grouped by the expert they
  * chose, and their rows are wherever those tokens are, not a stride
- * apart (kernelgen/quant.md). */
+ * apart (kernels.md). */
 typedef void (*qkern)(const uint8_t *blk, const void *x, const void *const *rows, float *scratch, float *acc, const float *consts, uint64_t next);
 #define QKONE(name) void name(const uint8_t *, const void *, const void *const *, float *, float *, const float *, uint64_t);
 #define QK(fmt) \
@@ -52,13 +52,13 @@ typedef void (*qkern)(const uint8_t *blk, const void *x, const void *const *rows
     QKONE(phi_##fmt##_1h) QKONE(phi_##fmt##_4h) QKONE(phi_##fmt##_8h)
 QK(q4k) QK(q5k) QK(q6k) QK(q8_0) QK(iq4xs)
 void phi_probe(const uint8_t *blk, const float *x, const float *consts, float *out);
-/* h = silu(g) * u over `count` vectors of 16 floats, all 64-byte aligned (kernelgen/glu.md) */
+/* h = silu(g) * u over `count` vectors of 16 floats, all 64-byte aligned (kernels.md) */
 void phi_swiglu(const float *g, const float *u, float *h, long count, const float *consts);
 /* the same, storing float16 (h advances 32 bytes a vector); and one vector of it under a lane mask */
 void phi_swiglu16(const float *g, const float *u, uint16_t *h, long count, const float *consts);
 void phi_swiglu16_edge(const float *g, const float *u, uint16_t *h, unsigned mask, const float *consts);
 void phi_swiglu_edge(const float *g, const float *u, float *h, unsigned mask, const float *consts);
-/* count 64-byte vectors from src to dst, whole-vector stores (kernelgen/copy.md) */
+/* count 64-byte vectors from src to dst, whole-vector stores (kernels.md) */
 void phi_copy64(void *dst, const void *src, long count);
 void phi_bench(long kind, const void *buf, long count);
 
@@ -83,7 +83,7 @@ static struct { struct mapping m; size_t cap; } g_groups, g_order;
 #define SLACK 64
 
 /* Transfers up to MAP_POOL_MAX go through the worker's mapping of the window in whole
- * 64-byte vectors instead of the block device (kernelgen/copy.md). The
+ * 64-byte vectors instead of the block device (kernels.md). The
  * mapping is uncached, so a 64-byte store is one transaction across the
  * link: 550 MB/s against 73 for memcpy, and a 16 KiB result in 29 us
  * against the block device's 94 us back to back, which is its best case
@@ -282,7 +282,7 @@ static float half_at(const uint8_t *p)
 /* ------------------------------------------------------------------ */
 /* The quantized formats' scalar side: the table per superblock         */
 
-/* The kernels' scratch (kernelgen/quant.rs, TAB_*): the superblock's 16
+/* The kernels' scratch (kernels.S, TAB_*): the superblock's 16
  * scales and 16 minuends, which the kernel itself decodes from the block
  * and writes here; and the constants every call shares (C_*, bytes):
  * 16, 4, 2, 2^-1..2^-8, the IQ4_XS values, the index and shift vectors
@@ -330,14 +330,14 @@ static void consts_init(void)
     put_u32(780, 0xc0);
     put_u32(784, 3);
     put_u32(788, 32);
-    /* the SwiGLU kernel's (kernelgen/glu.rs): -log2(e) and 1 */
+    /* the SwiGLU kernel's (kernels.S): -log2(e) and 1 */
     put_f32(832, -1.44269504088896340736f);
     put_f32(836, 1.0f);
 }
 
 /* Two sets of kernels per format: one that reads float32 activations and
  * one that reads float16 and up-converts them in the memory operand
- * itself, which costs no instruction (kernelgen/quant.md). The host
+ * itself, which costs no instruction (kernels.md). The host
  * chooses (`b_type`), and float16 halves both what crosses the link and
  * the activation bytes a core reads per call. */
 static const struct qfmt {
@@ -578,7 +578,7 @@ static void rows_range_q(const struct job *j, uint64_t i0, uint64_t i1, int mate
 }
 
 /* vprefetch1 [p]: the line into this core's L2 without waiting for it
- * (MVEX 62 f1 78 08 18 /2, as vpu_matmul_kernel.S writes it). The card has
+ * (MVEX 62 f1 78 08 18 /2, as kernels.S writes it). The card has
  * no SSE prefetch and the compiler drops __builtin_prefetch for it. */
 static inline void to_l2(const void *p)
 {

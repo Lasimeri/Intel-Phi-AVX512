@@ -3,7 +3,7 @@
  * tensors resident on the card (UPLOAD once, by id), then asks for whole
  * matrix multiplies (MATMUL): d[n][m] = a[m][k] . b[n][k], the rows of a
  * split across the pool, the dot products the AVX-512-derived kernels of
- * vpu_matmul_kernel.S. The descriptor lives in the control area at
+ * kernels.S. The descriptor lives in the control area at
  * VPU_OFF_MATMUL; the request's kernel field says which of the three.
  * Mirrored in host/crates/phi-vpu/src/proto.rs; tools/vpu-layout-check.c
  * checks. See vpu_matmul.md. */
@@ -20,15 +20,15 @@
 
 #define VPU_MM_F32 0
 #define VPU_MM_F16 1
-/* llama.cpp quantized formats (ggml-common.h), 256-weight superblocks; the kernels are phi_<fmt>_<rows> of vpu_matmul_kernel.S */
+/* llama.cpp quantized formats (ggml-common.h), 256-weight superblocks; the kernels are phi_<fmt>_<rows> of kernels.S */
 #define VPU_MM_Q4_K 2
 #define VPU_MM_Q5_K 3
 #define VPU_MM_Q6_K 4
 #define VPU_MM_Q8_0 5
 #define VPU_MM_IQ4_XS 6
 #define VPU_MM_TYPES 7
-#define VPU_MM_PROBE 99   /* diagnostic: phi_probe writes 8 vectors to d (kernelgen/quant.md) */
-#define VPU_MM_SWIGLU 98  /* diagnostic: d = silu(g) * u over m floats, g at b_off and u at b_off + nb_b, one thread (kernelgen/glu.md) */
+#define VPU_MM_PROBE 99   /* diagnostic: phi_probe writes 8 vectors to d (kernels.md) */
+#define VPU_MM_SWIGLU 98  /* diagnostic: d = silu(g) * u over m floats, g at b_off and u at b_off + nb_b, one thread (kernels.md) */
 
 struct vpu_matmul {
     uint64_t a_id;      /* UPLOAD: the id (nonzero); MATMUL: the cached tensor, or 0 for a in the window at a_off */

@@ -6,7 +6,7 @@ which one to use for what is a measurement, not a preference:
 
 | path | measured | used for |
 | --- | --- | --- |
-| `/dev/phihost`, mapped, uncached | 2.36 us doorbell round trip (2026-09-22); 11 MB/s reading and 73 MB/s writing a 16 KiB block by `memcpy` (2026-09-23); 64-byte vector copies split across the pool 2.6 GB/s by 1 MiB (`kernelgen/copy.md`) | control words; and, with the worker's `-m 1` (the default), a matrix multiply's activations and results up to 2 MiB (`MAP_POOL_MAX`) |
+| `/dev/phihost`, mapped, uncached | 2.36 us doorbell round trip (2026-09-22); 11 MB/s reading and 73 MB/s writing a 16 KiB block by `memcpy` (2026-09-23); 64-byte vector copies split across the pool 2.6 GB/s by 1 MiB (`kernels.md`) | control words; and, with the worker's `-m 1` (the default), a matrix multiply's activations and results up to 2 MiB (`MAP_POOL_MAX`) |
 | `/dev/phiblk1`, DMA block device | 1.2 GB/s at 16 MiB reads, 553 MB/s at 4 MiB, 184 MB/s at 1 MiB (2026-09-22); 109 us reading and 95 us writing 16 KiB, nearly all of it fixed cost (2026-09-23) | everything else: uploads, weights streamed from the window, larger transfers, the exec engine's pages |
 
 That the two paths address the same bytes at the same offsets was

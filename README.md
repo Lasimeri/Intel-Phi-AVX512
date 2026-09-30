@@ -119,8 +119,8 @@ mixture-of-experts one, with float16, float32 and llama.cpp's Q4_K,
 Q5_K, Q6_K, Q8_0 and IQ4_XS weights), and the backend shares each
 one by rows: every card keeps a share of the weight matrix resident and
 multiplies it on its 114 threads (two on each of its 57 cores) with the kernels of
-`card/vpu/vpu_matmul_kernel.S` (the quantized formats decoded on the
-vector unit, `host/crates/phi-vpu/src/bin/kernelgen/quant.md`), while
+`card/vpu/kernels.S` (the quantized formats decoded on the
+vector unit, `card/vpu/kernels.md`), while
 the host computes the rest with ggml's own CPU kernels; the results are
 gathered per multiply. A card is asked only when it would finish the
 multiply sooner: three rules decide that, one of them from what the

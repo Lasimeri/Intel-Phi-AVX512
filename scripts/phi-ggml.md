@@ -15,7 +15,7 @@ the CPU. `MUL_MAT_ID` is the mixture-of-experts multiply, which is where
 almost all of an MoE model's weights are. Each such multiply is shared
 by rows: every card keeps a share of the weight rows
 resident (uploaded once) and multiplies them on its 114 threads (two per core) with the
-kernels of `card/vpu/vpu_matmul_kernel.S` while the host computes its
+kernels of `card/vpu/kernels.S` while the host computes its
 own rows with ggml's CPU kernels; the results are gathered per multiply.
 
 This is the counterpart of `scripts/phi512.sh`, which intercepts a

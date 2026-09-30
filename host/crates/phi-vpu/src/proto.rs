@@ -366,7 +366,7 @@ pub struct Matmul {
     pub a_type: u32,
     /// The activations: 0 float32, 1 float16, which the card's memory
     /// operands up-convert at no cost and which halves what crosses the
-    /// link (`kernelgen/quant.md`).
+    /// link (`kernels.md`).
     pub b_type: u32,
     pub m: u64,
     pub n: u64,

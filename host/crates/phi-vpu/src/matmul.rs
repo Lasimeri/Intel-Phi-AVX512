@@ -1367,7 +1367,7 @@ fn check_ffn(
     Ok((took, wall))
 }
 
-/// The card's SwiGLU (`phi_swiglu`, kernelgen/glu.rs) against the host's
+/// The card's SwiGLU (`phi_swiglu`, kernels.S) against the host's
 /// own: `h = g / (1 + exp(-g)) * u` in float64 from the same float32
 /// inputs. Nothing on the card may be approximate before it is measured
 /// against the host (`docs/research/selection-under-a-slow-link.md`), and
@@ -1505,7 +1505,7 @@ pub fn check_swiglu(w: &Window, threads: u32) -> Result<[f64; 2]> {
     Ok(worst)
 }
 
-/// The instruction probe (`phi_probe`, kernelgen/quant.rs): bytes 0..255
+/// The instruction probe (`phi_probe`, kernels.S): bytes 0..255
 /// as the block, the floats 0..15 as `x`, print each stored vector.
 pub fn probe(w: &Window, threads: u32) -> Result<()> {
     let blk: Vec<u8> = (0..=255u8).collect();
@@ -1590,7 +1590,7 @@ pub fn probe(w: &Window, threads: u32) -> Result<()> {
             t(17) / 1e3 / 100.0,
             100.0 * 16384.0 / t(17) * 1e9 / 1e6
         );
-        // The same transfers as whole 64-byte vectors (kernelgen/copy.rs).
+        // The same transfers as whole 64-byte vectors (kernels.S).
         for (i, kib, what) in [
             (19, 4.0, "stores"),
             (20, 16.0, "stores"),

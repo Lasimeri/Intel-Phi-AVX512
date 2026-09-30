@@ -5,7 +5,7 @@ sh build.sh
 ```
 
 Compiles and links `phi-vpu-worker` from five sources: `vpu_worker.c`,
-`vpu_exec.c`, `vpu_matmul.c`, the generated `vpu_matmul_kernel.S`, and
+`vpu_exec.c`, `vpu_matmul.c`, the kernel file `kernels.S` (with `mvex.inc`), and
 the translated kernel `avx512_poly.S` (`cc -O2 -I<this directory> ...
 -lpthread`), using the card's own clang (`cc`). It runs on the card, not
 the host: the host's own compiler does not target Knights Corner.

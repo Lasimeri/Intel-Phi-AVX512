@@ -10,8 +10,9 @@
 - `matmul`: the card's matrix-multiply service, its requests and the
   check of it (`matmul.md`).
 
-The binaries: `phi-vpu` (`main.rs`: `status`, `poly`, `matmul-check`),
-the explicit driver and the service's check; `kernelgen`
-(`src/bin/kernelgen`), which writes the card's matrix kernels. The other
-users of the library: `libphi512` (`cards`, `proto`, `window`, for the
-seamless path) and `libggml_phi.so` (all four, host/crates/phi-ggml).
+The binary: `phi-vpu` (`main.rs`: `status`, `poly`, `matmul-check`),
+the explicit driver and the service's check. The card's matrix kernels
+are hand-maintained assembly since 2026-09-30 (`card/vpu/kernels.md`);
+the generator that wrote them (`kernelgen`) is gone. The other users of
+the library: `libphi512` (`cards`, `proto`, `window`, for the seamless
+path) and `libggml_phi.so` (all four, host/crates/phi-ggml).

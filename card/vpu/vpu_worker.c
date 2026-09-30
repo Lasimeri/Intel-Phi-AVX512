@@ -46,7 +46,7 @@
 
 /* Translated from AVX-512 by avx512-xlate; see card/examples/avx512_poly.S */
 void poly_kernel_x8(float *d, const float *x, const float *coef, long n);
-/* 64-byte vector copies (vpu_matmul_kernel.S, kernelgen/copy.rs): whole-line
+/* 64-byte vector copies (kernels.S, kernels.S): whole-line
  * loads from the uncached control area. */
 void phi_copy64(void *dst, const void *src, long count);
 

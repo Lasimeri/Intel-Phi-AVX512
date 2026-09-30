@@ -142,7 +142,7 @@ values (a sweep of g across both saturation points, specials, then
 typical values) against the host's float64, then the same through the
 ranged float32 and float16 paths with the lanes outside every range
 required untouched. The tolerance is the error budget, documented on the
-function and in `kernelgen/glu.md`.
+function and in `kernels.md`.
 
 Then `check_ffn` for five combinations of weight types (every quantized
 type in each of the three places at least once, as a model mixes them),
@@ -164,7 +164,7 @@ numbers are in `card/vpu/vpu_matmul.md`.
 doorbell `request` does (`ring_and_wait`).
 
 The probe's transport section also times the two things the card now
-moves data with (`kernelgen/copy.md`): 64-byte vector stores and loads
+moves data with (`kernels.md`): 64-byte vector stores and loads
 through the mapping on one thread at 4, 16 and 64 KiB, and the same
 split across the pool against the block device at 16 KiB, 64 KiB, 1 MiB
 and 4 MiB, each way. Those crossovers are the thresholds in
