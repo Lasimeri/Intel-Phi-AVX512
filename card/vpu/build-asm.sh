@@ -8,7 +8,7 @@
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
-sources=(worker text stubs matmul rows kernels)
+sources=(worker text exec matmul rows kernels)
 
 link() {
     local out=$1 obj

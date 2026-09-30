@@ -127,6 +127,31 @@ w_hex:
 	popq %rbx
 	ret
 
+# w_hexn: append rdi as hexadecimal without leading zeros ("0" for zero):
+# C's %llx.
+	.globl w_hexn
+w_hexn:
+	movl $1, %ecx
+	movq %rdi, %rax
+1:	shrq $4, %rax
+	jz 2f
+	incl %ecx
+	jmp 1b
+2:	jmp w_hex
+
+# w_hex0x: "0x" then the digits, or "0" alone for zero: C's %#llx.
+	.globl w_hex0x
+w_hex0x:
+	testq %rdi, %rdi
+	jz w_hexn
+	pushq %rdi
+	movb $'0', %al
+	call w_byte
+	movb $'x', %al
+	call w_byte
+	popq %rdi
+	jmp w_hexn
+
 # w_ms: append rdi nanoseconds as milliseconds with three decimals
 # ("1.234"), the C worker's %.3f of ns / 1e6, rounded to nearest.
 	.globl w_ms

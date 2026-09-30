@@ -26,7 +26,8 @@ trace:	.skip 4
 trace_every:	.skip 4
 spin_ns:	.skip 8
 idle_us:	.skip 8
-exec_pages:	.skip 4
+	.globl exec_pages
+exec_pages:	.skip 4			# -e: huge pages the exec engine pools (exec.S reads it)
 	.globl map_small
 map_small:	.skip 4
 nthreads:	.skip 4			# pool threads; the dispatcher is one more

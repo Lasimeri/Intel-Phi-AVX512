@@ -73,6 +73,72 @@
 	.set REGS_RFLAGS, 2240
 	.set REGS_RIP, 2248
 	.set EXEC_BYTES, 256 + 2256 + 512 + 1536
+# struct vpu_exec: the phase (in), the reply (out), the register file, the
+# code page addresses, the ranges.
+	.set EX_REGION_ID, 0
+	.set EX_MODE, 8
+	.set EX_FLAGS, 12
+	.set EX_CODE_ADDR, 16
+	.set EX_THUNK_ADDR, 24
+	.set EX_THUNK_LEN, 32
+	.set EX_REGION_LO, 40
+	.set EX_REGION_HI, 48
+	.set EX_ENTRY, 56
+	.set EX_CODE_PAGES, 64
+	.set EX_NRANGES, 68
+	.set EX_THREADS, 72
+	.set EX_IND_REG, 76
+	.set EX_BOUND_REG, 80
+	.set EX_STEP, 88
+	.set EX_IND_START, 96
+	.set EX_IND_END, 104
+	.set EX_LOOP_EXIT, 112
+	.set EX_RESERVED, 120
+	.set EX_EXIT_RIP, 152
+	.set EX_FAULT_ADDR, 160
+	.set EX_EXIT_KIND, 168
+	.set EX_EXIT_THREAD, 172
+	.set EX_CHUNKS, 176
+	.set EX_DIRTY, 180
+	.set EX_FAULTS, 184
+	.set EX_THREADS_RAN, 188
+	.set EX_FETCH_NS, 192
+	.set EX_WB_NS, 200
+	.set EX_RUN_NS, 208
+	.set EX_REGS, 256
+	.set EX_CODE_PAGE, 2512
+	.set EX_RANGES, 3024
+	.set RANGE_ADDR, 0
+	.set RANGE_LEN, 8
+	.set RANGE_FLAGS, 16
+	.set RANGE_BYTES, 24
+	.set RANGE_WRITE, 1
+	.set RANGE_DENSE, 2
+	.set MODE_DEMAND, 0
+	.set MODE_RANGES, 1
+	.set EXEC_FINAL, 1
+	.set EXEC_FIRST, 2
+	.set EXIT_LEFT, 0
+	.set EXIT_FAULT, 1
+	.set EXIT_ILLEGAL, 2
+	.set EXIT_COLLISION, 3
+	.set EXIT_LIMIT, 4
+	.set EXIT_SPLIT, 5
+# struct vpu_mail (48 bytes) and the write-back slot's page table.
+	.set MAIL_SEQ, 0
+	.set MAIL_ADDR, 8
+	.set MAIL_LEN, 16
+	.set MAIL_KIND, 24
+	.set MAIL_SLOT, 28
+	.set MAIL_ACK, 32
+	.set MAIL_STATUS, 40
+	.set MAIL_FETCH, 0
+	.set MAIL_WRITEBACK, 1
+	.set WB_ADDR, 0
+	.set WB_LINES, 8
+	.set WB_PAGE_BYTES, 16
+	.set WB_TABLE, 65536
+	.set WB_MAX_PAGES, (EXEC_CHUNK - WB_TABLE) / 4096
 
 # The matrix service (vpu_matmul.h): the descriptors and their fields.
 	.set OFF_MATMUL, 13312

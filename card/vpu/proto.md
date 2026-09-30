@@ -10,6 +10,12 @@ numbers; `tools/vpu-layout-check.c` (`make layout-check`) compares the
 three, so a field moved in one place fails the check rather than
 shifting silently.
 
+The seamless path's constants name every field of `struct vpu_exec`
+(`EX_*`), `struct vpu_range` (`RANGE_*`), `struct vpu_mail` (`MAIL_*`)
+and `struct vpu_wb_page` (`WB_*`), the modes, the phase flags and the
+exit kinds, in the header's order; `exec.S` reads and writes the
+descriptor through them.
+
 `MAGIC` (`VPU_MAGIC`, "VPU_READ") is given as its two 32-bit halves
 because an assembler immediate is at most 32 bits in a store; the worker
 writes the word as a register.

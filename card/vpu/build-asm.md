@@ -5,11 +5,14 @@ card/vpu/build-asm.sh              # assemble, link, audit; host/asm/out/phi-vpu
 card/vpu/build-asm.sh --out DIR    # the binary into DIR, nothing else
 ```
 
-Assembles `worker.S`, `text.S`, `stubs.S` (until `matmul.S` and `exec.S`
-replace it) and `kernels.S` with GNU `as --64` (`-I card/vpu` for
-`defs.inc`, `proto.inc`, `mvex.inc`), the translated polynomial kernel
-`card/examples/avx512_poly.S` as it is, and links them static with `ld`
-(`-nostdlib -e _start -z noexecstack -s`): the card is an x86-64 core, so
+Assembles `worker.S`, `text.S`, `exec.S`, `matmul.S`, `rows.S` and
+`kernels.S` with GNU `as --64` (`-I card/vpu` for `defs.inc`,
+`proto.inc`, `mvex.inc`), the translated polynomial kernel
+`card/examples/avx512_poly.S` with its `//` comments stripped into a
+copy (GNU `as` does not take them), and links them static with `ld`
+(`-nostdlib -e _start -z noexecstack`; the symbols are kept while the
+port lasts, so a card's `dmesg` address maps to a routine with `nm`):
+the card is an x86-64 core, so
 the host's binutils produce its binary, and the worker has no libc, so
 nothing of musl is needed. The stack's `phi-isa-audit` then decodes every
 instruction of the binary and refuses SSE, `cmov` and the rest of what

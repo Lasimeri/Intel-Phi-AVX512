@@ -2,8 +2,10 @@
 
 The worker's text: one line buffer (`LINECAP` bytes) filled by
 `l_begin`, `w_byte`, `w_str`, `w_bytes`, `w_dec`, `w_sdec`, `w_hex` (`cl`
-digits) and `w_ms` (nanoseconds as milliseconds with three decimals,
-the C worker's `%.3f` of `ns / 1e6`), then written whole by `l_end`
+digits), `w_hexn` (no leading zeros, C's `%llx`), `w_hex0x` (`0x` and the
+digits, or `0` alone, C's `%#llx`) and `w_ms` (nanoseconds as
+milliseconds with three decimals, the C worker's `%.3f` of `ns / 1e6`),
+then written whole by `l_end`
 (descriptor in `edi`: 1 is the worker's log, 2 the console it was
 started from). `say` writes one string as a line; `die` and `die_os`
 write a message (the latter with the negated errno) to standard error
