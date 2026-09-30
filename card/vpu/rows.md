@@ -30,11 +30,20 @@ exactly.
   runs (`vprefetch1`: the card's cores are in order and every cold line
   costs its whole miss); the table and the activation rows are the same
   lines for every core, so each starts on a different line of them.
-- `copy_share`, `fused_setup`: a small request's activations copied
-  inside its compute dispatch by the first cores' threads (at least
-  `PULL_LINES` lines each: a row copied a line or two per core and then
-  read by all 57 was seven times slower than one written by one core),
-  counted so the others can wait for the last copy.
+- `copy_share`, `fused_setup`, `copy64_nt`: a small request's
+  activations copied inside its compute dispatch by the first cores'
+  threads (at least `PULL_LINES` lines each: a row copied a line or two
+  per core and then read by all 57 was seven times slower than one
+  written by one core), counted so the others can wait for the last
+  copy. The copy's stores are the no-read, non-globally-ordered kind
+  (`vmovnrngoaps`, ordered by the locked add that counts the copy): a
+  plain store leaves the line dirty in the copying core's L2, from where
+  fifty-six readers then take it one at a time, and the request is slow
+  or fast by whether the lines happened to be written back before the
+  readers came (below, "The slow mode").
+- `vpu_phase`: each slice's clock after the copy wait, after the
+  activation warm-up and after its rows, for the `phases` line the
+  matrix service prints at `-v -v` (`matmul.md`).
 - `rows_range_q`: rows `i0..i1` of one quantized matrix by every group:
   chunks of `ROW_CHUNK` rows; the groups outermost so their activation
   rows are read from L2 for every weight row of the chunk; the
@@ -74,8 +83,30 @@ them (`kernels.md`). `rows_range_q` keeps its frame (the accumulators,
 the scratch table, the row pointers, its variables) 64-byte aligned
 below `rbp`, which is not the standard frame pointer here but the
 aligned base, with the pre-alignment stack pointer saved in the frame.
+Its row loop carries the superblock pointer and the accumulator pointer
+in registers the kernels keep (`r14`, `r15`, the count in `r13`) and
+adds the row stride to them; the first version recomputed both with
+three multiplies and a dozen frame accesses per kernel call, which on
+this in-order core was about 100 ns on top of a 280 ns kernel (the
+2048-row mixture shape: 1.03 ms against the C's 0.90, now 0.86).
 `run_pieces` takes its last two arguments on the stack as the C did.
 Everything is written for the card's scalar core: no SSE, no `cmov`.
+
+## The slow mode (2026-09-30)
+
+With the C worker's plain stores in the fused copy, the one-row mixture
+shape (128 x 2048, eight experts) computed in 95 us at best but 190 us at
+the median, where the C worker's median was 105 to 165 us; the per-slice
+phases showed every thread's row loop three to four times slower in the
+slow requests, with no dependence on which experts were drawn, and the
+mode absent with `-m 0` (the activations arriving by DMA into memory).
+The activation row is written by the eight copying threads and read by
+every other core right after: a line dirty in a copier's L2 is served
+from there, one reader at a time, and whether the request is slow is
+whether those lines were still dirty when the readers came. The no-read
+stores leave nothing in the copier's L2; the median fell to 93 us over
+two restarts (270 of 300 requests under 100 us), the best unchanged.
+The C worker has the same exposure with a different luck of timing.
 
 ## Gates
 

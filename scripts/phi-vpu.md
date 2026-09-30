@@ -1,7 +1,7 @@
 # phi-vpu.sh: put the co-processor worker on the card and drive it
 
 ```
-scripts/phi-vpu.sh [-c N] deploy        build the worker (host cross toolchain, else another card, else this card) and put it on the card
+scripts/phi-vpu.sh [-c N] deploy        build the worker on the host (GNU as and ld, audited) and put it on the card
 scripts/phi-vpu.sh [-c N] start [T]     start the worker with T threads (default 114, two per core)
 scripts/phi-vpu.sh [-c N] stop          stop the worker and release the huge pages
 scripts/phi-vpu.sh [-c N] status        worker process on the card, control words on the host
@@ -10,19 +10,15 @@ scripts/phi-vpu.sh [-c N] config        the huge pages reserved and the running 
 scripts/phi-vpu.sh [-c N] poly [args]   run the host driver; deploys and starts first if needed
 ```
 
-(`build-here DIR` is the verb `deploy` runs on another card; not for use
-by hand.)
-
 `-c N` picks the card (else `$PHI_CARD`, else 0). Each card has its own
 host-memory window (`/dev/shm/phi-hostmem` for card 0, `phi-hostmem-N`
 for card N) and runs its own worker. Since 2026-09-30 the script reaches
 the card over the stack's control socket only (`phi -c N run`, `put`,
 `get`: the daemon's rpc ring across PCIe), so nothing here needs SSH,
 a forward or a key; `PHI` names the stack's `phi` script when it is not
-the one next to `PHI_STACK_ROOT`. Needs the card up (`phi -c N status`); the
-card's own toolchain (`cc` on its disk) only when the host has no stack
-cross toolchain and no other card is up (below, "Where the worker is
-built"). The worker lives in `/opt/phi/vpu` on the card
+the one next to `PHI_STACK_ROOT`. Needs the card up (`phi -c N status`)
+and, for `deploy`, the stack built (its `phi-isa-audit` audits the
+binary, `card/vpu/build.md`). The worker lives in `/opt/phi/vpu` on the card
 (`PHI_VPU_DIR` to change), which is on the card's persistent disk, so a
 deployed worker survives a reboot and only `start` is needed afterwards.
 
@@ -82,9 +78,8 @@ returns.
 `/opt/phi/vpu` on the card, inside the `/opt/phi` bind mount of the
 persistent disk (`PHI_VPU_DIR` to change). The earlier `/opt/phi-vpu` was
 in the initramfs and vanished at every reboot; `poly` redeployed it
-silently, which is how nobody noticed. The worker now also carries the
-seamless path's exec engine (`card/vpu/vpu_exec.c`), so a deploy copies
-those sources too.
+silently, which is how nobody noticed. The worker also carries the
+seamless path's exec engine (`card/vpu/exec.S`), in the one binary.
 
 ## Swap, and the pool (2026-09-22 evening)
 
@@ -95,18 +90,15 @@ path's engine pools 256 of them at start (512 MiB of the program mapped
 at once, moved into place with `mremap`), the rest are the worker's
 buffers.
 
-## Where the worker is built (2026-09-22 night)
+## Where the worker is built (2026-09-30)
 
-`deploy` no longer builds on the card it deploys to unless it must. In
-order: on the host with the stack's cross toolchain (`toolchain/env.sh`
-puts `knc-cc` on PATH; the five sources (vpu_worker.c, vpu_exec.c, vpu_matmul.c, kernels.S and the examples' avx512_poly.S) compile in parallel and link
-statically, under a second, and the binary is pushed), else on another
-card that is up (`PHI_VPU_BUILD_CARD`, default the first other index;
-`build-here` is the verb it uses there, and the binary comes back
-through the host), else on the card itself with `build.sh`, which
-builds alone and slowly while the card serves. The host build must be
-static: the cross toolchain's default is a dynamic executable wanting
-`/lib/ld-musl-x86_64.so.1`, which the card does not have.
+`deploy` runs `card/vpu/build.sh` on the host (GNU `as` and `ld`, the
+stack's `phi-isa-audit`; the worker is assembly with no libc, so the
+host's binutils produce the card's static binary) and puts the binary on
+the card. Nothing compiles on a card any more. Before the port
+(2026-09-22 to 2026-09-30) the C worker was cross-compiled with the
+stack's `knc-cc`, else built on another card (`build-here`), else on the
+card itself, which built alone and slowly while it served.
 
 `start` stops a running worker first and waits until it is gone (up to
 10 s) before it asks for huge pages: the old worker's uploads hold huge

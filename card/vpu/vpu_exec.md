@@ -1,5 +1,11 @@
 # vpu_exec.c and vpu_exec.h: the seamless path, card side
 
+**The C this documents was replaced by the assembly worker on 2026-09-30**
+(`worker.S`, `exec.S`, `matmul.S` and `rows.S`, their `.md` siblings);
+the design, the measurements and the defects recorded here stand, and
+the assembly keeps every mechanism named. The C files are in the history
+before commit `6484cf0`.
+
 The host program never asked for anything: it executed an AVX-512
 instruction, the host CPU refused it, and `libphi512`'s handler
 (`host/crates/phi512/src/offload.md`) sent a phase of the region around
@@ -124,7 +130,7 @@ dot product's loop is a reduction, so it runs on one thread (66 ms at
 16 M) and stays bit-identical. Every lane of every kernel at every size
 matched the host's own FMA3 hardware. `docs/results/2026-09-22-seamless-card.md`.
 
-`vpu_exec_regs.h` holds the register load and store sequences, the same
+`vpu_exec_regs.h` held the register load and store sequences (until 2026-09-30; `exec.S` assembles them from `mvex.inc`), the same
 byte strings as the card kernel's `asm/knc_vpu.h`; regenerate with:
 
 ```

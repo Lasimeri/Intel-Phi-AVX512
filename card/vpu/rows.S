@@ -509,6 +509,22 @@ warm_slice:
 # ---- the fused pull: a small request's activations copied inside its
 # compute dispatch by the first cores' threads ----
 
+# copy64_nt: rdx 64-byte vectors from rsi to rdi with no-read stores that
+# leave no copy in this core's L2 (vmovnrngoaps): the lines go to memory,
+# where every other core reads them, instead of being served one by one
+# from this core's cache to fifty-six readers. The caller's locked add
+# orders them before its count.
+copy64_nt:
+	testq %rdx, %rdx
+	jz 2f
+1:	VMOVAPS zmm0, rsi, 0
+	VMOVNRNGOAPS_ST rdi, 0, zmm0
+	addq $64, %rsi
+	addq $64, %rdi
+	decq %rdx
+	jnz 1b
+2:	ret
+
 # copy_share: this thread's share (slice esi of edx) of the fused pull rdi:
 # its core's part of the lines, split between the core's threads, then
 # counted; the copy that completes the count notes the time.
@@ -577,7 +593,7 @@ copy_share:
 	addq %rax, %rsi
 	movq %r11, %rdx
 	subq %r10, %rdx
-	call phi_copy64
+	call copy64_nt
 2:	movl $1, %eax
 	lock xaddl %eax, FU_COPIED(%rbx)	# locked: the copy is visible before the count
 	incl %eax
@@ -695,7 +711,14 @@ half_to_float:
 	.set RQ_A, RQ_FMT + 104
 	.set RQ_Q, RQ_FMT + 112
 	.set RQ_SP, RQ_FMT + 120
-	.set RQ_FRAME, RQ_FMT + 128
+	.set RQ_I1, RQ_FMT + 128
+	.set RQ_MATE, RQ_FMT + 136
+	.set RQ_NMATES, RQ_FMT + 144
+	.set RQ_STRIDE, RQ_FMT + 152		# rstep * nb_a: the next row's distance, the kernels' seventh argument
+	.set RQ_TSTEP, RQ_FMT + 160		# T vectors: a row's accumulators
+	.set RQ_MINE, RQ_FMT + 168		# the rows this thread takes of the chunk
+	.set RQ_BASE0, RQ_FMT + 176		# the first of them, in the group's matrix
+	.set RQ_FRAME, RQ_FMT + 192
 
 # rows_range_q: rows rsi..rdx of the job rdi, shared with r8d threads on
 # the same core as ecx (slice_rows): chunks of ROW_CHUNK rows; within a
@@ -719,9 +742,11 @@ rows_range_q:
 	movq %rax, RQ_SP(%rbp)
 	movq %rdi, %rbx				# j
 	movq %rsi, %r12				# i
-	movq %rdx, %r13				# i1
-	movl %ecx, %r14d			# mate
-	movl %r8d, %r15d			# nmates
+	movq %rdx, RQ_I1(%rbp)
+	movl %ecx, %ecx
+	movq %rcx, RQ_MATE(%rbp)
+	movl %r8d, %r8d
+	movq %r8, RQ_NMATES(%rbp)
 	movl MJ_TYPE(%rbx), %eax
 	shlq $6, %rax
 	leaq g_fmt(%rip), %rcx
@@ -733,9 +758,9 @@ rows_range_q:
 	movq MJ_K(%rbx), %rax
 	andq $255, %rax
 	movq %rax, RQ_TAIL(%rbp)
-1:	cmpq %r13, %r12
+1:	cmpq RQ_I1(%rbp), %r12
 	jae 99f
-	movq %r13, %rax				# rows = min(i1 - i, chunk)
+	movq RQ_I1(%rbp), %rax			# rows = min(i1 - i, chunk)
 	subq %r12, %rax
 	movl MJ_CHUNK(%rbx), %ecx
 	cmpq %rcx, %rax
@@ -751,15 +776,15 @@ rows_range_q:
 	movq %rax, RQ_G(%rbp)
 	movl G_N(%rax), %r9d			# T
 	xorl %r10d, %r10d			# c0
-	movl %r14d, %r11d			# r0 = mate
-	movl %r15d, %r8d			# rstep = nmates
-	cmpl $2, %r15d
+	movq RQ_MATE(%rbp), %r11		# r0 = mate
+	movq RQ_NMATES(%rbp), %r8		# rstep = nmates
+	cmpl $2, %r8d
 	jne 4f
 	cmpl $8, %r9d
 	jne 4f
 	# two threads on a core divide an eight-column group by columns
 	movl $4, %r9d
-	movl %r14d, %r10d
+	movl %r11d, %r10d
 	shll $2, %r10d
 	xorl %r11d, %r11d
 	movl $1, %r8d
@@ -788,13 +813,28 @@ rows_range_q:
 	incl %esi
 	addq RQ_RSTEP(%rbp), %rcx
 	jmp 7b
-8:	movl %esi, %eax
-	imull RQ_T(%rbp), %eax
-	shll $6, %eax
+8:	movl %esi, %esi
+	movq %rsi, RQ_MINE(%rbp)
+	movq RQ_T(%rbp), %rax
+	shlq $6, %rax
+	movq %rax, RQ_TSTEP(%rbp)
+	imulq %rsi, %rax
+	shrq $3, %rax
 	leaq RQ_ACC(%rbp), %rdi
-	movl %eax, %ecx
+	movq %rax, %rcx
 	xorl %eax, %eax
-	rep stosb
+	rep stosq
+	# the loop's constants: the next row's distance (the kernels' seventh
+	# argument) and this thread's first row of the group's matrix
+	movq RQ_RSTEP(%rbp), %rax
+	imulq MJ_NB_A(%rbx), %rax
+	movq %rax, RQ_STRIDE(%rbp)
+	movq RQ_R0(%rbp), %rax
+	addq %r12, %rax
+	imulq MJ_NB_A(%rbx), %rax
+	movq RQ_G(%rbp), %rdx
+	addq G_A(%rdx), %rax
+	movq %rax, RQ_BASE0(%rbp)
 	# superblock outermost
 	movq $0, RQ_S(%rbp)
 11:	movq RQ_S(%rbp), %r9
@@ -814,39 +854,30 @@ rows_range_q:
 	movq %rax, RQ_XS(%rbp,%rsi,8)
 	incq %rsi
 	jmp 12b
-13:	# for r = r0; r < rows; r += rstep: kern(blk, xs[0], xs, scratch, acc, consts, rstep * nb_a)
-	movq RQ_R0(%rbp), %rax
-	movq %rax, RQ_R(%rbp)
-	leaq RQ_ACC(%rbp), %rax
-	movq %rax, RQ_A(%rbp)
-14:	movq RQ_R(%rbp), %r11
-	cmpq RQ_ROWS(%rbp), %r11
-	jae 19f
-	movq RQ_G(%rbp), %rdx
-	movq G_A(%rdx), %rdi
-	leaq (%r12,%r11), %rax			# i + r
-	imulq MJ_NB_A(%rbx), %rax
-	addq %rax, %rdi
+13:	# this thread's rows at superblock s: kern(blk, xs[0], xs, scratch,
+	# acc, consts, stride), the block and the accumulators advancing
+	# (r14, r15, r13: the kernels keep them)
+	movq RQ_MINE(%rbp), %r13
+	testq %r13, %r13
+	jz 19f
 	movq RQ_FMT(%rbp), %rcx
-	movq FMT_BLOCK(%rcx), %rax
-	imulq RQ_S(%rbp), %rax			# s * bb
-	addq %rax, %rdi				# the superblock
+	movq FMT_BLOCK(%rcx), %r14
+	imulq RQ_S(%rbp), %r14			# s * bb
+	addq RQ_BASE0(%rbp), %r14		# the superblock of the first row
+	leaq RQ_ACC(%rbp), %r15
+14:	movq %r14, %rdi
 	movq RQ_XS(%rbp), %rsi
 	leaq RQ_XS(%rbp), %rdx
 	leaq RQ_SCRATCH(%rbp), %rcx
-	movq RQ_A(%rbp), %r8
+	movq %r15, %r8
 	leaq g_consts(%rip), %r9
-	movq RQ_RSTEP(%rbp), %rax
-	imulq MJ_NB_A(%rbx), %rax		# the seventh argument: the next row's distance
-	pushq %rax
+	pushq RQ_STRIDE(%rbp)
 	call *RQ_KERN(%rbp)
 	addq $8, %rsp
-	movq RQ_T(%rbp), %rax
-	shlq $6, %rax
-	addq %rax, RQ_A(%rbp)			# a += T vectors
-	movq RQ_RSTEP(%rbp), %rax
-	addq %rax, RQ_R(%rbp)
-	jmp 14b
+	addq RQ_STRIDE(%rbp), %r14
+	addq RQ_TSTEP(%rbp), %r15
+	decq %r13
+	jnz 14b
 19:	incq RQ_S(%rbp)
 	jmp 11b
 20:	# the sums: for r, for q: sum16(acc) (+ the Q8_0 tail) into d[dst[c0 + q] * m + i + r]
@@ -1013,6 +1044,14 @@ q8_0_tail:
 # asked for; then, when the activations are still arriving (fused), this
 # thread's share of copying them and the wait for the rest; then the
 # activations asked for and the rows computed.
+	.bss
+	.balign 64
+# vpu_phase: each slice's clock after the copy wait, after the activation
+# warm-up and after its rows (a line each): the matrix service's -v -v
+# phases line.
+	.globl vpu_phase
+vpu_phase:	.skip (MAX_POOL + 1) * 64
+	.text
 	.set RP_LOCAL, 0			# MORE_MAX + 1 local jobs
 	.set RP_USE, (MORE_MAX + 1) * MJ_BYTES	# the job pointers used
 	.set RP_CORE, RP_USE + (MORE_MAX + 1) * 8
@@ -1130,7 +1169,12 @@ run_pieces:
 	movl $WAIT_DELAY, %eax
 	DELAY_EAX
 	jmp 6b
-7:	movq $0, RP_X(%rsp)
+7:	call now_ns
+	movl %r14d, %ecx
+	shlq $6, %rcx
+	leaq vpu_phase(%rip), %rdx
+	movq %rax, (%rdx,%rcx)
+	movq $0, RP_X(%rsp)
 8:	movq RP_X(%rsp), %rcx
 	cmpl %r13d, %ecx
 	jge 99f
@@ -1150,6 +1194,11 @@ run_pieces:
 	pushq $WARM_ACTS
 	call warm_slice
 	addq $8, %rsp
+	call now_ns
+	movl %r14d, %ecx
+	shlq $6, %rcx
+	leaq vpu_phase(%rip), %rdx
+	movq %rax, 8(%rdx,%rcx)
 	movq RP_X(%rsp), %rcx
 	movq %rcx, %rdx
 	shlq $4, %rdx
@@ -1159,6 +1208,11 @@ run_pieces:
 	movl 16(%rbp), %ecx
 	movl 24(%rbp), %r8d
 	call rows_range_q
+	call now_ns
+	movl %r14d, %ecx
+	shlq $6, %rcx
+	leaq vpu_phase(%rip), %rdx
+	movq %rax, 16(%rdx,%rcx)
 9:	incq RP_X(%rsp)
 	jmp 8b
 99:	leaq -40(%rbp), %rsp

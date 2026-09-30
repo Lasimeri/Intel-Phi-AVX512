@@ -15,6 +15,31 @@
 	.include "defs.inc"
 	.include "proto.inc"
 
+# -t: the sums per slice function (TR_*: the function, dispatches, and
+# per dispatch how long the slowest thread took to see the generation,
+# the longest pool slice, the dispatcher's slice, the tail from the last
+# end to the dispatcher seeing it, the total; then how often each thread
+# was the last to see it), and each thread's stamps.
+	.set TRACE_FNS, 8
+	.set TR_FN, 0
+	.set TR_N, 8
+	.set TR_SEE_LAST, 16
+	.set TR_RUN_MAX, 24
+	.set TR_RUN_DISP, 32
+	.set TR_TAIL, 40
+	.set TR_TOTAL, 48
+	.set TR_LATE, 56
+	.set TR_BYTES, 1024
+	.set STAMP_START, 0
+	.set STAMP_END, 8
+
+# TSC: the time-stamp counter into rax (clobbers rdx).
+	.macro TSC
+	rdtsc
+	shlq $32, %rdx
+	orq %rdx, %rax
+	.endm
+
 	.bss
 	.balign 64
 ctrl:	.skip 8			# the control area, mapped uncached
@@ -40,7 +65,11 @@ bc_nslices:	.skip 4
 bc_fn:	.skip 8
 bc_arg:	.skip 8
 	.balign 64
-pool_done:	.skip 4			# cores finished with this generation
+# Cores finished with this generation, counted on DONE_GROUPS lines (core
+# modulo DONE_GROUPS): fifty-seven locked adds queuing on one line took
+# the last of them 11 microseconds after the pool's faster wake made the
+# threads finish together; eight lines take seven each.
+pool_done:	.skip DONE_GROUPS * 64
 	.balign 64
 pool_parked:	.skip 4			# pool threads asleep in the kernel
 	.balign 64
@@ -69,6 +98,14 @@ cur_compute:	.skip 8
 	.balign 8
 affinity:	.skip 128
 timespec:	.skip 16
+tsc_per_ms:	.skip 8			# time-stamp ticks per millisecond, calibrated at start
+ns_mult:	.skip 8			# nanoseconds per tick, times 2^32: now_ns's scale
+	.balign 64
+stamps:	.skip (MAX_POOL + 1) * 64	# -t: each thread's start and end of the generation, a line each
+	.balign 64
+tr:	.skip TRACE_FNS * TR_BYTES	# -t: the sums per slice function
+st_sum:	.skip 3 * 7 * 8			# -t: the stage sums per kind of matrix request
+st_count:	.skip 3 * 8
 
 	.text
 
@@ -211,7 +248,52 @@ _start:
 	SYS SYS_arch_prctl
 	xorl %edi, %edi
 	call pin_cpu
-	# the pool: max_threads - 1 threads, core-major
+	# The time-stamp counter's rate against the kernel's clock over 20 ms:
+	# from here on now_ns is rdtsc scaled by it. A clock_gettime is a
+	# system call in this binary (no vDSO without a libc to find it), some
+	# microseconds on this core against the C worker's library call; the
+	# counter runs at one rate on every core of the card.
+	call now_ns_sys
+	movq %rax, %r14
+	TSC
+	movq %rax, %r15
+	movq $0, timespec(%rip)
+	movq $20000000, timespec+8(%rip)
+	leaq timespec(%rip), %rdi
+	xorl %esi, %esi
+	SYS SYS_nanosleep
+	TSC
+	subq %r15, %rax
+	movq %rax, %r15				# ticks
+	call now_ns_sys
+	subq %r14, %rax				# nanoseconds
+	movq %rax, %rcx
+	movq %r15, %rax
+	imulq $1000000, %rax, %rax
+	xorl %edx, %edx
+	divq %rcx
+	movq %rax, tsc_per_ms(%rip)
+	movabsq $4294967296000000, %rax		# 2^32 * 1e6 / tsc_per_ms
+	xorl %edx, %edx
+	divq tsc_per_ms(%rip)
+	movq %rax, ns_mult(%rip)
+	cmpl $0, trace(%rip)
+	je 13f
+	call l_begin
+	leaq s_tsc(%rip), %rsi
+	call w_str
+	movq tsc_per_ms(%rip), %rax
+	addq $50, %rax
+	xorl %edx, %edx
+	movl $100, %ecx
+	divq %rcx
+	movq %rax, %rdi
+	call w_tenths
+	leaq s_perus(%rip), %rsi
+	call w_str
+	movl $1, %edi
+	call l_end
+13:	# the pool: max_threads - 1 threads, core-major
 	leal -1(%r13d), %edi
 	call pool_start
 	call vpu_exec_init
@@ -463,7 +545,15 @@ main_loop:
 	movl cur_live(%rip), %eax
 	movl %eax, OFF_REPLY + RP_THREADS(%rbx)
 	movq %r12, OFF_REPLY + RP_SEQ(%rbx)
-	call now_ns
+	cmpl $0, trace(%rip)
+	je 6f
+	cmpl $K_EXEC, rq+RQ_KERNEL(%rip)
+	je 6f
+	TSC
+	movq %rax, vpu_marks+56(%rip)
+	movl rq+RQ_KERNEL(%rip), %edi
+	call stage_note
+6:	call now_ns
 	movq %rax, idle_since(%rip)
 	# A line per request costs the reply 35 to 60 us on this card (a write
 	# to the host-backed disk): the matrix service's requests log at -v -v.
@@ -681,7 +771,14 @@ pool_thread:
 2:	movl %r14d, %edi
 	call wait_for_work
 	movl bc_gen(%rip), %r14d
-	movl bc_nslices(%rip), %r15d
+	cmpl $0, trace(%rip)
+	je 21f
+	TSC
+	movq %r12, %rcx
+	shlq $6, %rcx
+	leaq stamps(%rip), %rdx
+	movq %rax, STAMP_START(%rdx,%rcx)
+21:	movl bc_nslices(%rip), %r15d
 	testl %r15d, %r15d
 	jnz 3f
 	movq %r12, %rdi
@@ -697,7 +794,14 @@ pool_thread:
 	movl %r12d, %esi
 	movl %r15d, %edx
 	call *bc_fn(%rip)
-4:	# locked: results are visible first; the thread completing its core's
+4:	cmpl $0, trace(%rip)
+	je 41f
+	TSC
+	movq %r12, %rcx
+	shlq $6, %rcx
+	leaq stamps(%rip), %rdx
+	movq %rax, STAMP_END(%rdx,%rcx)
+41:	# locked: results are visible first; the thread completing its core's
 	# count reports the core
 	leaq core_threads(%rip), %rax
 	movl (%rax,%r13,4), %ecx
@@ -715,7 +819,11 @@ pool_thread:
 	divq %rcx
 	testq %rdx, %rdx
 	jnz 2b
-5:	lock incl pool_done(%rip)
+5:	movl %r13d, %eax
+	andl $DONE_GROUPS - 1, %eax
+	shll $6, %eax
+	leaq pool_done(%rip), %rdx
+	lock incl (%rdx,%rax)
 	jmp 2b
 
 # wait_for_work: until the generation moves past edi. Spin first (a
@@ -756,15 +864,37 @@ wait_for_work:
 	popq %rbx
 	ret
 
-# wait_done: until every busy core has counted itself done.
+# wait_done: until every busy core has counted itself done (the sum of
+# the group counts).
 wait_done:
-1:	movl pool_done(%rip), %eax
+1:	leaq pool_done(%rip), %rdx
+	movl (%rdx), %eax
+	addl 64(%rdx), %eax
+	addl 128(%rdx), %eax
+	addl 192(%rdx), %eax
+	addl 256(%rdx), %eax
+	addl 320(%rdx), %eax
+	addl 384(%rdx), %eax
+	addl 448(%rdx), %eax
 	cmpl busy_cores(%rip), %eax
 	je 2f
 	movl $WAIT_DELAY, %eax
 	DELAY_EAX
 	jmp 1b
 2:	ret
+
+# done_reset: the group counts to zero before a generation. Clobbers rdx.
+done_reset:
+	leaq pool_done(%rip), %rdx
+	movl $0, (%rdx)
+	movl $0, 64(%rdx)
+	movl $0, 128(%rdx)
+	movl $0, 192(%rdx)
+	movl $0, 256(%rdx)
+	movl $0, 320(%rdx)
+	movl $0, 384(%rdx)
+	movl $0, 448(%rdx)
+	ret
 
 # run_job: the job at rdi: a generic slice when fn is set, else the
 # polynomial over its elements.
@@ -876,7 +1006,7 @@ poly_dispatch:
 	incl %r9d
 5:	incl %ebx
 	jmp 3b
-6:	movl $0, pool_done(%rip)
+6:	call done_reset
 	movl $0, bc_nslices(%rip)		# the per-thread jobs
 	incl bc_gen(%rip)
 	FENCE
@@ -912,6 +1042,7 @@ vpu_pool_map:
 	pushq %rbx
 	pushq %r12
 	pushq %r13
+	pushq %r14
 	movq %rdi, %r12
 	movq %rsi, %r13
 	movl nthreads(%rip), %eax
@@ -923,11 +1054,16 @@ vpu_pool_map:
 	jge 2f
 	movl $1, %edx
 2:	movl %edx, %ebx
-	movl $0, pool_done(%rip)
+	call done_reset
 	movq %r12, bc_fn(%rip)
 	movq %r13, bc_arg(%rip)
 	movl %ebx, bc_nslices(%rip)
-	incl bc_gen(%rip)
+	xorl %r14d, %r14d
+	cmpl $0, trace(%rip)
+	je 21f
+	TSC
+	movq %rax, %r14				# t0
+21:	incl bc_gen(%rip)
 	FENCE
 	cmpl $0, pool_parked(%rip)
 	je 3f
@@ -936,12 +1072,35 @@ vpu_pool_map:
 	movl $0x7fffffff, %edx
 	xorl %r10d, %r10d
 	SYS SYS_futex
-3:	movq %r13, %rdi
+3:	cmpl $0, trace(%rip)
+	je 31f
+	TSC
+	movl nthreads(%rip), %ecx
+	shlq $6, %rcx
+	leaq stamps(%rip), %rdx
+	movq %rax, STAMP_START(%rdx,%rcx)
+31:	movq %r13, %rdi
 	leal -1(%ebx), %esi
 	movl %ebx, %edx
 	call *%r12
-	call wait_done
-	movl %ebx, %eax
+	cmpl $0, trace(%rip)
+	je 32f
+	TSC
+	movl nthreads(%rip), %ecx
+	shlq $6, %rcx
+	leaq stamps(%rip), %rdx
+	movq %rax, STAMP_END(%rdx,%rcx)
+32:	call wait_done
+	cmpl $0, trace(%rip)
+	je 33f
+	TSC
+	movq %r12, %rdi
+	movl %ebx, %esi
+	movq %r14, %rdx
+	movq %rax, %rcx
+	call trace_note
+33:	movl %ebx, %eax
+	popq %r14
 	popq %r13
 	popq %r12
 	popq %rbx
@@ -1115,10 +1274,9 @@ reserve:
 	popq %rbx
 	ret
 
-# now_ns: CLOCK_MONOTONIC in nanoseconds, in rax. Clobbers rcx, rdx, rsi,
-# rdi, r11.
-	.globl now_ns
-now_ns:
+# now_ns_sys: CLOCK_MONOTONIC in nanoseconds, in rax, from the kernel
+# (a system call). Clobbers rcx, rdx, rsi, rdi, r11.
+now_ns_sys:
 	subq $24, %rsp
 	movl $CLOCK_MONOTONIC, %edi
 	movq %rsp, %rsi
@@ -1127,6 +1285,299 @@ now_ns:
 	imulq $1000000000, %rax, %rax
 	addq 8(%rsp), %rax
 	addq $24, %rsp
+	ret
+
+# now_ns: nanoseconds from the time-stamp counter (its zero is the card's
+# boot, not the kernel clock's: only differences are used), in rax.
+# Clobbers rdx.
+	.globl now_ns
+now_ns:
+	rdtsc
+	shlq $32, %rdx
+	orq %rdx, %rax
+	mulq ns_mult(%rip)
+	shrq $32, %rax
+	shlq $32, %rdx
+	orq %rdx, %rax
+	ret
+
+# ---- the -t trace ----
+
+# w_tenths: rdi tenths as "N.d".
+w_tenths:
+	pushq %rbx
+	movq %rdi, %rax
+	xorl %edx, %edx
+	movl $10, %ecx
+	divq %rcx
+	movq %rdx, %rbx
+	movq %rax, %rdi
+	call w_dec
+	movb $'.', %al
+	call w_byte
+	leal '0'(%rbx), %eax
+	call w_byte
+	popq %rbx
+	ret
+
+# w_us1: rdi ticks summed over rsi dispatches as microseconds per
+# dispatch with one decimal (the C's %.1f of ticks / (tsc_per_us * N)).
+w_us1:
+	movq tsc_per_ms(%rip), %rcx
+	imulq %rsi, %rcx
+	movq %rdi, %rax
+	movl $10000, %edx
+	mulq %rdx
+	movq %rcx, %rsi
+	shrq $1, %rsi
+	addq %rsi, %rax
+	adcq $0, %rdx
+	divq %rcx
+	movq %rax, %rdi
+	jmp w_tenths
+
+# trace_note(fn rdi, nslices esi, t0 rdx, t1 rcx): the dispatch's
+# stamps summed under the slice function; a line every trace_every.
+trace_note:
+	pushq %rbx
+	pushq %r12
+	pushq %r13
+	pushq %r14
+	pushq %r15
+	pushq %rbp
+	movq %rdi, %r12				# fn
+	movl %esi, %r13d			# nslices
+	movq %rdx, %r14				# t0
+	movq %rcx, %r15				# t1
+	leaq tr(%rip), %rbx
+	xorl %ecx, %ecx
+1:	cmpl $TRACE_FNS, %ecx
+	jge 9f
+	movq TR_FN(%rbx), %rax
+	testq %rax, %rax
+	jz 2f
+	cmpq %r12, %rax
+	je 2f
+	addq $TR_BYTES, %rbx
+	incl %ecx
+	jmp 1b
+2:	movq %r12, TR_FN(%rbx)
+	xorl %r8d, %r8d				# see
+	xorl %r9d, %r9d				# run
+	xorl %r10d, %r10d			# last_end
+	xorl %r11d, %r11d			# late
+	xorl %ecx, %ecx				# t
+	leaq stamps(%rip), %rsi
+3:	cmpl nthreads(%rip), %ecx
+	jge 5f
+	movq %rcx, %rdx
+	shlq $6, %rdx
+	movq STAMP_START(%rsi,%rdx), %rax
+	movq STAMP_END(%rsi,%rdx), %rdi
+	subq %rax, %rdi				# r = end - start
+	subq %r14, %rax				# s = start - t0
+	cmpq %r8, %rax
+	jbe 31f
+	movq %rax, %r8
+	movl %ecx, %r11d
+31:	leal -1(%r13d), %eax
+	cmpl %eax, %ecx
+	jge 32f
+	cmpq %r9, %rdi
+	jbe 32f
+	movq %rdi, %r9
+32:	movq STAMP_END(%rsi,%rdx), %rax
+	cmpq %r10, %rax
+	jbe 33f
+	movq %rax, %r10
+33:	incl %ecx
+	jmp 3b
+5:	movl nthreads(%rip), %ecx
+	shlq $6, %rcx
+	movq STAMP_END(%rsi,%rcx), %rax
+	movq %rax, %rdi
+	subq STAMP_START(%rsi,%rcx), %rdi	# the dispatcher's slice
+	cmpq %r10, %rax
+	jbe 51f
+	movq %rax, %r10
+51:	incq TR_N(%rbx)
+	addq %r8, TR_SEE_LAST(%rbx)
+	addq %r9, TR_RUN_MAX(%rbx)
+	addq %rdi, TR_RUN_DISP(%rbx)
+	movq %r15, %rax
+	subq %r10, %rax
+	addq %rax, TR_TAIL(%rbx)
+	movq %r15, %rax
+	subq %r14, %rax
+	addq %rax, TR_TOTAL(%rbx)
+	movl %r11d, %eax
+	incl TR_LATE(%rbx,%rax,4)
+	movq TR_N(%rbx), %rax
+	xorl %edx, %edx
+	movl trace_every(%rip), %ecx
+	divq %rcx
+	testq %rdx, %rdx
+	jnz 9f
+	xorl %ebp, %ebp				# the thread most often last
+	movl $1, %ecx
+6:	cmpl nthreads(%rip), %ecx
+	jge 7f
+	movl TR_LATE(%rbx,%rcx,4), %eax
+	cmpl TR_LATE(%rbx,%rbp,4), %eax
+	jbe 61f
+	movl %ecx, %ebp
+61:	incl %ecx
+	jmp 6b
+7:	call l_begin
+	leaq s_tr1(%rip), %rsi
+	call w_str
+	movq %r12, %rdi
+	call w_hex0x
+	leaq s_tr2(%rip), %rsi
+	call w_str
+	movl trace_every(%rip), %edi
+	call w_dec
+	leaq s_tr3(%rip), %rsi
+	call w_str
+	movq TR_TOTAL(%rbx), %rdi
+	movl trace_every(%rip), %esi
+	call w_us1
+	leaq s_tr4(%rip), %rsi
+	call w_str
+	movq TR_SEE_LAST(%rbx), %rdi
+	movl trace_every(%rip), %esi
+	call w_us1
+	leaq s_tr5(%rip), %rsi
+	call w_str
+	movq TR_RUN_MAX(%rbx), %rdi
+	movl trace_every(%rip), %esi
+	call w_us1
+	leaq s_tr6(%rip), %rsi
+	call w_str
+	movq TR_RUN_DISP(%rbx), %rdi
+	movl trace_every(%rip), %esi
+	call w_us1
+	leaq s_tr7(%rip), %rsi
+	call w_str
+	movq TR_TAIL(%rbx), %rdi
+	movl trace_every(%rip), %esi
+	call w_us1
+	leaq s_tr8(%rip), %rsi
+	call w_str
+	movl %ebp, %edi
+	call w_dec
+	leaq s_tr9(%rip), %rsi
+	call w_str
+	# its CPU: 1 + 4 core + slot, core = t mod 57, slot from pool_slot
+	movl %ebp, %eax
+	xorl %edx, %edx
+	movl $NCORES, %ecx
+	divl %ecx
+	movl %edx, %edi
+	movl %eax, %esi
+	pushq %rdi
+	call pool_slot
+	popq %rdi
+	leal 1(%rax,%rdi,4), %edi
+	call w_dec
+	leaq s_tr10(%rip), %rsi
+	call w_str
+	movl TR_LATE(%rbx,%rbp,4), %edi
+	call w_dec
+	leaq s_tr11(%rip), %rsi
+	call w_str
+	movl trace_every(%rip), %edi
+	call w_dec
+	movl $1, %edi
+	call l_end
+	movq $0, TR_SEE_LAST(%rbx)
+	movq $0, TR_RUN_MAX(%rbx)
+	movq $0, TR_RUN_DISP(%rbx)
+	movq $0, TR_TAIL(%rbx)
+	movq $0, TR_TOTAL(%rbx)
+	leaq TR_LATE(%rbx), %rdi
+	xorl %eax, %eax
+	movl $(MAX_POOL + 1), %ecx
+	rep stosl
+9:	popq %rbp
+	popq %r15
+	popq %r14
+	popq %r13
+	popq %r12
+	popq %rbx
+	ret
+
+# stage_note(kernel edi): a matrix request's stages, from the stamps
+# matmul.S and the poll loop leave in vpu_marks (0 the doorbell seen, 6
+# the request read, 1 the descriptors read and checked, 2 pulled, 3 the
+# groups built, 4 computed, 5 pushed, 7 the reply written), summed per
+# kind of request and printed every trace_every of that kind.
+stage_note:
+	pushq %rbx
+	pushq %r12
+	xorl %ebx, %ebx
+	cmpl $K_MATMUL, %edi
+	je 1f
+	movl $1, %ebx
+	cmpl $K_MATMUL_ID, %edi
+	je 1f
+	movl $2, %ebx
+	cmpl $K_MATMUL_MORE, %edi
+	jne 9f
+1:	leaq st_sum(%rip), %r12
+	movq %rbx, %rax
+	imulq $56, %rax, %rax
+	addq %rax, %r12				# the kind's seven sums
+	leaq vpu_marks(%rip), %rsi
+	leaq st_order(%rip), %rdi
+	xorl %ecx, %ecx
+2:	movzbl 1(%rdi,%rcx), %eax
+	movq (%rsi,%rax,8), %rdx
+	movzbl (%rdi,%rcx), %eax
+	subq (%rsi,%rax,8), %rdx
+	addq %rdx, (%r12,%rcx,8)
+	incl %ecx
+	cmpl $7, %ecx
+	jb 2b
+	leaq st_count(%rip), %rax
+	incq (%rax,%rbx,8)
+	movq (%rax,%rbx,8), %rax
+	xorl %edx, %edx
+	movl trace_every(%rip), %ecx
+	divq %rcx
+	testq %rdx, %rdx
+	jnz 9f
+	call l_begin
+	leaq s_st1(%rip), %rsi
+	call w_str
+	leaq st_names(%rip), %rax
+	movq (%rax,%rbx,8), %rsi
+	call w_str
+	leaq s_tr2(%rip), %rsi
+	call w_str
+	movl trace_every(%rip), %edi
+	call w_dec
+	leaq s_st2(%rip), %rsi
+	call w_str
+	xorl %ebx, %ebx
+3:	movq (%r12,%rbx,8), %rdi
+	movl trace_every(%rip), %esi
+	call w_us1
+	incl %ebx
+	cmpl $7, %ebx
+	jae 4f
+	leaq st_labels(%rip), %rax
+	movq -8(%rax,%rbx,8), %rsi
+	call w_str
+	jmp 3b
+4:	movl $1, %edi
+	call l_end
+	movq %r12, %rdi
+	xorl %eax, %eax
+	movl $7, %ecx
+	rep stosq
+9:	popq %r12
+	popq %rbx
 	ret
 
 	.section .rodata
@@ -1157,3 +1608,32 @@ s_pull:	.asciz " pull="
 s_compute:	.asciz "ms compute="
 s_push:	.asciz "ms push="
 s_ms:	.asciz "ms"
+# the -t trace's text
+s_tsc:	.asciz "trace: the time stamp counter runs at "
+s_perus:	.asciz " per us"
+s_tr1:	.asciz "trace fn "
+s_tr2:	.asciz " x"
+s_tr3:	.asciz ": per dispatch "
+s_tr4:	.asciz " us: last thread sees it "
+s_tr5:	.asciz ", longest pool slice "
+s_tr6:	.asciz ", dispatcher's slice "
+s_tr7:	.asciz ", last end to seen "
+s_tr8:	.asciz "; most often last to see it: thread "
+s_tr9:	.asciz " (CPU "
+s_tr10:	.asciz "), "
+s_tr11:	.asciz " of "
+s_st1:	.asciz "stages "
+s_st2:	.asciz ", us: read request "
+s_st3:	.asciz ", descriptors and checks "
+s_st4:	.asciz ", pull "
+s_st5:	.asciz ", groups "
+s_st6:	.asciz ", compute "
+s_st7:	.asciz ", push "
+s_st8:	.asciz ", reply "
+s_st_matmul:	.asciz "matmul"
+s_st_id:	.asciz "matmul_id"
+s_st_more:	.asciz "matmul_more"
+st_order:	.byte 0, 6, 1, 2, 3, 4, 5, 7
+	.balign 8
+st_names:	.quad s_st_matmul, s_st_id, s_st_more
+st_labels:	.quad s_st3, s_st4, s_st5, s_st6, s_st7, s_st8

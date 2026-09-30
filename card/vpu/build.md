@@ -1,21 +1,26 @@
-# build.sh: build the worker on the card
+# build.sh: the assembly worker, built on the host
 
 ```
-sh build.sh
+card/vpu/build.sh              # assemble, link, audit; host/asm/out/phi-vpu-worker
+card/vpu/build.sh --out DIR    # the binary into DIR, nothing else
 ```
 
-Compiles and links `phi-vpu-worker` from five sources: `vpu_worker.c`,
-`vpu_exec.c`, `vpu_matmul.c`, the kernel file `kernels.S` (with `mvex.inc`), and
-the translated kernel `avx512_poly.S` (`cc -O2 -I<this directory> ...
--lpthread`), using the card's own clang (`cc`). It runs on the card, not
-the host: the host's own compiler does not target Knights Corner.
+Assembles `worker.S`, `text.S`, `exec.S`, `matmul.S`, `rows.S` and
+`kernels.S` with GNU `as --64` (`-I card/vpu` for `defs.inc`,
+`proto.inc`, `mvex.inc`), the translated polynomial kernel
+`card/examples/avx512_poly.S` with its `//` comments stripped into a
+copy (GNU `as` does not take them), and links them static with `ld`
+(`-nostdlib -e _start -z noexecstack`; the symbols are kept while the
+port lasts, so a card's `dmesg` address maps to a routine with `nm`):
+the card is an x86-64 core, so
+the host's binutils produce its binary, and the worker has no libc, so
+nothing of musl is needed. The stack's `phi-isa-audit` then decodes every
+instruction of the binary and refuses SSE, `cmov` and the rest of what
+Knights Corner does not run (GNU `as` would assemble them without a
+word); the build fails on any.
 
-It is the last of three ways `scripts/phi-vpu.sh deploy` builds the
-worker. `deploy` copies this directory's sources, the four headers and
-the kernel to `/opt/phi/vpu` on the card (`PHI_VPU_DIR`), then builds:
-on the host with the stack's cross toolchain (`knc-cc`) when the stack
-has one; else on another card that is up (`PHI_VPU_BUILD_CARD`, default
-the other one); else here, with this script. That last is why it
-accepts a copy of `avx512_poly.S` next to itself as well as the one in
-`../examples`. There is one kernel source, in `card/examples`; a second
-copy in this directory would drift.
+`scripts/phi-vpu.sh -c N deploy` runs this script and puts the binary on
+the card (`/opt/phi/vpu/phi-vpu-worker`, by `.new` and a move);
+`start` runs it. Until 2026-09-30 this file was `build-asm.sh` beside
+the C worker's on-card `build.sh`; the C worker's sources went with
+step 1e of the port (`docs/results/2026-09-30-worker-assembly.md`).

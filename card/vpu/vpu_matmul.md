@@ -1,5 +1,11 @@
 # vpu_matmul.c and vpu_matmul.h: the card as a matrix-multiply engine
 
+**The C this documents was replaced by the assembly worker on 2026-09-30**
+(`worker.S`, `exec.S`, `matmul.S` and `rows.S`, their `.md` siblings);
+the design, the measurements and the defects recorded here stand, and
+the assembly keeps every mechanism named. The C files are in the history
+before commit `6484cf0`.
+
 The service behind the ggml backend (`host/crates/phi-ggml`): six
 request kinds on the worker's doorbell, with a descriptor
 (`struct vpu_matmul`, 128 bytes) in the control area at

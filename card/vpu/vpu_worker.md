@@ -1,5 +1,11 @@
 # phi-vpu-worker: the card side of the co-processor
 
+**The C this documents was replaced by the assembly worker on 2026-09-30**
+(`worker.S`, `exec.S`, `matmul.S` and `rows.S`, their `.md` siblings);
+the design, the measurements and the defects recorded here stand, and
+the assembly keeps every mechanism named. The C files are in the history
+before commit `6484cf0`.
+
 Resident on the card. Polls a doorbell in host memory, and when a request
 arrives runs an AVX-512 kernel, translated to the card's own instruction
 set ahead of time by `host/crates/avx512-xlate`, across the vector units,

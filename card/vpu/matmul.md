@@ -55,9 +55,25 @@ what is where in the assembly and what its gates were.
   dispatcher runs this. At `-v -v` a line at the start of each request
   names it (kind, type, shape) and one at the end gives its times.
 
-Not carried yet: `MM_PROBE` (the diagnostics behind `matmul-check
---probe`, `phi_bench` and `phi_probe`), which answers `VPU_E_REQUEST`
-until the measurement step of the port adds it.
+- **The probe** (`MM_PROBE`, the diagnostics behind `matmul-check
+  --probe`): what each kernel instruction produces (`phi_probe`), then
+  the rates the C measured in the same order and units, as 8-byte times
+  after the probe's 512 bytes: this thread's issue and streaming rates
+  (`phi_bench`), the Q4_K and Q5_K kernels on one L1-resident superblock
+  (`probe_kernels`, an aligned frame for the table and accumulators), a
+  dispatch of nothing, the pool's read bandwidth and issue rate
+  (`bench_pool`) and the eight-row kernel across it (`kernel_slice`,
+  `bench_kernel_pool`), and the link both ways at a token's and a
+  prompt's sizes (`probe_rounds` over `copy_pool`, `vpu_pull`,
+  `vpu_push`; the C's `memcpy` measured as `rep movsq`, which is what it
+  compiled to). The driver's text over the assembly worker differs from
+  the C worker's only in the numbers.
+- **The stage marks** (`MARK 1..5`): the time-stamp counter at the
+  request's stages, for the worker's `-t` trace (`worker.md`); at
+  `-v -v` a fused request also prints a `phases` line (`log_phases`):
+  the longest wait past the copy's completion, the longest activation
+  warm-up, the longest rows phase and its thread (`vpu_phase`,
+  `rows.md`), which is what found the slow mode of the fused copy.
 
 ## Gates
 

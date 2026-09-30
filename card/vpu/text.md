@@ -13,7 +13,7 @@ and exit 1; `parse_u64` and `str_eq` serve the option parser.
 
 Written for the card's scalar core: no SSE (Knights Corner has none), no
 `cmov` (deleted on it; ISA reference 327364-001, appendix B); `div` and
-`imul` are the integer forms. The audit in `build-asm.sh` refuses a
+`imul` are the integer forms. The audit in `build.sh` refuses a
 binary with anything else. A line that overflows the buffer is cut, not
 overrun; a write that fails is dropped: the log is best effort, the
 control words are what the host reads.

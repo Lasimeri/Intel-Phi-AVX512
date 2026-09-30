@@ -6,7 +6,7 @@ the card's vector units. It replaces `vpu_worker.c` (the plan of
 2026-09-30: the card first, since the fixed cost of a request is the
 pole after the whole-expert placement). No libc: system calls direct
 (`defs.inc`), threads by `clone`, text by `text.S`. Built on the host by
-`build-asm.sh` and audited for what the card does not run.
+`build.sh` and audited for what the card does not run.
 
 ```
 phi-vpu-worker [-v] [-t N] [-s MS] [-i US] [-e N] [-m 0|1] [threads]
@@ -20,8 +20,8 @@ microseconds once parked (500; `nanosleep` on this kernel costs about
 60 us over the ask); `-e N` huge pages the seamless path pools (256; 0
 leaves them all to the matrix multiplies); `-m 0` sends the matrix
 service's small transfers through the block device (1: through the
-mapping). `-t N` is accepted and stored; the pool's stage trace comes
-back with the measurement step of the port.
+mapping). `-t N` prints the pool's dispatch trace and the matrix
+service's stage trace every N dispatches or requests (below).
 
 ## What the process does
 
@@ -58,6 +58,13 @@ back with the measurement step of the port.
   counted per core (a locked add on a line of that core's own, no ring
   traffic) and the thread completing its core's multiple adds once to
   `pool_done`, so the dispatcher waits for 57 cores, not 227 threads.
+  `pool_done` is eight counters on eight lines (core modulo
+  `DONE_GROUPS`), summed by `wait_done`: with one counter the
+  assembly's faster wake had the 57 adds arrive together and queue on
+  the line, 11 microseconds from the last thread's end to the
+  dispatcher seeing it (the C worker's slower wake spread them, 5); on
+  eight lines it is 4, a dispatch of nothing 18 to 11 microseconds by
+  the trace.
 - **The doorbell.** One uncached 8-byte load of the request's sequence
   per poll; idle, it keeps rewriting the readiness word (the host clears
   the window before its first request and would wipe the flag it is
@@ -72,6 +79,22 @@ back with the measurement step of the port.
   over whole 128-element chunks with the last slice on this thread, the
   output pushed), anything else `VPU_E_KERNEL`. The reply's fields are
   written, then its sequence number last: that is what the host polls.
+- **The clock.** `now_ns` is the time-stamp counter scaled by a rate
+  measured at start against the kernel's clock over 20 ms (1099.8
+  ticks per microsecond on this card, the same on every core): a
+  `clock_gettime` is a system call in this binary, which has no libc to
+  find the vDSO through, and the request path takes the time six or
+  seven times. Only differences are used.
+- **The trace (`-t N`).** `stamps` holds each thread's start and end of
+  the current generation; `trace_note` sums, per slice function, how
+  long the slowest thread took to see the generation, the longest pool
+  slice, the dispatcher's slice and the tail from the last end to the
+  dispatcher seeing it, and prints them every N dispatches (`trace fn`,
+  with the thread most often last to see it and its CPU). `stage_note`
+  sums a matrix request's stages from the marks the service leaves in
+  `vpu_marks` (the request read, the descriptors, the pull, the groups,
+  the compute, the push, the reply) and prints them every N requests of
+  that kind (`stages`). The C worker's lines, word for word.
 - **Bulk data**: `vpu_pull` and `vpu_push` read and write whole 4 KiB
   blocks through the block device (`O_DIRECT` wants the offsets and
   lengths aligned, so every buffer is page aligned and oversized by a

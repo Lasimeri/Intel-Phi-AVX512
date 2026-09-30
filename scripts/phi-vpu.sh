@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # phi-vpu.sh: put the AVX-512 co-processor worker on a card and drive it.
 #
-#   scripts/phi-vpu.sh [-c N] deploy        build the worker (host cross toolchain, else another card, else this card) and put it on the card
+#   scripts/phi-vpu.sh [-c N] deploy        build the worker on the host (GNU as and ld, audited) and put it on the card
 #   scripts/phi-vpu.sh [-c N] start [T]     start the worker with T threads (default 114, two per core);
 #                                           PHI_VPU_ARGS="-s MS -i US" passes worker options
 #                                           PHI_VPU_HUGEPAGES=N huge pages reserved on the card at start (768)
@@ -77,71 +77,15 @@ refuse_if_swapping() {
 cmd=${1:-}; shift || true
 case "$cmd" in
     deploy)
+        # Built on the host (GNU as and ld: the card is an x86-64 core and
+        # the worker has no libc; card/vpu/build.sh audits the binary for
+        # what the card does not run) and put on the card over the control
+        # socket.
+        "$root/card/vpu/build.sh" > /dev/null
         ssh_ "mkdir -p '$dir'"
-        put_ "$dir" "$root/card/vpu/vpu_proto.h" "$root/card/vpu/vpu_exec.h" "$root/card/vpu/vpu_exec_regs.h" \
-            "$root/card/vpu/vpu_worker.c" "$root/card/vpu/vpu_exec.c" "$root/card/vpu/build.sh" \
-            "$root/card/vpu/vpu_matmul.h" "$root/card/vpu/vpu_matmul.c" "$root/card/vpu/kernels.S" "$root/card/vpu/mvex.inc" \
-            "$root/card/examples/avx512_poly.S"
-        # Built on the host with the stack's cross toolchain when it is there
-        # (the files in parallel, under a second), else on another card that
-        # is up (PHI_VPU_BUILD_CARD, default: the other one), else on this
-        # card, which builds alone and slowly while it serves.
-        built=
-        if [ -x "$PHI_STACK_ROOT/toolchain/clang/knc-cc" ] || [ -f "$PHI_STACK_ROOT/toolchain/env.sh" ]; then
-            work=$(mktemp -d)
-            if (
-                . "$PHI_STACK_ROOT/toolchain/env.sh" >/dev/null 2>&1
-                cd "$root/card/vpu"
-                knc-cc -O2 -I. -c vpu_worker.c -o "$work/vpu_worker.o" &
-                knc-cc -O2 -I. -c vpu_exec.c -o "$work/vpu_exec.o" &
-                knc-cc -O2 -I. -c ../examples/avx512_poly.S -o "$work/avx512_poly.o" &
-                knc-cc -O2 -I. -c vpu_matmul.c -o "$work/vpu_matmul.o" &
-                knc-cc -O2 -I. -c kernels.S -o "$work/kernels.o" &
-                wait
-                knc-cc -static -o "$work/phi-vpu-worker" "$work/vpu_worker.o" "$work/vpu_exec.o" "$work/avx512_poly.o" "$work/vpu_matmul.o" "$work/kernels.o" -lpthread
-            ) 2>"$work/build.log"; then
-                "$PHI" -c "$PHI_CARD" put "$work/phi-vpu-worker" "$dir/phi-vpu-worker.new" < /dev/null
-                ssh_ "mv -f '$dir/phi-vpu-worker.new' '$dir/phi-vpu-worker'"
-                echo "built on the host ($(nproc) cores), pushed to card $PHI_CARD"
-                built=host
-            else
-                echo "host build failed, building on a card instead:" >&2
-                cat "$work/build.log" >&2
-            fi
-            rm -rf "$work"
-        fi
-        if [ -z "$built" ]; then
-            other=${PHI_VPU_BUILD_CARD:-}
-            if [ -z "$other" ]; then
-                for c in $PHI_CARDS; do [ "$c" != "$PHI_CARD" ] && { other=$c; break; }; done
-            fi
-            if [ -n "$other" ] && "$0" -c "$other" build-here "$dir" 2>/dev/null; then
-                # The binary from the other card, through the host.
-                work=$(mktemp -d)
-                get_ "$dir/phi-vpu-worker" "$work/phi-vpu-worker" "$other"
-                "$PHI" -c "$PHI_CARD" put "$work/phi-vpu-worker" "$dir/phi-vpu-worker.new" < /dev/null
-                ssh_ "mv -f '$dir/phi-vpu-worker.new' '$dir/phi-vpu-worker'"
-                rm -rf "$work"
-                echo "built on card $other, pushed to card $PHI_CARD"
-                built=card$other
-            fi
-        fi
-        if [ -z "$built" ]; then
-            # A non-login shell over ssh has no /opt/phi/bin on PATH until the
-            # card's next boot links the toolchain into /usr/bin; name it.
-            ssh_ "cd '$dir' && PATH=/opt/phi/bin:\$PATH sh build.sh"
-        fi
-        ;;
-    build-here)
-        # Build the sources already in $1 on this card (used by deploy for
-        # another card).
-        d=${1:-$dir}
-        ssh_ "mkdir -p '$d'"
-        put_ "$d" "$root/card/vpu/vpu_proto.h" "$root/card/vpu/vpu_exec.h" "$root/card/vpu/vpu_exec_regs.h" \
-            "$root/card/vpu/vpu_worker.c" "$root/card/vpu/vpu_exec.c" "$root/card/vpu/build.sh" \
-            "$root/card/vpu/vpu_matmul.h" "$root/card/vpu/vpu_matmul.c" "$root/card/vpu/kernels.S" "$root/card/vpu/mvex.inc" \
-            "$root/card/examples/avx512_poly.S"
-        ssh_ "cd '$d' && PATH=/opt/phi/bin:\$PATH sh build.sh"
+        "$PHI" -c "$PHI_CARD" put "$root/host/asm/out/phi-vpu-worker" "$dir/phi-vpu-worker.new" < /dev/null
+        ssh_ "mv -f '$dir/phi-vpu-worker.new' '$dir/phi-vpu-worker'"
+        echo "built on the host, pushed to card $PHI_CARD"
         ;;
     start)
         refuse_if_swapping

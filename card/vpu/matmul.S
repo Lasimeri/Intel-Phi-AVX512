@@ -1614,7 +1614,7 @@ vpu_matmul_run:
 9:	cmpl $MM_SWIGLU, MM_A_TYPE(%rbx)
 	je .Lswiglu
 	cmpl $MM_PROBE, MM_A_TYPE(%rbx)
-	je .Lbad
+	je .Lprobe
 	leaq mm(%rip), %rdi
 	call shape_ok
 	testl %eax, %eax
@@ -2322,6 +2322,567 @@ vpu_matmul_run:
 	movl $1, (%rcx)
 	jmp .Lok
 
+.Lprobe:
+	# The diagnostics behind matmul-check --probe (vpu_matmul.md): what
+	# each kernel instruction produces (phi_probe, 512 bytes at d), then
+	# times in nanoseconds as 8-byte words from d + 512: this thread's
+	# issue rate (compute_ns) and its streaming walks (1..6), the Q4_K and
+	# Q5_K kernels on one superblock (7..10), a dispatch of nothing (11),
+	# the pool's read bandwidth and issue rate (12, 13) and the eight-row
+	# kernel across it (18), the link both ways at a token's sizes
+	# (14..17, 19..24) and a prompt's (25..40).
+	testq $VPU_BLOCK - 1, MM_A_OFF(%rbx)
+	jnz .Lbad
+	leaq g_a(%rip), %rdi
+	movl $VPU_BLOCK, %esi
+	call grow
+	testl %eax, %eax
+	jnz .Lalloc
+	leaq g_b(%rip), %rdi
+	movl $VPU_BLOCK, %esi
+	call grow
+	testl %eax, %eax
+	jnz .Lalloc
+	leaq g_d(%rip), %rdi
+	movl $VPU_BLOCK, %esi
+	call grow
+	testl %eax, %eax
+	jnz .Lalloc
+	movq g_a + BUF_MAP + MAP_P(%rip), %rdi
+	movl $VPU_BLOCK, %esi
+	movq MM_A_OFF(%rbx), %rdx
+	call vpu_pull
+	testl %eax, %eax
+	jnz .Lpull
+	movq g_b + BUF_MAP + MAP_P(%rip), %rdi
+	movl $VPU_BLOCK, %esi
+	movq MM_B_OFF(%rbx), %rdx
+	call vpu_pull
+	testl %eax, %eax
+	jnz .Lpull
+	movq g_a + BUF_MAP + MAP_P(%rip), %rdi
+	movq g_b + BUF_MAP + MAP_P(%rip), %rsi
+	leaq g_consts(%rip), %rdx
+	movq g_d + BUF_MAP + MAP_P(%rip), %rcx
+	call phi_probe
+	movq g_d + BUF_MAP + MAP_P(%rip), %rdi
+	movl $VPU_BLOCK, %esi
+	movq MM_D_OFF(%rbx), %rdx
+	call vpu_push
+	testl %eax, %eax
+	jnz .Lpush
+	# the issue rate on this thread, as the compute time
+	call now_ns
+	movq %rax, r_c0(%rip)
+	xorl %edi, %edi
+	xorl %esi, %esi
+	xorl %edx, %edx
+	call phi_bench
+	call now_ns
+	subq r_c0(%rip), %rax
+	movq r_pcompute(%rip), %rcx
+	movq %rax, (%rcx)
+	# one region per thread for the pool-wide walks, 64 MiB at least
+	movq r_threads(%rip), %rax
+	shlq $22, %rax
+	movq $67108864, %rcx
+	cmpq %rcx, %rax
+	jae 60f
+	movq %rcx, %rax
+60:	movq %rax, %r12				# want
+	leaq g_a(%rip), %rdi
+	movq %r12, %rsi
+	call grow
+	testl %eax, %eax
+	jnz .Lalloc
+	movq g_a + BUF_MAP + MAP_P(%rip), %rdi
+	movq %r12, %rcx
+	shrq $3, %rcx
+	xorl %eax, %eax
+	rep stosq
+	movq g_d + BUF_MAP + MAP_P(%rip), %r13
+	addq $512, %r13				# the times
+	movl $1, %r14d
+61:	call now_ns
+	movq %rax, r_c0(%rip)
+	movq %r14, %rdi
+	movq g_a + BUF_MAP + MAP_P(%rip), %rsi
+	xorl %edx, %edx
+	call phi_bench
+	call now_ns
+	subq r_c0(%rip), %rax
+	movq %rax, (%r13,%r14,8)
+	incl %r14d
+	cmpl $5, %r14d
+	jle 61b
+	# kind 1 again on a 256 KiB walk (L2 resident): 1 M loads over the
+	# same 4096 lines
+	call now_ns
+	movq %rax, r_c0(%rip)
+	movl $256, %r14d
+62:	movl $6, %edi
+	movq g_a + BUF_MAP + MAP_P(%rip), %rsi
+	xorl %edx, %edx
+	call phi_bench
+	decl %r14d
+	jnz 62b
+	call now_ns
+	subq r_c0(%rip), %rax
+	movq %rax, 48(%r13)
+	movq %r13, %rdi
+	call probe_kernels
+	# The two ceilings, with every thread of the request working: the
+	# card's aggregate read bandwidth (4 MiB per thread, prefetched) and
+	# its aggregate vector issue rate (register fused multiply-adds,
+	# nothing from memory); then the eight-row kernel itself, every
+	# thread on its own L1-resident superblock.
+	movl $3, %edi
+	movq g_a + BUF_MAP + MAP_P(%rip), %rsi
+	movl $4194304, %edx
+	movl $65536, %ecx
+	movq r_threads(%rip), %r8
+	call bench_pool
+	movq %rax, 96(%r13)
+	xorl %edi, %edi
+	xorl %esi, %esi
+	xorl %edx, %edx
+	movl $1000000, %ecx
+	movq r_threads(%rip), %r8
+	call bench_pool
+	movq %rax, 104(%r13)
+	movq r_threads(%rip), %rdi
+	call bench_kernel_pool
+	movq %rax, 144(%r13)
+	# The two ways bytes cross the link, at the size a token's activations
+	# and results are: the block device (a request each way, whose cost is
+	# nearly all fixed) and the window mapped straight into the card's
+	# address space (no request, but every access is a link round trip).
+	# 100 rounds of 16 KiB each.
+	movq MM_B_OFF(%rbx), %rdi
+	movl $65536, %esi
+	call vpu_window
+	movq %rax, r_win(%rip)
+	call now_ns
+	movq %rax, r_c0(%rip)
+	movl $100, %r14d
+63:	movq g_b + BUF_MAP + MAP_P(%rip), %rdi
+	movl $16384, %esi
+	movq MM_B_OFF(%rbx), %rdx
+	call vpu_pull
+	decl %r14d
+	jnz 63b
+	call now_ns
+	subq r_c0(%rip), %rax
+	movq %rax, 112(%r13)
+	call now_ns
+	movq %rax, r_c0(%rip)
+	movl $100, %r14d
+64:	movq g_d + BUF_MAP + MAP_P(%rip), %rdi
+	movl $16384, %esi
+	movq MM_D_OFF(%rbx), %rdx
+	call vpu_push
+	decl %r14d
+	jnz 64b
+	call now_ns
+	subq r_c0(%rip), %rax
+	movq %rax, 120(%r13)
+	cmpq $0, r_win(%rip)
+	je 69f
+	# the C's memcpy on this core: 8 bytes a store (copy.md)
+	call now_ns
+	movq %rax, r_c0(%rip)
+	movl $100, %r14d
+65:	movq g_b + BUF_MAP + MAP_P(%rip), %rdi
+	movq r_win(%rip), %rsi
+	movl $16384 / 8, %ecx
+	rep movsq
+	decl %r14d
+	jnz 65b
+	call now_ns
+	subq r_c0(%rip), %rax
+	movq %rax, 128(%r13)
+	call now_ns
+	movq %rax, r_c0(%rip)
+	movl $100, %r14d
+66:	movq r_win(%rip), %rdi
+	movq g_d + BUF_MAP + MAP_P(%rip), %rsi
+	movl $16384 / 8, %ecx
+	rep movsq
+	decl %r14d
+	jnz 66b
+	call now_ns
+	subq r_c0(%rip), %rax
+	movq %rax, 136(%r13)
+	# the same as whole 64-byte vector stores, then loads, at 4, 16 and
+	# 64 KiB: on an uncached mapping each store is one transaction
+	xorl %r15d, %r15d			# s
+67:	call now_ns
+	movq %rax, r_c0(%rip)
+	movl $100, %r14d
+671:	movq r_win(%rip), %rdi
+	movq g_a + BUF_MAP + MAP_P(%rip), %rsi
+	leaq probe_sizes(%rip), %rax
+	movq (%rax,%r15,8), %rdx
+	shrq $6, %rdx
+	call phi_copy64
+	decl %r14d
+	jnz 671b
+	call now_ns
+	subq r_c0(%rip), %rax
+	movq %rax, 152(%r13,%r15,8)
+	call now_ns
+	movq %rax, r_c0(%rip)
+	movl $100, %r14d
+672:	movq g_a + BUF_MAP + MAP_P(%rip), %rdi
+	movq r_win(%rip), %rsi
+	leaq probe_sizes(%rip), %rax
+	movq (%rax,%r15,8), %rdx
+	shrq $6, %rdx
+	call phi_copy64
+	decl %r14d
+	jnz 672b
+	call now_ns
+	subq r_c0(%rip), %rax
+	movq %rax, 176(%r13,%r15,8)
+	incl %r15d
+	cmpl $3, %r15d
+	jb 67b
+	# split across the pool, and the block device, at the sizes a prompt
+	# moves as well (per transfer, scaled to 100 rounds)
+	movq MM_B_OFF(%rbx), %rdi
+	movl $4194304, %esi
+	call vpu_window
+	movq %rax, r_big(%rip)
+	testq %rax, %rax
+	jz 69f
+	xorl %r15d, %r15d
+68:	leaq probe_psz(%rip), %rax
+	movq (%rax,%r15,8), %r12		# the size
+	movq $100, r_rounds(%rip)
+	cmpq $65536, %r12
+	jbe 681f
+	movq $10, r_rounds(%rip)
+681:	leaq 200(%r13,%r15,8), %rdi
+	leaq probe_pool_in(%rip), %rsi
+	call probe_rounds
+	leaq 232(%r13,%r15,8), %rdi
+	leaq probe_pool_out(%rip), %rsi
+	call probe_rounds
+	leaq 264(%r13,%r15,8), %rdi
+	leaq probe_blk_in(%rip), %rsi
+	call probe_rounds
+	leaq 296(%r13,%r15,8), %rdi
+	leaq probe_blk_out(%rip), %rsi
+	call probe_rounds
+	incl %r15d
+	cmpl $4, %r15d
+	jb 68b
+69:	# What one dispatch across the request's threads costs with nothing
+	# to do: the pool's fixed cost per request, which a small multiply
+	# pays in full (1000 rounds).
+	call now_ns
+	movq %rax, r_c0(%rip)
+	movl $1000, %r14d
+691:	leaq noop_slice(%rip), %rdi
+	xorl %esi, %esi
+	movq r_threads(%rip), %rdx
+	call vpu_pool_map
+	decl %r14d
+	jnz 691b
+	call now_ns
+	subq r_c0(%rip), %rax
+	movq %rax, 88(%r13)
+	movq g_d + BUF_MAP + MAP_P(%rip), %rdi
+	movl $VPU_BLOCK, %esi
+	movq MM_D_OFF(%rbx), %rdx
+	call vpu_push
+	testl %eax, %eax
+	jnz .Lpush
+	jmp .Lok
+
+# ---- the probe's helpers ----
+
+# noop_slice: a slice that does nothing: the probe times the dispatch.
+noop_slice:
+	ret
+
+# probe_rounds: r_rounds calls of the routine rsi (which reads its size
+# from r12), the time per 100 rounds into (rdi).
+probe_rounds:
+	pushq %rdi
+	pushq %rsi
+	call now_ns
+	pushq %rax
+	movq r_rounds(%rip), %rax
+	movq %rax, r_i(%rip)
+1:	movq 8(%rsp), %rax
+	call *%rax
+	decq r_i(%rip)
+	jnz 1b
+	call now_ns
+	popq %rcx
+	subq %rcx, %rax
+	imulq $100, %rax, %rax
+	xorl %edx, %edx
+	divq r_rounds(%rip)
+	popq %rsi
+	popq %rdi
+	movq %rax, (%rdi)
+	ret
+probe_pool_in:
+	movq g_a + BUF_MAP + MAP_P(%rip), %rdi
+	movq r_big(%rip), %rsi
+	movq %r12, %rdx
+	shrq $6, %rdx
+	movq r_threads(%rip), %rcx
+	jmp copy_pool
+probe_pool_out:
+	movq r_big(%rip), %rdi
+	movq g_a + BUF_MAP + MAP_P(%rip), %rsi
+	movq %r12, %rdx
+	shrq $6, %rdx
+	movq r_threads(%rip), %rcx
+	jmp copy_pool
+probe_blk_in:
+	movq g_a + BUF_MAP + MAP_P(%rip), %rdi
+	movq %r12, %rsi
+	movq mm + MM_B_OFF(%rip), %rdx
+	jmp vpu_pull
+probe_blk_out:
+	movq g_a + BUF_MAP + MAP_P(%rip), %rdi
+	movq %r12, %rsi
+	movq mm + MM_B_OFF(%rip), %rdx
+	jmp vpu_push
+
+# bench_slice(job rdi, slice esi, nslices edx): phi_bench on this
+# thread's region of the buffer.
+bench_slice:
+	movq BJ_KIND(%rdi), %rax
+	movl %esi, %esi
+	movq BJ_PER(%rdi), %rcx
+	imulq %rsi, %rcx
+	addq BJ_BUF(%rdi), %rcx
+	movq BJ_COUNT(%rdi), %rdx
+	movq %rcx, %rsi
+	movq %rax, %rdi
+	jmp phi_bench
+
+# bench_pool(kind rdi, buf rsi, per rdx, count rcx, threads r8): the whole
+# pool running phi_bench at once, each thread on its own region: the
+# card's aggregate rates, which a matrix multiply is measured against
+# (one thread's rate times 57 is not: the memory system is shared, the
+# vector units are not). rax the nanoseconds.
+bench_pool:
+	pushq %rbx
+	leaq bjob(%rip), %rax
+	movq %rdi, BJ_KIND(%rax)
+	movq %rsi, BJ_BUF(%rax)
+	movq %rdx, BJ_PER(%rax)
+	movq %rcx, BJ_COUNT(%rax)
+	movq %r8, %rbx
+	call now_ns
+	pushq %rax
+	leaq bench_slice(%rip), %rdi
+	leaq bjob(%rip), %rsi
+	movl %ebx, %edx
+	call vpu_pool_map
+	call now_ns
+	popq %rcx
+	subq %rcx, %rax
+	popq %rbx
+	ret
+
+# kernel_slice(consts rdi, slice esi, nslices edx): the eight-row Q4_K
+# kernel on one superblock this thread holds in its own L1, 20000 calls:
+# the kernel's issue rate with no memory behind it. The frame (table,
+# accumulators, eight activation rows, the block, the row pointers) is
+# 64-byte aligned below the saved stack pointer.
+	.set KS_TAB, 0
+	.set KS_ACC, 128
+	.set KS_XS, 640
+	.set KS_BLK, 704
+	.set KS_X, 960
+	.set KS_BYTES, 960 + 8192 + 64
+kernel_slice:
+	pushq %rbx
+	pushq %r12
+	pushq %r13
+	pushq %r14
+	pushq %r15
+	pushq %rbp
+	movq %rsp, %rbp
+	subq $KS_BYTES, %rsp
+	andq $-64, %rsp
+	movq %rdi, %r12				# consts
+	movl %esi, %r13d
+	leaq KS_ACC(%rsp), %rdi
+	xorl %eax, %eax
+	movl $512 / 8, %ecx
+	rep stosq
+	leaq KS_X(%rsp), %rdi
+	movl $8192 / 8, %ecx
+	rep stosq
+	leaq KS_BLK(%rsp), %rdi
+	leal 1(%r13d), %eax
+	movl $256, %ecx
+	rep stosb
+	xorl %ecx, %ecx
+1:	movq %rcx, %rax
+	shlq $10, %rax
+	leaq KS_X(%rsp,%rax), %rax
+	movq %rax, KS_XS(%rsp,%rcx,8)
+	incl %ecx
+	cmpl $GROUP_MAX, %ecx
+	jb 1b
+	movl $20000, %r14d
+2:	leaq KS_BLK(%rsp), %rdi
+	movq KS_XS(%rsp), %rsi
+	leaq KS_XS(%rsp), %rdx
+	leaq KS_TAB(%rsp), %rcx
+	leaq KS_ACC(%rsp), %r8
+	movq %r12, %r9
+	pushq $144
+	call phi_q4k_8
+	addq $8, %rsp
+	decl %r14d
+	jnz 2b
+	movq %rbp, %rsp
+	popq %rbp
+	popq %r15
+	popq %r14
+	popq %r13
+	popq %r12
+	popq %rbx
+	ret
+
+# bench_kernel_pool(threads rdi): kernel_slice across the pool, timed.
+bench_kernel_pool:
+	pushq %rbx
+	movq %rdi, %rbx
+	call now_ns
+	pushq %rax
+	leaq kernel_slice(%rip), %rdi
+	leaq g_consts(%rip), %rsi
+	movl %ebx, %edx
+	call vpu_pool_map
+	call now_ns
+	popq %rcx
+	subq %rcx, %rax
+	popq %rbx
+	ret
+
+# probe_kernels(times rdi): the Q4_K kernels on one superblock held in L1
+# (compute only), 100000 calls, one activation row and eight (7, 8); then
+# walking the zeroed buffer as weights, one row, Q4_K and Q5_K (9, 10).
+	.set PK_TAB, 0
+	.set PK_ACC, 128
+	.set PK_XS, 640
+	.set PK_BYTES, 704 + 64
+probe_kernels:
+	pushq %rbx
+	pushq %r12
+	pushq %r13
+	pushq %r14
+	pushq %r15
+	pushq %rbp
+	movq %rsp, %rbp
+	subq $PK_BYTES, %rsp
+	andq $-64, %rsp
+	movq %rdi, %r12				# times
+	movq g_b + BUF_MAP + MAP_P(%rip), %r13	# x
+	xorl %ecx, %ecx
+1:	movq %rcx, %rax
+	shlq $10, %rax
+	addq %r13, %rax
+	movq %rax, PK_XS(%rsp,%rcx,8)
+	incl %ecx
+	cmpl $GROUP_MAX, %ecx
+	jb 1b
+	leaq PK_ACC(%rsp), %rdi
+	xorl %eax, %eax
+	movl $512 / 8, %ecx
+	rep stosq
+	call now_ns
+	movq %rax, r_c0(%rip)
+	movl $100000, %r14d
+2:	movq g_a + BUF_MAP + MAP_P(%rip), %rdi
+	movq %r13, %rsi
+	leaq PK_XS(%rsp), %rdx
+	leaq PK_TAB(%rsp), %rcx
+	leaq PK_ACC(%rsp), %r8
+	leaq g_consts(%rip), %r9
+	pushq $144
+	call phi_q4k_1
+	addq $8, %rsp
+	decl %r14d
+	jnz 2b
+	call now_ns
+	subq r_c0(%rip), %rax
+	movq %rax, 56(%r12)
+	call now_ns
+	movq %rax, r_c0(%rip)
+	movl $100000, %r14d
+3:	movq g_a + BUF_MAP + MAP_P(%rip), %rdi
+	movq %r13, %rsi
+	leaq PK_XS(%rsp), %rdx
+	leaq PK_TAB(%rsp), %rcx
+	leaq PK_ACC(%rsp), %r8
+	leaq g_consts(%rip), %r9
+	pushq $144
+	call phi_q4k_8
+	addq $8, %rsp
+	decl %r14d
+	jnz 3b
+	call now_ns
+	subq r_c0(%rip), %rax
+	movq %rax, 64(%r12)
+	call now_ns
+	movq %rax, r_c0(%rip)
+	movl $100000, %r14d
+	movq g_a + BUF_MAP + MAP_P(%rip), %r15
+4:	movq %r15, %rdi
+	movq %r13, %rsi
+	leaq PK_XS(%rsp), %rdx
+	leaq PK_TAB(%rsp), %rcx
+	leaq PK_ACC(%rsp), %r8
+	leaq g_consts(%rip), %r9
+	pushq $144
+	call phi_q4k_1
+	addq $8, %rsp
+	addq $144, %r15
+	decl %r14d
+	jnz 4b
+	call now_ns
+	subq r_c0(%rip), %rax
+	movq %rax, 72(%r12)
+	call now_ns
+	movq %rax, r_c0(%rip)
+	movl $100000, %r14d
+	movq g_a + BUF_MAP + MAP_P(%rip), %r15
+5:	movq %r15, %rdi
+	movq %r13, %rsi
+	leaq PK_XS(%rsp), %rdx
+	leaq PK_TAB(%rsp), %rcx
+	leaq PK_ACC(%rsp), %r8
+	leaq g_consts(%rip), %r9
+	pushq $176
+	call phi_q5k_1
+	addq $8, %rsp
+	addq $176, %r15
+	decl %r14d
+	jnz 5b
+	call now_ns
+	subq r_c0(%rip), %rax
+	movq %rax, 80(%r12)
+	movq %rbp, %rsp
+	popq %rbp
+	popq %r15
+	popq %r14
+	popq %r13
+	popq %r12
+	popq %rbx
+	ret
+
 .Lbad_said:
 	cmpq $0, r_verbose(%rip)
 	je .Lbad
@@ -2435,7 +2996,75 @@ times_after_compute:
 	subq %rdx, %rax
 	movq r_pcompute(%rip), %rcx
 	movq %rax, (%rcx)
+	cmpq $2, r_verbose(%rip)
+	jl 1f
+	call log_phases
 1:	popq %rbx
+	ret
+
+# log_phases: at -v -v, a fused request's phases across the threads
+# (vpu_phase, rows.S): the longest wait past the copy's completion, the
+# longest activation warm-up, the longest rows phase and its thread.
+log_phases:
+	pushq %rbx
+	pushq %r12
+	pushq %r13
+	pushq %r14
+	pushq %r15
+	movq g_fused + FU_DONE_NS(%rip), %rbx
+	xorl %r12d, %r12d			# wait
+	xorl %r13d, %r13d			# warm
+	xorl %r14d, %r14d			# rows
+	xorl %r15d, %r15d			# the slowest rows thread
+	xorl %ecx, %ecx
+	leaq vpu_phase(%rip), %rsi
+1:	cmpq r_threads(%rip), %rcx
+	jae 5f
+	movq %rcx, %rdx
+	shlq $6, %rdx
+	movq (%rsi,%rdx), %rax
+	movq %rax, %rdi
+	subq %rbx, %rdi
+	cmpq %r12, %rdi
+	jle 2f
+	movq %rdi, %r12
+2:	movq 8(%rsi,%rdx), %rdi
+	subq %rax, %rdi
+	cmpq %r13, %rdi
+	jle 3f
+	movq %rdi, %r13
+3:	movq 16(%rsi,%rdx), %rdi
+	subq 8(%rsi,%rdx), %rdi
+	cmpq %r14, %rdi
+	jle 4f
+	movq %rdi, %r14
+	movq %rcx, %r15
+4:	incq %rcx
+	jmp 1b
+5:	call l_begin
+	leaq s_ph1(%rip), %rsi
+	call w_str
+	movq %r12, %rdi
+	call w_ms
+	leaq s_ph2(%rip), %rsi
+	call w_str
+	movq %r13, %rdi
+	call w_ms
+	leaq s_ph3(%rip), %rsi
+	call w_str
+	movq %r14, %rdi
+	call w_ms
+	leaq s_ph4(%rip), %rsi
+	call w_str
+	movq %r15, %rdi
+	call w_dec
+	movl $1, %edi
+	call l_end
+	popq %r15
+	popq %r14
+	popq %r13
+	popq %r12
+	popq %rbx
 	ret
 
 # ids_ok(ids rsi, experts rdx, n rcx): eax 1 when every id is -1 (no
@@ -2459,6 +3088,15 @@ ids_ok:
 	.bss
 	.balign 8
 cuts:	.skip 48
+# the probe's bench job (kind, buffer, bytes per thread, count) and loops
+	.set BJ_KIND, 0
+	.set BJ_BUF, 8
+	.set BJ_PER, 16
+	.set BJ_COUNT, 24
+bjob:	.skip 32
+r_big:	.skip 8
+r_rounds:	.skip 8
+r_i:	.skip 8
 
 	.section .rodata
 s_upload:	.asciz "matmul: upload id "
@@ -2479,3 +3117,10 @@ s_threads_pull:	.asciz " threads: pull "
 s_compute:	.asciz " compute "
 s_push:	.asciz " push "
 s_msnl:	.asciz " ms"
+# the probe: the vector copy sizes and the prompt-sized transfers
+probe_sizes:	.quad 4096, 16384, 65536
+probe_psz:	.quad 16384, 65536, 1048576, 4194304
+s_ph1:	.asciz "phases: wait "
+s_ph2:	.asciz " ms, warm "
+s_ph3:	.asciz " ms, rows "
+s_ph4:	.asciz " ms on thread "
