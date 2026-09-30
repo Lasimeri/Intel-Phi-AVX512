@@ -1,0 +1,15 @@
+# proto.inc
+
+The host/card contract as assembler constants: the offsets of the
+control words, the request and reply fields, the request kinds and
+status values (`vpu_proto.h`), the seamless path's mailbox, descriptor,
+register file and slots (`vpu_exec.h`), and the matrix service's
+descriptors (`vpu_matmul.h`). The C headers stay the readable contract
+and the Rust side (`host/crates/phi-vpu/src/proto.rs`) carries the same
+numbers; `tools/vpu-layout-check.c` (`make layout-check`) compares the
+three, so a field moved in one place fails the check rather than
+shifting silently.
+
+`MAGIC` (`VPU_MAGIC`, "VPU_READ") is given as its two 32-bit halves
+because an assembler immediate is at most 32 bits in a store; the worker
+writes the word as a register.
