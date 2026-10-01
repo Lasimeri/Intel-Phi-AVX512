@@ -10,6 +10,7 @@ members = [
     "crates/phi512",
     "crates/phi-vpu",
     "crates/phi-pld",
+    "crates/phi-stream",
 ]
 # phi-pld links a llama.cpp build and needs libclang (bindgen): not built
 # by default; `make` adds it (`--workspace`) where llama.cpp is found, and
