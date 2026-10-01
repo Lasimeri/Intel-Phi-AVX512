@@ -63,6 +63,7 @@ sections are the same in every repository of the family (see
 | --- | --- | --- |
 | [Intel-Phi-3120A](https://github.com/Lasimeri/Intel-Phi-3120A) | the cards' software stack: daemon, kernel, boot, storage, the `phi` CLI, the cross toolchain | (none) |
 | [Intel-Phi-AVX512](https://github.com/Lasimeri/Intel-Phi-AVX512) (this one) | the cards as an AVX-512 co-processor: phi512, the card worker, the `libggml_phi.so` backend | `PHI_STACK_ROOT`, `phi` on PATH, a checkout next to this one, `$HOME` |
+| [Intel-Phi-Stream](https://github.com/Lasimeri/Intel-Phi-Stream) | a thought stream over the GPU, the cards and host memory, through `libggml_phi.so` | `PHI_AVX512_ROOT`, a checkout next to it, `$HOME` |
 | [Intel-Phi-Jev](https://github.com/Lasimeri/Intel-Phi-Jev) | `xks`, a local Jev (System One) whose subject runs on the host and the cards | `PHI_AVX512_ROOT`, a checkout next to it, `$HOME` |
 | [Mechanical-Jev](https://github.com/Lasimeri/Mechanical-Jev) | `mjev`, the asking side of Jev, and Jev reverse engineered from its docs | `MJEV_XKS`, `xks` on PATH, a checkout next to it, `$HOME` |
 
@@ -75,6 +76,7 @@ sections are the same in every repository of the family (see
   encoder is made in both in the same session.
 - The interfaces the others consume from this repository keep working
   across changes: `scripts/phi512.sh`, `scripts/phi-vpu.sh` and its verbs,
+  `scripts/phi-ggml.sh` (Intel-Phi-Stream runs through it),
   `host/target/release/libggml_phi.so`, and the `PHI_GGML_*` and
   `PHI_VPU_*` environment variables. Add, do not rename; when one must
   change, change its consumers in the same session.

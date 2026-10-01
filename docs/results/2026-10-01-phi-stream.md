@@ -5,7 +5,10 @@ GB, 1.7 GB of it the desktop's), both cards up with the assembly worker.
 llama.cpp f5b9bd3 unchanged: the CUDA build (`build/bin`) for the
 program, the backend `libggml_phi.so` of this repository at the commit of
 this record. Model: Qwen3.8-35B-A3B Q6_K (27.19 GiB in the file).
-Program: `host/crates/phi-stream` (`host/crates/phi-stream/src/main.md`).
+Program: `host/crates/phi-stream` at commit b8be089, moved the same day
+to its own repository, [Intel-Phi-Stream](https://github.com/Lasimeri/Intel-Phi-Stream),
+where its sources and their notes now are (the `.md` names below are
+its `src/`).
 Logs under `~/.cache/phi-asm-test/stream/`.
 
 ## The ask

@@ -56,10 +56,9 @@ stack's block-path timer shows,
   ([`scripts/stack.md`](scripts/stack.md)).
 - `make build` here: `libphi512.so` (the library the wrapper preloads),
   `libggml_phi.so` (the ggml backend), `phi-vpu` (the explicit driver),
-  the translator and the encoder; and `phi-pld` and `phi-stream` where
-  llama.cpp's headers are found (`LLAMA_CPP_DIR`, default `~/llama.cpp`;
-  skipped with a note otherwise; both need libclang; `phi-stream` links
-  the CUDA build, `build/bin`, or `PHI_STREAM_LLAMA_BUILD_DIR`).
+  the translator and the encoder; and `phi-pld` where llama.cpp's
+  headers are found (`LLAMA_CPP_DIR`, default `~/llama.cpp`; skipped with
+  a note otherwise; it also needs libclang).
 - The card's worker deployed once (`scripts/phi-vpu.sh -c N deploy`); it
   lives on the card's persistent disk after that, and the wrapper starts
   it when it is not running (`scripts/phi-vpu.sh -c N start` by hand).
@@ -292,28 +291,24 @@ activation rows are written into the window a quarter of a page apart
 (their L1 has 64 sets, and a 5 x 4096 row stride puts eight rows in the
 same ones).
 
-## A thought stream over the GPU, the cards and host memory: phi-stream
+## A thought stream over the GPU, the cards and host memory: Intel-Phi-Stream
 
-`phi-stream` (`host/crates/phi-stream`) runs one model, the 35B-A3B at
-Q6_K, split three ways: everything that is not an expert on the GPU with
-the experts of as many blocks as its free memory allows, the experts of
-the remaining blocks in host memory, where `libggml_phi.so` takes the
-cards' share of them as of any host weight (on this machine: 28 of 41
-blocks on the 3090 Ti, 8.0 GiB of experts in host memory, 2.94 GB of it
-on the cards). Over it, one context and several sequences: a live
-sequence that generates without pause, and beside it, in the same
+[Intel-Phi-Stream](https://github.com/Lasimeri/Intel-Phi-Stream) runs
+one model, the 35B-A3B at Q6_K, split three ways: everything that is not
+an expert on the GPU with the experts of as many blocks as its free
+memory allows, the experts of the remaining blocks in host memory, where
+`libggml_phi.so` takes the cards' share of them as of any host weight
+(28 of 41 blocks on the 3090 Ti, 8.0 GiB of experts in host memory, 2.94
+GB of it on the cards). Over it, one context and several sequences: a
+live sequence that generates without pause, and beside it, in the same
 decode cycles, the reading of whatever it is given, joined into the
-stream afterwards with a chase of the thoughts produced meanwhile
-(`host/crates/phi-stream/src/engine.md`). Short things said to it are
-heard in one cycle. Alone it generates 46 tokens a second and reads at
-about 295; reading beside the stream is a trade the chunk sets, 7.5
-tokens a second of thoughts against 120 read at chunks of 16, 3.5
-against 220 at 64 (`docs/results/2026-10-01-phi-stream.md`). `phi-stream
-tui` is the terminal, `run` the same on stdout and stdin.
-
-```
-scripts/phi-ggml.sh env PHI_GGML_OFFLOAD=1 host/target/release/phi-stream tui
-```
+stream afterwards. Alone it generates 46 tokens a second and reads at
+about 295; reading beside the stream is a trade the chunk sets (7.5
+tokens a second of thoughts against 120 read at chunks of 16). It was
+written here on 2026-10-01 (commit b8be089) and moved to its own
+repository the same day; the founding record stays here
+(`docs/results/2026-10-01-phi-stream.md`). It consumes `scripts/phi-ggml.sh`
+and `libggml_phi.so` from this repository.
 
 ## Layout
 
@@ -325,7 +320,6 @@ scripts/phi-ggml.sh env PHI_GGML_OFFLOAD=1 host/target/release/phi-stream tui
 | `host/crates/phi-vpu` | the protocol with the card worker, the shared window, the explicit driver |
 | `host/asm/ggml-phi` | `libggml_phi.so`, the ggml backend in assembly (with `host/asm/common`): matrix multiplies shared by rows between the host and the cards; `host/crates/phi-ggml` keeps the Rust design notes |
 | `host/crates/phi-pld` | `phi-pld`, prompt lookup decoding over libllama (llama.cpp unchanged), served as llama-server serves; its simulator; built where llama.cpp is found |
-| `host/crates/phi-stream` | `phi-stream`, a thought stream over libllama (llama.cpp unchanged): one model split over the GPU, the cards and host memory, a live sequence that never stops while what it is given is read beside it; a terminal to talk to it; built where llama.cpp's CUDA build is found |
 | `card/vpu` | the card-side worker: the exec engine, the explicit path's thread pool and the matrix-multiply service; built by `scripts/phi-vpu.sh deploy`, on the host with the stack's cross toolchain when it has one (`card/vpu/build.md`) |
 | `card/examples` | the AVX-512 kernel and its translation the explicit path and the ground-truth check use |
 | `tools` | the seamless, narrow and review tests, the conformance programs, the protocol layout check |
@@ -343,14 +337,15 @@ the stack's copy (`mvex-check`); `CONTRIBUTING.md` has the rules.
 | --- | --- | --- |
 | [Intel-Phi-3120A](https://github.com/Lasimeri/Intel-Phi-3120A) | the cards' software stack: boots them, serves their memory, the `phi` command | `PHI_STACK_ROOT`, else `phi` on PATH, else a checkout next to this one, else in `$HOME` |
 | Intel-Phi-AVX512 (this one) | the cards as an AVX-512 co-processor | `PHI_AVX512_ROOT`, else a checkout next to Intel-Phi-Jev, else in `$HOME` |
+| [Intel-Phi-Stream](https://github.com/Lasimeri/Intel-Phi-Stream) | a thought stream over the GPU, the cards and host memory, through `libggml_phi.so` and `scripts/phi-ggml.sh` | `PHI_AVX512_ROOT`, else a checkout next to it, else in `` |
 | [Intel-Phi-Jev](https://github.com/Lasimeri/Intel-Phi-Jev) | `xks`, a local Jev (TypeSafe System One) whose model runs through `libggml_phi.so` (its `cards` site) and `phi512.sh` (its `avx512` site) | by Mechanical-Jev |
 | [Mechanical-Jev](https://github.com/Lasimeri/Mechanical-Jev) | `mjev`, the asking side of that Jev | |
 
 Cloned side by side, the repositories find each other without
 configuration, under each one's clone name or the spaced one; the model
 and llama.cpp paths are set in Intel-Phi-Jev's `xks.conf`, and the cards
-need the stack's `phi` command with a card up. What Intel-Phi-Jev
-consumes from here (`scripts/phi512.sh`, `scripts/phi-vpu.sh`,
+need the stack's `phi` command with a card up. What Intel-Phi-Jev and Intel-Phi-Stream
+consume from here (`scripts/phi512.sh`, `scripts/phi-vpu.sh`,
 `host/target/release/libggml_phi.so`, the `PHI_GGML_*` and `PHI_VPU_*`
 variables) stays as it is across changes; [`CONTRIBUTING.md`](CONTRIBUTING.md)
 has the rules the repositories share. MIT ([`LICENSE-MIT`](LICENSE-MIT)).

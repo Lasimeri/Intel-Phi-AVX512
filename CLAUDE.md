@@ -10,7 +10,8 @@ Read `CONTRIBUTING.md` first; it is the authority. The non-obvious rules:
   identical to the stack's by `make mvex-check`). Intel-Phi-Jev consumes
   `scripts/phi512.sh`, `scripts/phi-vpu.sh`,
   `host/target/release/libggml_phi.so` and the `PHI_GGML_*` /
-  `PHI_VPU_*` variables: add, do not rename.
+  `PHI_VPU_*` variables, Intel-Phi-Stream `scripts/phi-ggml.sh` and the
+  same library: add, do not rename.
 - Rust on the host for what is not yet ported. The card worker
   (`card/vpu`) and the ggml backend (`host/asm/ggml-phi`,
   `host/asm/common`) are assembly: GNU `as` on the host, no libc, the

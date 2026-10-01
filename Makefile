@@ -9,14 +9,14 @@ HOST := host
 LLAMA_CPP_DIR ?= $(HOME)/llama.cpp
 export LLAMA_CPP_DIR
 PLD := $(if $(wildcard $(LLAMA_CPP_DIR)/include/llama.h),--workspace,)
-PLD_NOTE = $(if $(PLD),,@echo "phi-pld and phi-stream skipped: no $(LLAMA_CPP_DIR)/include/llama.h (set LLAMA_CPP_DIR)")
+PLD_NOTE = $(if $(PLD),,@echo "phi-pld skipped: no $(LLAMA_CPP_DIR)/include/llama.h (set LLAMA_CPP_DIR)")
 
 .PHONY: help build test fmt clippy docs-check layout-check mvex-check check clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-14s %s\n", $$1, $$2}'
 
-build: ## Build the host workspace (libphi512.so, phi-vpu, the translator, the encoder; phi-pld and phi-stream where llama.cpp is found) and libggml_phi.so from host/asm
+build: ## Build the host workspace (libphi512.so, phi-vpu, the translator, the encoder; phi-pld where llama.cpp is found) and libggml_phi.so from host/asm
 	cd $(HOST) && cargo build $(PLD) && cargo build --release $(PLD)
 	$(PLD_NOTE)
 	host/asm/ggml-phi/build.sh --install
