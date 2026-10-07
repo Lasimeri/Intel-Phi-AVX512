@@ -59,6 +59,8 @@ verbose:	.skip 4
 ffn_h16:	.skip 4
 offload:	.skip 4
 judge:	.skip 4
+experts_host:	.skip 4		# whole experts placed with the offload off (the host keeps its copy)
+tg_only:	.skip 4			# PHI_GGML_TG_ONLY: a multiply of more than one token stays with the host
 	.p2align 3
 pp_only:	.skip 8			# PHI_GGML_PP_ONLY: tokens a multiply must exceed to reach a card (0: off)
 all_rows:	.skip 4
@@ -233,6 +235,7 @@ e_experts:	.asciz "PHI_GGML_EXPERTS"
 e_spin:	.asciz "PHI_GGML_SPIN_US"
 e_judge:	.asciz "PHI_GGML_JUDGE"
 e_pp_only:	.asciz "PHI_GGML_PP_ONLY"
+e_tg_only:	.asciz "PHI_GGML_TG_ONLY"
 e_min_bytes:	.asciz "PHI_GGML_MIN_BYTES"
 e_pp_adapt:	.asciz "PHI_GGML_PP_ADAPT"
 e_act:	.asciz "PHI_GGML_ACT"
@@ -282,6 +285,7 @@ s_nocards:	.asciz "no card is up with a worker polling; nothing to share the wor
 s_clear:	.asciz "could not clear card "
 s_allrows_needs:	.asciz "PHI_GGML_ALL_ROWS needs PHI_GGML_OFFLOAD=1 (the judgement needs host rows): ignored"
 s_experts_needs:	.asciz "PHI_GGML_EXPERTS needs PHI_GGML_OFFLOAD=1 (a whole expert on a card is not the host's to compute): ignored"
+s_experts_host:	.asciz "whole experts without the offload: the host keeps its copy of every expert (a batch handed to a GPU reads it) and skips the cards' at a generation step; the judge is off"
 s_experts_err1:	.asciz "PHI_GGML_EXPERTS: "
 s_experts_err2:	.asciz "; the experts are shared by rows"
 s_spin1:	.asciz "waiting for a card spins "
@@ -303,6 +307,8 @@ s_judge_off:	.asciz "judge off: a tensor goes where the static rules put it, wha
 s_pp_only_line:	.asciz "prompts only (PHI_GGML_PP_ONLY): a multiply of that many tokens or fewer stays off the cards, so the cards take the prompts and token generation stays with the GPUs and the host"
 s_pp_only_off:	.asciz "PHI_GGML_PP_ONLY ignored: under the offload the host has no copy of the cards' rows to generate with"
 r_tokens:	.asciz "few tokens (the cards take prompts only)"
+s_tg_only_line:	.asciz "generation only (PHI_GGML_TG_ONLY): a multiply of more than one token stays off the cards, so the prompts stay with the GPUs and the host and the cards take the generation steps"
+r_batch:	.asciz "a batch (the cards take generation steps only)"
 s_no_layer_line:	.asciz ": no 'layer N: e e ...' line"
 s_layer_prefix:	.asciz "layer "
 s_reads1:	.asciz "the host reads "
@@ -1198,9 +1204,16 @@ phi_ggml_open:
 	jz 84f
 	cmpl $0, offload(%rip)
 	jne 82f
-	leaq s_experts_needs(%rip), %rsi
+	# Without the offload the host keeps every page: a card's whole
+	# expert is skipped by the host through the substituted ids at a
+	# generation step, and a batch handed to a GPU (llama.cpp's op
+	# offload) reads the host's copy. The judge is off, so a tensor
+	# never moves back to the host by its timings.
+	pushq %rax				# the file's path, kept across say
+	leaq s_experts_host(%rip), %rsi
 	call say
-	jmp 84f
+	movl $1, experts_host(%rip)
+	popq %rax
 82:	movq %rax, %rdi
 	call load_placement
 	testl %eax, %eax
@@ -1329,7 +1342,14 @@ phi_ggml_open:
 	setnz %al
 	movzbl %al, %eax
 	movl %eax, judge(%rip)
-	testl %eax, %eax
+	# whole experts without the offload (above): the judge off whatever
+	# PHI_GGML_JUDGE says, since a tensor moved back to the host would be
+	# computed in full by the host, its cards' experts included
+	cmpl $0, experts_host(%rip)
+	je 941f
+	movl $0, judge(%rip)
+	jmp 95f
+941:	testl %eax, %eax
 	jnz 95f
 	cmpl $0, offload(%rip)
 	jne 95f
@@ -1352,7 +1372,20 @@ phi_ggml_open:
 	jmp 96f
 97:	leaq s_pp_only_line(%rip), %rsi
 	call say
-96:	movl -48(%rbp), %eax
+96:	# PHI_GGML_TG_ONLY=1: the inverse, a multiply of more than one token
+	# stays with the host (prepare)
+	leaq e_tg_only(%rip), %rdi
+	xorl %esi, %esi
+	call env_u64
+	testq %rax, %rax
+	setnz %al
+	movzbl %al, %eax
+	movl %eax, tg_only(%rip)
+	testl %eax, %eax
+	jz 98f
+	leaq s_tg_only_line(%rip), %rsi
+	call say
+98:	movl -48(%rbp), %eax
 	xorl $1, %eax
 	movl %eax, fraction_auto(%rip)
 	movl $0, fraction_settled(%rip)
@@ -3728,7 +3761,20 @@ prepare:
 	movl $1, %edx
 	call prep_host
 	jmp 99f
-43:	leaq members_tab(%rip), %rdi
+	# generation only: a multiply of more than one token stays with the host
+43:	cmpl $0, tg_only(%rip)
+	je 45f
+	movq q_n(%rip), %rax
+	cmpl $0, -48(%rbp)
+	je 46f
+	movq MX_N_TOKENS(%rbx), %rax
+46:	cmpq $1, %rax
+	jbe 45f
+	leaq r_batch(%rip), %rsi
+	movl $1, %edx
+	call prep_host
+	jmp 99f
+45:	leaq members_tab(%rip), %rdi
 	movq q_a(%rip), %rsi
 	call tab_find
 	testq %rax, %rax

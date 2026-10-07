@@ -23,8 +23,9 @@ variables (every one with its Rust default):
 | `PHI_GGML_ACT` | 1 | activations as float16 |
 | `PHI_GGML_OFFLOAD` | 0 | the cards' rows are theirs alone and their pages are dropped |
 | `PHI_GGML_ALL_ROWS` | 0 | with the offload, the cards may keep every row |
-| `PHI_GGML_EXPERTS` | unset | a placement file: whole experts on the cards (offload only) |
+| `PHI_GGML_EXPERTS` | unset | a placement file: whole experts on the cards. Under the offload the cards' experts are theirs alone (their pages dropped); without it (since 2026-10-06) the host keeps its copy of every expert, so a batch handed to a GPU by llama.cpp's op offload reads it while a generation step skips the cards' experts through the substituted ids, and the judge is forced off (a tensor judged back to the host would be computed in full there) |
 | `PHI_GGML_JUDGE` | 1 | tensors judged by their timings |
+| `PHI_GGML_TG_ONLY` | 0 | the inverse: a multiply of more than one token (a mixture's tokens) stays with the host, so the prompts stay with the GPUs and the host (llama.phi's prefill engine) and the cards take the generation steps alone (2026-10-06, the user's split for the rack) |
 | `PHI_GGML_PP_ONLY` | 0 | a multiply of that many tokens or fewer (a mixture's tokens, not its columns) stays with the host: the cards take the prompts, token generation stays with the GPUs and the host. Ignored under the offload (the host has no copy to generate with). Measured 2026-10-06 on the four-card rack, Flash-Next Q6_K_XL, twice interleaved: prompts 87.9 and 88.1 against 85.5 and 85.8 tok/s, generation 8.02 and 7.80 against 7.68 and 7.59 (`PHI_GGML_PP_ONLY=1`) |
 | `PHI_GGML_SPIN_US` | unset: spin throughout | how long a wait spins before it naps |
 | `PHI_GGML_FFN_H16` | 0 | the fused block's intermediate as float16 on the card |
