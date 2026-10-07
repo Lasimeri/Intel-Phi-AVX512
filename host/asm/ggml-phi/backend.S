@@ -60,7 +60,7 @@ ffn_h16:	.skip 4
 offload:	.skip 4
 judge:	.skip 4
 experts_host:	.skip 4		# whole experts placed with the offload off (the host keeps its copy)
-tg_only:	.skip 4			# PHI_GGML_TG_ONLY: a multiply of more than one token stays with the host
+tg_only:	.skip 8			# PHI_GGML_TG_ONLY=K: a multiply of more than K tokens stays with the host (0: off)
 	.p2align 3
 pp_only:	.skip 8			# PHI_GGML_PP_ONLY: tokens a multiply must exceed to reach a card (0: off)
 all_rows:	.skip 4
@@ -307,7 +307,7 @@ s_judge_off:	.asciz "judge off: a tensor goes where the static rules put it, wha
 s_pp_only_line:	.asciz "prompts only (PHI_GGML_PP_ONLY): a multiply of that many tokens or fewer stays off the cards, so the cards take the prompts and token generation stays with the GPUs and the host"
 s_pp_only_off:	.asciz "PHI_GGML_PP_ONLY ignored: under the offload the host has no copy of the cards' rows to generate with"
 r_tokens:	.asciz "few tokens (the cards take prompts only)"
-s_tg_only_line:	.asciz "generation only (PHI_GGML_TG_ONLY): a multiply of more than one token stays off the cards, so the prompts stay with the GPUs and the host and the cards take the generation steps"
+s_tg_only_line:	.asciz "generation only (PHI_GGML_TG_ONLY=K): a multiply of more than K tokens stays off the cards, so the prompts stay with the GPUs and the host and the cards take the generation steps of up to K sequences at once"
 r_batch:	.asciz "a batch (the cards take generation steps only)"
 s_no_layer_line:	.asciz ": no 'layer N: e e ...' line"
 s_layer_prefix:	.asciz "layer "
@@ -1372,16 +1372,13 @@ phi_ggml_open:
 	jmp 96f
 97:	leaq s_pp_only_line(%rip), %rsi
 	call say
-96:	# PHI_GGML_TG_ONLY=1: the inverse, a multiply of more than one token
-	# stays with the host (prepare)
+96:	# PHI_GGML_TG_ONLY=K: the inverse, a multiply of more than K tokens
+	# stays with the host (prepare); K is the sequences generating at once
 	leaq e_tg_only(%rip), %rdi
 	xorl %esi, %esi
 	call env_u64
+	movq %rax, tg_only(%rip)
 	testq %rax, %rax
-	setnz %al
-	movzbl %al, %eax
-	movl %eax, tg_only(%rip)
-	testl %eax, %eax
 	jz 98f
 	leaq s_tg_only_line(%rip), %rsi
 	call say
@@ -3761,14 +3758,14 @@ prepare:
 	movl $1, %edx
 	call prep_host
 	jmp 99f
-	# generation only: a multiply of more than one token stays with the host
-43:	cmpl $0, tg_only(%rip)
+	# generation only: a multiply of more than tg_only tokens stays with the host
+43:	cmpq $0, tg_only(%rip)
 	je 45f
 	movq q_n(%rip), %rax
 	cmpl $0, -48(%rbp)
 	je 46f
 	movq MX_N_TOKENS(%rbx), %rax
-46:	cmpq $1, %rax
+46:	cmpq tg_only(%rip), %rax
 	jbe 45f
 	leaq r_batch(%rip), %rsi
 	movl $1, %edx
