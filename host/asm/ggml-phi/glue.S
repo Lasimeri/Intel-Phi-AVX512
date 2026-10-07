@@ -1306,6 +1306,13 @@ supports_mul_mat_id:
 	call phi_ggml_supports
 	testl %eax, %eax
 	jz 9f
+	# phi_ggml_take over the mixture's tokens (ids' ne1)
+	movq T_DATA(%r12), %rdi
+	movl %r15d, %esi
+	movq T_NE+8(%r14), %rdx
+	call phi_ggml_take
+	testl %eax, %eax
+	jz 9f
 	movq %r12, %rdi
 	call layer_of
 	movq T_DATA(%r12), %rdi
@@ -1372,6 +1379,14 @@ supports_mul_mat:
 	movq T_NB+8(%r13), %r8
 	movq T_NE+8(%r13), %r9
 	call phi_ggml_supports
+	testl %eax, %eax
+	jz 9f
+	# the rules that would keep it with the host anyway (phi_ggml_take):
+	# then it stays in the CPU's sub-graph, and is not offered
+	movq T_DATA(%r12), %rdi
+	movl %r15d, %esi
+	movq T_NE+8(%r13), %rdx
+	call phi_ggml_take
 	testl %eax, %eax
 	jz 9f
 	movq %r12, %rdi

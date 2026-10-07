@@ -34,6 +34,15 @@ hands out a backend from a pool of eight (`BE_SLOT`, `BE_USED`).
   for the shares (`phi_ggml_note_weight`, with its layer from the name
   `blk.N.`).
 - `MUL_MAT_ID` likewise, over the experts.
+- Either multiply only when `phi_ggml_take` (`backend.md`) says the cards
+  may take it: not when a rule `prepare` applies would keep it with the
+  host anyway (the batch class: `PHI_GGML_PP_ONLY`, `PHI_GGML_TG_ONLY`,
+  float weights at a batch; and, once the weight has been multiplied, its
+  split: the host keeping every row, the judge having taken it off at
+  that class). Declined, the multiply stays inside the CPU's sub-graph and
+  is not offered for the shares. ggml's scheduler asks again whenever
+  llama.cpp builds a graph (each new shape: in a server, each request),
+  not at a graph it reuses.
 - `GLU` (SwiGLU, split) when `PHI_GGML_FFN` is on and the node is part
   of a fusable block (`ffn_enabled`; off under `PHI_GGML_OFFLOAD` with
   the message the C gave).

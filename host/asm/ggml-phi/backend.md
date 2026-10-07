@@ -132,3 +132,26 @@ placements, 512 experts in a mixture placed whole (a larger one is
 shared by rows), 256 layers in a placement file, 64 entries of
 `PHI_GGML_CARDS`, 65536 columns of ids, 8192 file-backed ranges. None
 is near what a model here has.
+
+## The gate (`phi_ggml_take`, 2026-10-07)
+
+`supports_op` asks it before offering a multiply: 0 when what `prepare`
+applies would keep that multiply with the host whatever happens, so
+ggml's scheduler leaves it in the CPU backend's own sub-graph. The rules
+are `prepare`'s, in its order: the batch class (`pp_only`, `tg_only`,
+over a mixture's tokens), float weights at a batch (8 tokens and over,
+unless offloaded), and, when the weight has a split (it has been
+multiplied once), the split's record: whole experts placed (taken), the
+host keeping every row (`SP_NCARDS` 0: the share's card part under
+`min_bytes`), the judge having taken it off at this class
+(`SP_AVOID`). A weight never multiplied is taken (the first graph is as
+before); the scheduler asks again at the next graph llama.cpp builds.
+
+Why: Qwen3.8 Flash Next generating on the rack (`PHI_GGML_TG_ONLY=1`,
+`-t 12`, GPUs hidden) made 905 multiplies a token, 134 of them on the
+cards; every one of the 905 was a sub-graph of one node handed to this
+backend, the host's rows computed through `host_rows` on the private CPU
+backend. The backend loaded with no tensor allowed on a card
+(`PHI_GGML_MIN_BYTES` huge) ran 6.48 and 6.16 tokens a second against
+the CPU alone's 7.76 and 7.92, interleaved: the hand-offs, not the
+cards, cost about 30 ms a token (`docs/results/2026-10-07-rack-generation.md`).

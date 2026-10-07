@@ -2146,6 +2146,83 @@ phi_ggml_supports:
 	popq %rbx
 	ret
 
+# phi_ggml_take(a rdi, card type esi, tokens rdx): eax 1 when the cards
+# may take a multiply of the weight at a (its data) over that many tokens
+# (a mixture's tokens), 0 when what prepare applies would keep it with the
+# host whatever happens: the batch class's rules (PHI_GGML_PP_ONLY,
+# PHI_GGML_TG_ONLY, float weights at a batch) and, once the weight has
+# been multiplied, what its split recorded (the host keeping every row,
+# the judge having taken it off at this class). Declined here, ggml's
+# scheduler leaves the multiply inside the CPU's own sub-graph instead of
+# one of its own with a hand-off to this backend (2026-10-07, Flash Next
+# on the rack: 771 of a token's 905 multiplies never reached a card and
+# their hand-offs cost about 30 ms a token). Clobbers rax, rcx, rdx, rsi,
+# rdi, r8 to r11.
+	.globl phi_ggml_take
+phi_ggml_take:
+	pushq %rbp
+	movq %rsp, %rbp
+	pushq %rbx
+	pushq %r12
+	pushq %r13
+	pushq %r14
+	movq %rdi, %r12				# a
+	movl %esi, %r13d			# card type
+	movq %rdx, %r14				# tokens
+	# prompts only: that many tokens or fewer stay with the host
+	movq pp_only(%rip), %rcx
+	testq %rcx, %rcx
+	jz 1f
+	cmpq %rcx, %r14
+	jbe 8f
+	# generation only: more than that many stay with the host
+1:	movq tg_only(%rip), %rcx
+	testq %rcx, %rcx
+	jz 2f
+	cmpq %rcx, %r14
+	ja 8f
+	# the batch class (as prepare's: 8 tokens and over), float weights
+	# at a batch
+2:	xorl %ebx, %ebx
+	cmpq $8, %r14
+	jb 3f
+	movl $1, %ebx
+	cmpl $0, offload(%rip)
+	jne 3f
+	cmpl $MM_F16, %r13d
+	je 8f
+	cmpl $MM_F32, %r13d
+	je 8f
+	# what the weight's split recorded, if it has one
+3:	leaq ctx_lock(%rip), %rdi
+	call lock_take
+	movl $1, %r13d
+	leaq splits_tab(%rip), %rdi
+	movq %r12, %rsi
+	call tab_find
+	testq %rax, %rax
+	jz 7f
+	cmpl $0, SP_WHOLE(%rax)			# whole experts placed: the cards'
+	jns 7f
+	cmpl $0, SP_NCARDS(%rax)		# the host keeps every row
+	je 6f
+	cmpl $0, offload(%rip)
+	jne 7f
+	cmpl $0, SP_AVOID0(%rax,%rbx,4)		# judged off at this class
+	je 7f
+6:	xorl %r13d, %r13d
+7:	leaq ctx_lock(%rip), %rdi
+	call lock_drop
+	movl %r13d, %eax
+	jmp 9f
+8:	xorl %eax, %eax
+9:	popq %r14
+	popq %r13
+	popq %r12
+	popq %rbx
+	popq %rbp
+	ret
+
 # phi_ggml_note_weight(data rdi, m rsi, nb_a rdx, experts rcx, mixture
 # r8d, layer r9d): the weight noted for the shares' sizing, until they
 # are settled.
