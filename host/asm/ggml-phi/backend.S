@@ -59,6 +59,8 @@ verbose:	.skip 4
 ffn_h16:	.skip 4
 offload:	.skip 4
 judge:	.skip 4
+	.p2align 3
+pp_only:	.skip 8			# PHI_GGML_PP_ONLY: tokens a multiply must exceed to reach a card (0: off)
 all_rows:	.skip 4
 unmapped_said:	.skip 4
 ids_env:	.skip 4			# PHI_GGML_IDS set
@@ -230,6 +232,7 @@ e_all_rows:	.asciz "PHI_GGML_ALL_ROWS"
 e_experts:	.asciz "PHI_GGML_EXPERTS"
 e_spin:	.asciz "PHI_GGML_SPIN_US"
 e_judge:	.asciz "PHI_GGML_JUDGE"
+e_pp_only:	.asciz "PHI_GGML_PP_ONLY"
 e_min_bytes:	.asciz "PHI_GGML_MIN_BYTES"
 e_pp_adapt:	.asciz "PHI_GGML_PP_ADAPT"
 e_act:	.asciz "PHI_GGML_ACT"
@@ -297,6 +300,9 @@ s_threads_rest:	.asciz " threads while the host does the rest"
 s_offload_line:	.asciz "offload: the cards' rows are theirs alone; the host never reads them after the upload, and their pages are dropped"
 s_allrows_line:	.asciz "all rows: the cards may keep every row of a matrix, the host none (a model that fits them leaves the host no weight arithmetic)"
 s_judge_off:	.asciz "judge off: a tensor goes where the static rules put it, whatever its timings (with PHI_GGML_PP_ADAPT=0, the same request gives the same output)"
+s_pp_only_line:	.asciz "prompts only (PHI_GGML_PP_ONLY): a multiply of that many tokens or fewer stays off the cards, so the cards take the prompts and token generation stays with the GPUs and the host"
+s_pp_only_off:	.asciz "PHI_GGML_PP_ONLY ignored: under the offload the host has no copy of the cards' rows to generate with"
+r_tokens:	.asciz "few tokens (the cards take prompts only)"
 s_no_layer_line:	.asciz ": no 'layer N: e e ...' line"
 s_layer_prefix:	.asciz "layer "
 s_reads1:	.asciz "the host reads "
@@ -1330,7 +1336,23 @@ phi_ggml_open:
 	leaq s_judge_off(%rip), %rsi
 	call say
 95:	# the rest of the state
-	movl -48(%rbp), %eax
+	# PHI_GGML_PP_ONLY=K: a multiply of K tokens or fewer stays with the
+	# host (prepare), which needs the host's own copy of the cards' rows.
+	leaq e_pp_only(%rip), %rdi
+	xorl %esi, %esi
+	call env_u64
+	movq %rax, pp_only(%rip)
+	testq %rax, %rax
+	jz 96f
+	cmpl $0, offload(%rip)
+	je 97f
+	movq $0, pp_only(%rip)
+	leaq s_pp_only_off(%rip), %rsi
+	call say
+	jmp 96f
+97:	leaq s_pp_only_line(%rip), %rsi
+	call say
+96:	movl -48(%rbp), %eax
 	xorl $1, %eax
 	movl %eax, fraction_auto(%rip)
 	movl $0, fraction_settled(%rip)
@@ -3691,7 +3713,22 @@ prepare:
 	movl $1, %edx
 	call prep_host
 	jmp 99f
-42:	leaq members_tab(%rip), %rdi
+	# prompts only: a multiply of pp_only tokens or fewer (a mixture's
+	# tokens, not its columns) stays with the host
+42:	movq pp_only(%rip), %rcx
+	testq %rcx, %rcx
+	jz 43f
+	movq q_n(%rip), %rax
+	cmpl $0, -48(%rbp)
+	je 44f
+	movq MX_N_TOKENS(%rbx), %rax
+44:	cmpq %rcx, %rax
+	ja 43f
+	leaq r_tokens(%rip), %rsi
+	movl $1, %edx
+	call prep_host
+	jmp 99f
+43:	leaq members_tab(%rip), %rdi
 	movq q_a(%rip), %rsi
 	call tab_find
 	testq %rax, %rax
