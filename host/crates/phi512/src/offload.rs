@@ -38,7 +38,7 @@ use iced_x86::{CpuidFeature, Decoder, DecoderOptions, EncodingKind, FlowControl,
 use phi_vpu::proto::*;
 use phi_vpu::window::{wait_ready, Window};
 
-use crate::plan::{self, Bound, Insns, Loop, Tracker, Val};
+use crate::plan::{self, Bound, Insns, Loop, Tracker};
 use crate::state::VState;
 
 /// ucontext gregs indices (glibc x86-64).
@@ -1471,9 +1471,6 @@ fn finish(
         total_us: t0.elapsed().as_micros() as u64,
     })
 }
-
-#[allow(dead_code)]
-fn unused(_: Val) {}
 
 #[cfg(test)]
 mod tests {

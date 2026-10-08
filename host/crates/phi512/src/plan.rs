@@ -76,10 +76,6 @@ impl Val {
             Val::Unknown => Val::Unknown,
         }
     }
-    #[allow(dead_code)]
-    fn is_known(self) -> bool {
-        matches!(self, Val::Known(_))
-    }
 }
 
 /// x86 encoding index of a general register, any width.
