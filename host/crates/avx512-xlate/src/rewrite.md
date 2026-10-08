@@ -102,11 +102,19 @@ What the card cannot do directly, and how each is expressed:
   the unpack pair (2-byte alignment) or from a register through the
   scratch area; `vcvtps2ph` the float16 store down-conversion.
   `vpmovzxbd`, `vpmovsxbd`, `vpmovzxwd`, `vpmovsxwd` are the byte and
-  word up-conversions the same way.
+  word up-conversions the same way. `vpmovzxdq` and `vpmovsxdq` (dword
+  to qword, which the card cannot up-convert from a register) permute
+  each dword into both halves of its qword (`vpermd` by 0, 0, 1, 1, ...)
+  and zero the high halves or shift them to the sign (`vpsrad` 31); the
+  mask applies per qword (2026-10-08).
 - **64-bit lanes the card lacks**: `vpsrlq`, `vpsllq`, `vpsraq` by
   immediate as the two halves shifted and combined; `vpmuludq` as
   `vpmulld` and `vpmulhud` interleaved; `vpabsd` as `(x ^ (x >> 31)) -
-  (x >> 31)`.
+  (x >> 31)`; `vpaddq` and `vpsubq` as `vpaddd` and `vpsubd` on both
+  halves, then each low half's carry (the sum below a summand) or
+  borrow (the minuend below the subtrahend) from `vpcmpud` lt, kept on
+  the even lanes and moved up one lane through eax (`and`, `shl`), added
+  to or subtracted from the high half (2026-10-08).
 - **`vmaxps` / `vminps`**: the second source everywhere, the first
   where an ordered compare holds, which is AVX-512's choice for NaN and
   signed zeros (the card's `vgmaxps` is IEEE maxNum, which differs).
@@ -132,7 +140,10 @@ What the card cannot do directly, and how each is expressed:
   and `vgetmantps` are the same opcodes.
 - **Scalar conversions with general registers** (`vcvtsi2sd`,
   `vcvtusi2ss`, `vcvttss2si`, ...): integer to float through x87 (`fild`,
-  `fstp`: one rounding of an exact value), float to a signed 32-bit
+  `fstp`: one rounding of an exact value; an unsigned 64-bit integer,
+  which `fild` reads as signed, gets 2^64 added when its top bit is set,
+  chosen without a branch, and the sum is still exact in x87's 64-bit
+  significand, 2026-10-08), float to a signed 32-bit
   integer through the card's fixed-point conversion with the indefinite
   fix-up, float to an unsigned 32-bit or a 64-bit integer through x87
   with the control word set to

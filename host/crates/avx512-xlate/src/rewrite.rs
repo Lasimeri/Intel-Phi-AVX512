@@ -807,6 +807,8 @@ fn special(insn: &Instruction, bytes: &[u8], ev: &Ev, tg: &Target) -> Result<Opt
         },
         M::Vcvtps2ph => cvt_ps2ph(insn, ev, tg)?,
         M::Vpmovzxbd | M::Vpmovsxbd | M::Vpmovzxwd | M::Vpmovsxwd => widen(insn, ev, tg)?,
+        M::Vpmovzxdq | M::Vpmovsxdq => widen_dq(insn, ev, tg)?,
+        M::Vpaddq | M::Vpsubq => add_sub_q(insn, ev, tg)?,
         M::Vpsrlq | M::Vpsllq | M::Vpsraq if insn.op_kind(insn.op_count() - 1) == OpKind::Immediate8 => shift_q(insn, ev, tg)?,
         M::Vpabsd => abs_d(insn, ev, tg)?,
         M::Vpmuludq => muludq(insn, ev, tg)?,
@@ -1582,6 +1584,73 @@ fn widen(insn: &Instruction, ev: &Ev, tg: &Target) -> Result<Rewrite, Unsupporte
         }
     }
     commit(&mut em, d, r, ev);
+    Ok(Rewrite::Thunk(em.finish()))
+}
+
+/// vpmovzxdq / vpmovsxdq: dword j of the source to qword j, its high half
+/// zero or the sign. The card has no register form of the widening, so
+/// the dwords are permuted into both halves of their qword (`vpermd` by
+/// 0, 0, 1, 1, ...) and the high halves zeroed or shifted to the sign
+/// (`vpsrad` 31); the mask applies per qword.
+fn widen_dq(insn: &Instruction, ev: &Ev, tg: &Target) -> Result<Rewrite, Unsupported> {
+    let mut em = Em::new(tg, insn);
+    let d = ev.reg;
+    let signed = insn.mnemonic() == Mnemonic::Vpmovsxdq;
+    let r = em.temp().map_err(|e| refuse(insn, e))?;
+    let t = em.temp().map_err(|e| refuse(insn, e))?;
+    let s = match MemOp::of(insn) {
+        Some(m) => {
+            // The source's dwords: half the destination's lanes in dwords.
+            let u = em.temp().map_err(|e| refuse(insn, e))?;
+            let n = vl_lanes(ev.ll, 1).count_ones();
+            let k = em.mask_imm(((1u32 << n) - 1) as u16);
+            em.load_unaligned(u, m, k, 0, false, 0);
+            u
+        }
+        None => ev.rm,
+    };
+    let idx = em.const_dws([0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7]);
+    em.vmov(t, Rm::Const(idx), 0, 0);
+    em.vpermd(r, t, Rm::Reg(s), 0);
+    let odd = em.mask_imm(0xaaaa);
+    if signed {
+        em.shift_imm(4, r, Rm::Reg(r), 31, odd);
+    } else {
+        em.zero(r, odd, 0);
+    }
+    commit(&mut em, d, r, &Ev { w: 1, ..*ev });
+    Ok(Rewrite::Thunk(em.finish()))
+}
+
+/// vpaddq / vpsubq on dword lanes: both halves of every qword added
+/// (subtracted) with `vpaddd` (`vpsubd`), then the carry (borrow) of each
+/// low half into its high half. The carries are an unsigned compare of the
+/// low halves (`vpcmpud` lt: the sum below a summand, or the minuend below
+/// the subtrahend), kept on the even lanes and moved up one lane through
+/// eax (`and`, `shl`), and the high halves they mark take one more (less).
+fn add_sub_q(insn: &Instruction, ev: &Ev, tg: &Target) -> Result<Rewrite, Unsupported> {
+    let mut em = Em::new(tg, insn);
+    let d = ev.reg;
+    let s1 = ev.vvvv;
+    let sub = insn.mnemonic() == Mnemonic::Vpsubq;
+    let s2 = src2(&mut em, insn, ev, vl_lanes(ev.ll, 1))?;
+    let r = em.temp().map_err(|e| refuse(insn, e))?;
+    let op = if sub { 0xFA } else { 0xFE };
+    em.i0f(op, r, s1, Rm::Reg(s2), 0, 0);
+    em.flags();
+    let k = em.k();
+    if sub {
+        em.mvex(3, 1, 0, 0x1E, k, s1, Rm::Reg(s2), 0, 0, Some(1)); // vpcmpud k, s1, s2, lt
+    } else {
+        em.mvex(3, 1, 0, 0x1E, k, r, Rm::Reg(s1), 0, 0, Some(1)); // vpcmpud k, sum, s1, lt
+    }
+    em.kmov_r_k(0, k);
+    em.t.seq.extend_from_slice(&[0x25, 0x55, 0x55, 0x00, 0x00]); // and eax, 0x5555
+    em.t.seq.extend_from_slice(&[0xd1, 0xe0]); // shl eax, 1
+    em.kmov_k_r(k, 0);
+    let one = em.const_dw(1);
+    em.i0f(op, r, r, Rm::Const(one), k, 0);
+    commit(&mut em, d, r, &Ev { w: 1, ..*ev });
     Ok(Rewrite::Thunk(em.finish()))
 }
 
@@ -2659,7 +2728,7 @@ fn scalar_cvt(insn: &Instruction, ev: &Ev, tg: &Target) -> Result<Rewrite, Unsup
             let unsigned = matches!(m, M::Vcvtusi2ss | M::Vcvtusi2sd);
             let (d, s1) = (ev.reg, ev.vvvv);
             // The integer to the scratch slot as a qword: sign- or zero-extended.
-            match MemOp::of(insn) {
+            let wide = match MemOp::of(insn) {
                 Some(mm) => {
                     let wide = insn.memory_size() == iced_x86::MemorySize::UInt64 || insn.memory_size() == iced_x86::MemorySize::Int64;
                     em.rax();
@@ -2674,6 +2743,7 @@ fn scalar_cvt(insn: &Instruction, ev: &Ev, tg: &Target) -> Result<Rewrite, Unsup
                         em.mem_modrm(0, mm);
                     }
                     em.gpr_scratch(0, true, S_XFER, true);
+                    wide
                 }
                 None => {
                     let (r, wide) = gpr(insn.op2_register()).ok_or_else(|| refuse(insn, "conversion source is not a general register"))?;
@@ -2695,12 +2765,26 @@ fn scalar_cvt(insn: &Instruction, ev: &Ev, tg: &Target) -> Result<Rewrite, Unsup
                         em.t.seq.extend_from_slice(&[0x48 | ((r >> 3) & 1), 0x63, 0xc0 | (r & 7)]);
                         em.gpr_scratch(0, true, S_XFER, true);
                     }
-                    if unsigned && wide {
-                        return Err(refuse(insn, "unsigned 64-bit integer to float: not expressed yet"));
-                    }
+                    wide
                 }
-            }
+            };
             em.fs_op(&[0xdf], 5, S_XFER); // fild qword
+            if unsigned && wide {
+                // fild read the qword as signed: v - 2^64 when its top bit is
+                // set. Add 2^64 then (0.0 otherwise), chosen without a
+                // branch: the sign spread over rax masks the double 2^64.
+                // The sum is v exactly (x87's 64-bit significand), so the
+                // fstp below is the one rounding, as the instruction's.
+                em.flags();
+                em.gpr_scratch(0, true, S_XFER, false); // mov rax, [S_XFER]
+                em.t.seq.extend_from_slice(&[0x48, 0xc1, 0xf8, 0x3f]); // sar rax, 63
+                em.rcx();
+                em.t.seq.extend_from_slice(&[0x48, 0xb9]); // mov rcx, 2^64 as a double
+                em.t.seq.extend_from_slice(&0x43f0_0000_0000_0000u64.to_le_bytes());
+                em.t.seq.extend_from_slice(&[0x48, 0x21, 0xc8]); // and rax, rcx
+                em.gpr_scratch(0, true, S_XFER + 8, true);
+                em.fs_op(&[0xdc], 0, S_XFER + 8); // fadd qword
+            }
             if to_double {
                 em.fs_op(&[0xdd], 3, S_XFER); // fstp qword
                 let k = em.mask_imm(1);
