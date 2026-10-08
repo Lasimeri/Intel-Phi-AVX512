@@ -4,12 +4,15 @@
 .DEFAULT_GOAL := help
 HOST := host
 # phi-pld links a llama.cpp build (headers here, libraries in
-# build-native/bin) and needs libclang; it joins the build where the
-# headers are found, and is skipped with a note where not.
+# build-native/bin, or LLAMA_BUILD_DIR) and needs libclang; it joins the
+# build where both the headers and libllama.so are found, and is skipped
+# with a note naming the missing one where not (headers alone made its
+# build script stop the whole build).
 LLAMA_CPP_DIR ?= $(HOME)/llama.cpp
-export LLAMA_CPP_DIR
-PLD := $(if $(wildcard $(LLAMA_CPP_DIR)/include/llama.h),--workspace,)
-PLD_NOTE = $(if $(PLD),,@echo "phi-pld skipped: no $(LLAMA_CPP_DIR)/include/llama.h (set LLAMA_CPP_DIR)")
+LLAMA_BUILD_DIR ?= $(LLAMA_CPP_DIR)/build-native/bin
+export LLAMA_CPP_DIR LLAMA_BUILD_DIR
+PLD := $(if $(and $(wildcard $(LLAMA_CPP_DIR)/include/llama.h),$(wildcard $(LLAMA_BUILD_DIR)/libllama.so)),--workspace,)
+PLD_NOTE = $(if $(PLD),,@echo "phi-pld skipped: no $(if $(wildcard $(LLAMA_CPP_DIR)/include/llama.h),$(LLAMA_BUILD_DIR)/libllama.so (set LLAMA_BUILD_DIR),$(LLAMA_CPP_DIR)/include/llama.h (set LLAMA_CPP_DIR))")
 
 .PHONY: help build test fmt clippy docs-check layout-check mvex-check check clean
 
