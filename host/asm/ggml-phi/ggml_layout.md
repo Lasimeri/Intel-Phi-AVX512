@@ -8,6 +8,15 @@ llama.cpp's own headers (`ggml.h`, `ggml-impl.h`, `ggml-backend.h`,
 written by hand; a llama.cpp whose layout differs regenerates the file
 and the glue follows.
 
+The committed file is generated from the tree the library is loaded
+into in production: llama.phi, the person's fork that the rack serves
+with (`GGML_BACKEND_API_VERSION` 3). Upstream llama.cpp of an older
+date reports 2, and ggml refuses a backend whose version is not its own;
+build against another tree by regenerating with `--gen` there, never by
+hiding a local edit from git (a skip-worktree flag kept the rack's
+version 3 out of the repository until 2026-10-08, so a clean checkout
+built a library llama.phi would not load).
+
 | group | symbols |
 | --- | --- |
 | `struct ggml_tensor` | `T_BYTES`, `T_TYPE`, `T_BUFFER`, `T_NE`, `T_NB`, `T_OP`, `T_OP_PARAMS`, `T_FLAGS`, `T_SRC`, `T_VIEW_SRC`, `T_DATA`, `T_NAME`, `GGML_MAX_SRC` |
