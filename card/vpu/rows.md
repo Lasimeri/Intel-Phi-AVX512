@@ -32,7 +32,9 @@ exactly.
   lines for every core, so each starts on a different line of them.
 - `copy_share`, `fused_setup`, `copy64_nt`: a small request's
   activations copied inside its compute dispatch by the first cores'
-  threads (at least `PULL_LINES` lines each: a row copied a line or two
+  threads, since 2026-10-08 only when the card's DMA channel does not
+  carry them (`cdma.md`: the channel down, or the request past its
+  landing area) (at least `PULL_LINES` lines each: a row copied a line or two
   per core and then read by all 57 was seven times slower than one
   written by one core), counted so the others can wait for the last
   copy. The copy's stores are the no-read, non-globally-ordered kind

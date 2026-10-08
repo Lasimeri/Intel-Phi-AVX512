@@ -77,13 +77,35 @@ its bits) and returns `-CE_*`; the code is also in `cdma_err`.
 - `cdma_wait(seq)` spins on the status word (a cacheable line the engine
   writes; coherent, measured in `dmabench.md`), `delay 32` between looks
   so the other threads of the core keep their issue slots, until it
-  reaches `seq`, at most `cdma_timeout` ticks (2 s when 0; a
-  caller sets its own); a timeout closes the channel (`CE_TIMEOUT`) so the
+  reaches `seq`, at most `cdma_timeout` ticks (2 s when 0; the worker
+  sets 100 ms); a timeout closes the channel (`CE_TIMEOUT`) so the
   caller falls back to its own copy.
 - `cdma_close` clears the enable bit (the owner bit stays card).
   `cdma_report(fd)` prints the channel's registers and counters.
 - `cdma_nodoorbell` is a test hook for `dmabench`'s negative control: the
   descriptors are written, the head is neither advanced nor written.
+
+## In the worker
+
+`worker.S` opens the channel at start, after the clock calibration and
+before the pool exists (`-d 0` leaves it closed), with the nonce through
+the control area's free line at `OFF_NONCE` (128, `vpu_proto.md`) and
+`cdma_timeout` at 100 ms, and prints one line: the page and the window's
+address with the DCR and tail it found, or the error code. `matmul.S`'s
+`dma_pull` then carries a request's ids and activations (a matrix
+request's, a feed-forward request's) in one copy into the landing area,
+submitted and waited for by the dispatcher before the ids check (about
+3.5 us for a token's 5 KiB), and the job reads them there, in card
+memory before the dispatch: nothing is fused, no thread copies or waits.
+A request whose data with the kernels' slack does not fit the landing
+area (`CD_LAND_MAX`), or that finds the channel down, goes the way it
+went before (the fused copy inside the dispatch, the pooled copy, or the
+block device; `rows.md`, `matmul.md`). A copy that fails closes the
+channel and is said once in the log with the registers; the worker then
+stays on the cores' copy. A worker killed without `cdma_close` leaves
+the channel enabled and idle; the next open takes it over (every restart
+of 2026-10-08 did). The request breakdown before and after is in
+`docs/results/2026-10-08-card-dma.md`.
 
 ## Measured on card 3 (`dmabench.md`)
 

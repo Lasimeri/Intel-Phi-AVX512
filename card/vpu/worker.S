@@ -5,11 +5,12 @@
 # their entry points. No libc: system calls direct, threads by clone with
 # a block per thread as its fs base. See worker.md.
 #
-#   phi-vpu-worker [-v] [-t N] [-s MS] [-i US] [-e N] [-m 0|1] [threads]
+#   phi-vpu-worker [-v] [-t N] [-s MS] [-i US] [-e N] [-m 0|1] [-d 0|1] [threads]
 #     threads 1 to 228 (57); spin MS after a job before parking (200);
 #     -e N huge pages the seamless path pools (256); once parked, poll the
 #     doorbell every US microseconds (500); -m 0 sends the matrix service's
 #     small transfers through the block device (1: through the mapping);
+#     -d 0 leaves the card's DMA channel closed (1: it carries the pull);
 #     -t N prints the pool's timings every N dispatches.
 
 	.include "defs.inc"
@@ -55,6 +56,7 @@ idle_us:	.skip 8
 exec_pages:	.skip 4			# -e: huge pages the exec engine pools (exec.S reads it)
 	.globl map_small
 map_small:	.skip 4
+use_dma:	.skip 4			# -d: the card's own DMA channel for the pull (cdma.S)
 nthreads:	.skip 4			# pool threads; the dispatcher is one more
 busy_cores:	.skip 4
 	.balign 64
@@ -117,6 +119,7 @@ _start:
 	movq $500, idle_us(%rip)
 	movl $256, exec_pages(%rip)
 	movl $1, map_small(%rip)
+	movl $1, use_dma(%rip)
 	movl $1000, trace_every(%rip)
 	movl $57, %r13d			# max_threads (the dispatcher included)
 	# argv: (rsp) argc, 8(rsp) argv[0], ...
@@ -178,6 +181,14 @@ _start:
 	movl %eax, map_small(%rip)
 	jmp 8f
 7:	movq (%rbx), %rsi
+	leaq s_d(%rip), %rdi
+	call str_eq
+	testl %eax, %eax
+	jz 71f
+	call opt_value
+	movl %eax, use_dma(%rip)
+	jmp 8f
+71:	movq (%rbx), %rsi
 	call parse_u64
 	testq %rdx, %rdx
 	jnz 8f
@@ -278,7 +289,7 @@ _start:
 	divq tsc_per_ms(%rip)
 	movq %rax, ns_mult(%rip)
 	cmpl $0, trace(%rip)
-	je 13f
+	je 14f
 	call l_begin
 	leaq s_tsc(%rip), %rsi
 	call w_str
@@ -293,6 +304,53 @@ _start:
 	call w_str
 	movl $1, %edi
 	call l_end
+14:	# The card's own DMA channel for the pull (cdma.S, channel 7), opened
+	# before the pool exists, its nonce through the control area's free
+	# line at OFF_NONCE; a copy outstanding for 100 ms gives the channel
+	# up (the pull then stays on the cores). One line says which.
+	cmpl $0, use_dma(%rip)
+	je 13f
+	movq tsc_per_ms(%rip), %rax
+	imulq $100, %rax, %rax
+	movq %rax, cdma_timeout(%rip)
+	movq ctrl(%rip), %rdi
+	addq $OFF_NONCE, %rdi
+	movl $OFF_NONCE, %esi
+	call cdma_open
+	movq %rax, %r14
+	call l_begin
+	leaq s_cdma(%rip), %rsi
+	call w_str
+	testq %r14, %r14
+	jnz 141f
+	leaq s_cdma_up(%rip), %rsi
+	call w_str
+	movq cdma_page_phys(%rip), %rdi
+	call w_hex0x
+	leaq s_cdma_win(%rip), %rsi
+	call w_str
+	movq cdma_win_phys(%rip), %rdi
+	call w_hex0x
+	leaq s_cdma_dcr(%rip), %rsi
+	call w_str
+	movq cdma_dcr_before(%rip), %rdi
+	call w_hex0x
+	leaq s_cdma_tail(%rip), %rsi
+	call w_str
+	movq cdma_tail0(%rip), %rdi
+	call w_dec
+	jmp 142f
+141:	leaq s_cdma_down(%rip), %rsi
+	call w_str
+	movq %r14, %rdi
+	negq %rdi
+	call w_dec
+	leaq s_cdma_down2(%rip), %rsi
+	call w_str
+142:	movl $1, %edi
+	call l_end
+	movl $1, %edi
+	call cdma_report
 13:	# the pool: max_threads - 1 threads, core-major
 	leal -1(%r13d), %edi
 	call pool_start
@@ -1588,6 +1646,14 @@ s_s:	.asciz "-s"
 s_i:	.asciz "-i"
 s_e:	.asciz "-e"
 s_m:	.asciz "-m"
+s_d:	.asciz "-d"
+s_cdma:	.asciz "cdma: "
+s_cdma_up:	.asciz "channel 7 carries the pull: ring and landing area at "
+s_cdma_win:	.asciz ", the window at "
+s_cdma_dcr:	.asciz "; DCR found "
+s_cdma_tail:	.asciz ", tail "
+s_cdma_down:	.asciz "not used (error "
+s_cdma_down2:	.asciz ", cdma.md); the pull stays on the cores"
 s_phihost:	.asciz "/dev/phihost"
 s_phiblk:	.asciz "/dev/phiblk1"
 s_phiblk_err:	.asciz "/dev/phiblk1 (O_DIRECT)"

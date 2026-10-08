@@ -30,6 +30,7 @@ that stale memory can satisfy needs a control that fails.
 | --- | --- |
 | 0 | readiness word: the card writes `VPU_MAGIC` while it is polling |
 | 64 | `struct vpu_request`, 56 bytes |
+| 128 | the card alone writes it, once at start: the nonce its DMA channel's open copies back to check the window's card address (`cdma.md`); the host never touches this line |
 | 256 | `struct vpu_reply`, 48 bytes |
 | 1 MiB | bulk data |
 

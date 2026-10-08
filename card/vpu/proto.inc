@@ -9,6 +9,7 @@
 	.set OFF_READY, 0
 	.set OFF_SCRATCH, 8
 	.set OFF_REQ, 64
+	.set OFF_NONCE, 128		# the card alone writes it: the nonce of its DMA channel's open (cdma.md)
 	.set OFF_REPLY, 256
 	.set OFF_DATA, 1048576
 	.set MAGIC_LO, 0x52454144

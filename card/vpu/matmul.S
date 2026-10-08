@@ -115,6 +115,7 @@ r_act64:	.skip 8
 r_experts:	.skip 8
 r_total:	.skip 8
 r_slice:	.skip 8
+r_acts:	.skip 8			# where the ids and activations landed: the engine's area (cdma.S) or g_b
 
 	.text
 
@@ -295,6 +296,52 @@ push_data:
 	popq %r13
 	popq %r12
 	popq %rbx
+	ret
+
+# dma_pull(len rsi, off rdx): len bytes of the window at off into the
+# landing area of the card's own DMA channel (cdma.S), submitted and waited
+# for here; rax = where they are, or 0 when the engine does not carry this
+# request: the channel down (never opened, or failed earlier), the data
+# and the kernels' slack past the landing area, the copy refused, or the
+# copy failed (the channel then closed itself: said once, with its
+# registers). The caller falls back to the cores' copy on 0. A token's
+# 5 KiB takes about 3.5 us this way (cdma.md), where the cores' copy
+# inside the dispatch took tens.
+dma_pull:
+	pushq %rbx
+	xorl %eax, %eax
+	cmpq $0, cdma_ready(%rip)
+	je 9f
+	leaq 63(%rsi), %rbx
+	andq $-64, %rbx				# whole lines
+	leaq SLACK(%rbx), %rax
+	cmpq $CD_LAND_MAX, %rax
+	ja 8f
+	movq %rdx, %rdi				# the window offset
+	xorl %esi, %esi				# landing offset 0
+	movq %rbx, %rdx
+	call cdma_submit
+	testq %rax, %rax
+	jz 8f
+	movq %rax, %rdi
+	call cdma_wait
+	testl %eax, %eax
+	jz 7f
+	movq cdma_land(%rip), %rax
+	jmp 9f
+7:	call l_begin
+	leaq s_dma_fail(%rip), %rsi
+	call w_str
+	movq cdma_err(%rip), %rdi
+	call w_dec
+	leaq s_dma_fail2(%rip), %rsi
+	call w_str
+	movl $1, %edi
+	call l_end
+	movl $1, %edi
+	call cdma_report
+8:	xorl %eax, %eax
+9:	popq %rbx
 	ret
 
 # ctrl_read(dst rdi, src rsi, len rdx): a descriptor out of the control
@@ -1166,6 +1213,14 @@ ffn_run:
 	call grow
 	testl %eax, %eax
 	jnz .Lff_alloc_pop2
+	# the activations: the engine's copy, else the cores'
+	movq FF_N(%rbx), %rsi
+	imulq FF_NB_B(%rbx), %rsi
+	movq FF_B_OFF(%rbx), %rdx
+	call dma_pull
+	movq %rax, r_acts(%rip)
+	testq %rax, %rax
+	jnz 25f
 	movq g_b + BUF_MAP + MAP_P(%rip), %rdi
 	movq FF_N(%rbx), %rsi
 	imulq FF_NB_B(%rbx), %rsi
@@ -1174,7 +1229,9 @@ ffn_run:
 	call pull_data
 	testl %eax, %eax
 	jnz .Lff_pull_pop2
-	call now_ns
+	movq g_b + BUF_MAP + MAP_P(%rip), %rax
+	movq %rax, r_acts(%rip)
+25:	call now_ns
 	subq r_t0(%rip), %rax
 	movq r_ppull(%rip), %rcx
 	movq %rax, (%rcx)
@@ -1197,7 +1254,7 @@ ffn_run:
 	leaq g_cache(%rip), %rdx
 	movq CE_MAP + MAP_P(%rdx,%rcx), %rax
 	movq %rax, FJ_GATE + MJ_A(%r8)
-	movq g_b + BUF_MAP + MAP_P(%rip), %rax
+	movq r_acts(%rip), %rax
 	movq %rax, FJ_GATE + MJ_B(%r8)
 	movq g_fg + BUF_MAP + MAP_P(%rip), %rax
 	movq %rax, FJ_GATE + MJ_D(%r8)
@@ -1768,9 +1825,21 @@ vpu_matmul_run:
 	call grow
 	testl %eax, %eax
 	jnz .Lalloc
-	# a small request (a few columns of a quantized type, its data within
-	# the mapping) pulls its activations inside its compute dispatch
 	movq $0, r_win(%rip)
+	movq g_b + BUF_MAP + MAP_P(%rip), %rax
+	movq %rax, r_acts(%rip)
+	# the engine first: the ids and the activations in one copy into its
+	# landing area, in card memory before the dispatch (nothing fused)
+	movq r_pull_len(%rip), %rsi
+	movq MM_B_OFF(%rbx), %rdx
+	call dma_pull
+	testq %rax, %rax
+	jz 161f
+	movq %rax, r_acts(%rip)
+	jmp 19f
+161:	# the cores: a small request (a few columns of a quantized type, its
+	# data within the mapping) pulls its activations inside its compute
+	# dispatch
 	movl MM_A_TYPE(%rbx), %edi
 	call quantized
 	testl %eax, %eax
@@ -1822,7 +1891,7 @@ vpu_matmul_run:
 	leaq job0(%rip), %r13
 	movq r_a(%rip), %rax
 	movq %rax, MJ_A(%r13)
-	movq g_b + BUF_MAP + MAP_P(%rip), %rax
+	movq r_acts(%rip), %rax
 	movq %rax, MJ_IDS(%r13)
 	addq MM_IDS_BYTES(%rbx), %rax
 	movq %rax, MJ_B(%r13)
@@ -3120,6 +3189,8 @@ s_msnl:	.asciz " ms"
 # the probe: the vector copy sizes and the prompt-sized transfers
 probe_sizes:	.quad 4096, 16384, 65536
 probe_psz:	.quad 16384, 65536, 1048576, 4194304
+s_dma_fail:	.asciz "cdma: a copy failed (error "
+s_dma_fail2:	.asciz "); the channel is closed, the pull stays on the cores"
 s_ph1:	.asciz "phases: wait "
 s_ph2:	.asciz " ms, warm "
 s_ph3:	.asciz " ms, rows "

@@ -18,14 +18,21 @@ what is where in the assembly and what its gates were.
   (4096 entries), a growable buffer, a column group, a job (one matrix by
   the request's columns), the fused pull, a request of several matrices,
   a feed-forward job, a pooled copy, and the constants of the loops.
-- **Copies** (`copy_pool`, `pull_data`, `push_data`): a request's
-  activations and results cross through the worker's mapping of the
+- **Copies** (`dma_pull`, `copy_pool`, `pull_data`, `push_data`): since
+  2026-10-08 a request's ids and activations come in one copy by the
+  card's own DMA channel (`dma_pull`: `cdma_submit` and `cdma_wait` of
+  `cdma.S`, the data then read from the channel's landing area, `r_acts`)
+  whenever the channel is up and the data with `SLACK` fits the landing
+  area (`CD_LAND_MAX`, about 2 MiB); otherwise, and for every result,
+  they cross through the worker's mapping of the
   window in whole 64-byte vectors (`phi_copy64`) up to `MAP_POOL_MAX`
   (one thread up to `PULL_ONE_MAX` or `PUSH_ONE_MAX`, the pool above),
   else through the block device (`vpu_pull`, `vpu_push` in `worker.S`).
+  A copy the engine fails closes the channel (said once in the log) and
+  the request, like every later one, takes the other path.
   `ctrl_read` takes a descriptor out of the uncached control area in
-  64-byte loads. The worker's `-m 0` (`map_small`) sends everything
-  through the block device.
+  64-byte loads. The worker's `-m 0` (`map_small`) sends everything the
+  engine does not carry through the block device.
 - **Memory**: `big_alloc` from 2 MiB huge pages when the card has them
   (else 4 KiB pages), every buffer with `SLACK` past its data for the
   unaligned load pairs; `grow` for the streaming buffers kept between
@@ -49,9 +56,10 @@ what is where in the assembly and what its gates were.
   kind, threads, verbosity, and pointers for the compute, pull and push
   times and the slices run), every check the C made in the same order,
   the ids checked once before any thread runs (-1 allowed: a column
-  without an expert), a small request's activations pulled inside its
-  compute dispatch (`fused_setup`), the results pushed, the stage marks
-  for the worker's trace. The request's variables are statics: only the
+  without an expert), the activations by the engine (`dma_pull`, waited
+  for before the ids check) or else, for a small request, pulled inside
+  its compute dispatch (`fused_setup`), the results pushed, the stage
+  marks for the worker's trace. The request's variables are statics: only the
   dispatcher runs this. At `-v -v` a line at the start of each request
   names it (kind, type, shape) and one at the end gives its times.
 

@@ -14,6 +14,9 @@ pub const OFF_READY: usize = 0;
 pub const OFF_SCRATCH: usize = 8;
 /// Window offset of the request descriptor.
 pub const OFF_REQ: usize = 64;
+/// Window offset of the line the card alone writes at start: the nonce of
+/// its DMA channel's open (`card/vpu/cdma.md`). The host never touches it.
+pub const OFF_NONCE: usize = 128;
 /// Window offset of the reply descriptor.
 pub const OFF_REPLY: usize = 256;
 /// Where bulk data starts. Everything below is control words.
@@ -132,6 +135,8 @@ mod tests {
         assert!(OFF_REQ - OFF_READY >= 64);
         assert!(OFF_REPLY - OFF_REQ >= std::mem::size_of::<Request>());
         assert!(OFF_REPLY - OFF_REQ >= 64);
+        assert!(OFF_NONCE - OFF_REQ >= 64);
+        assert!(OFF_REPLY - OFF_NONCE >= 64);
         assert!(OFF_DATA as usize >= OFF_REPLY + std::mem::size_of::<Reply>());
         assert_eq!(OFF_DATA % BLOCK, 0);
     }

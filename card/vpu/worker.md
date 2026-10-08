@@ -9,7 +9,7 @@ pole after the whole-expert placement). No libc: system calls direct
 `build.sh` and audited for what the card does not run.
 
 ```
-phi-vpu-worker [-v] [-t N] [-s MS] [-i US] [-e N] [-m 0|1] [threads]
+phi-vpu-worker [-v] [-t N] [-s MS] [-i US] [-e N] [-m 0|1] [-d 0|1] [threads]
 ```
 
 `threads` 1 to 228 (57): the dispatcher plus the pool. `-v` logs each
@@ -20,8 +20,10 @@ microseconds once parked (500; `nanosleep` on this kernel costs about
 60 us over the ask); `-e N` huge pages the seamless path pools (256; 0
 leaves them all to the matrix multiplies); `-m 0` sends the matrix
 service's small transfers through the block device (1: through the
-mapping). `-t N` prints the pool's dispatch trace and the matrix
-service's stage trace every N dispatches or requests (below).
+mapping); `-d 0` leaves the card's own DMA channel closed, so the pull
+stays on the cores (1: the channel carries it, `cdma.md`). `-t N` prints
+the pool's dispatch trace and the matrix service's stage trace every N
+dispatches or requests (below).
 
 ## What the process does
 
@@ -32,7 +34,10 @@ service's stage trace every N dispatches or requests (below).
   host's stale bytes otherwise), sets its own per-thread block as `fs`
   (`arch_prctl`), pins itself to CPU 0 (core 56's last hardware thread,
   so the pool's core-major fill never lands a worker on its core until
-  all 227 others are taken), starts the pool, initialises the exec
+  all 227 others are taken), calibrates its clock, opens the card's DMA
+  channel for the pull (`cdma_open`, `cdma.md`; one log line says
+  whether it is up, with the DCR and tail it found, or why not; `-d 0`
+  skips it), starts the pool, initialises the exec
   engine, prints one line, then owns the reset: both sequence numbers to
   zero (a request left in the window by an earlier run would otherwise
   be invisible for ever), the scratch displacement at `OFF_SCRATCH`
