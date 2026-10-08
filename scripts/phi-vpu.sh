@@ -10,6 +10,8 @@
 #   scripts/phi-vpu.sh [-c N] log           the worker's output
 #   scripts/phi-vpu.sh [-c N] config        the huge pages reserved and the running worker's arguments
 #   scripts/phi-vpu.sh [-c N] poly [args]   run the host driver; deploys and starts first if needed
+#   scripts/phi-vpu.sh [-c N] dmabench [R]  the card-owned DMA channel against the window copy (card/vpu/dmabench.md);
+#                                           refuses while a worker runs (the channel has one owner)
 #
 # N is the card index (default $PHI_CARD, else 0). Each card has its own
 # host-memory window, so each runs its own worker. Needs the card up
@@ -146,8 +148,20 @@ case "$cmd" in
         fi
         exec "$(driver)" --card "$PHI_CARD" poly "$@"
         ;;
+    dmabench)
+        # The bench owns channel 7 alone (card/vpu/cdma.md): a running
+        # worker is reported, not stopped. It needs one free huge page.
+        if running; then
+            echo "phi-vpu.sh: a worker runs on card $PHI_CARD; stop it first: scripts/phi-vpu.sh -c $PHI_CARD stop" >&2
+            exit 1
+        fi
+        "$root/card/vpu/build.sh" > /dev/null
+        ssh_ "mkdir -p '$dir'; f=\$(awk '/HugePages_Free/ {print \$2}' /proc/meminfo); [ \$f -ge 1 ] || echo \$((\$(cat /proc/sys/vm/nr_hugepages) + 1)) > /proc/sys/vm/nr_hugepages"
+        "$PHI" -c "$PHI_CARD" put "$root/host/asm/out/phi-vpu-dmabench" "$dir/phi-vpu-dmabench" < /dev/null > /dev/null
+        ssh_ "chmod +x '$dir/phi-vpu-dmabench' && '$dir/phi-vpu-dmabench' ${1:-1000}"
+        ;;
     *)
-        sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
         exit 2
         ;;
 esac

@@ -8,6 +8,7 @@ scripts/phi-vpu.sh [-c N] status        worker process on the card, control word
 scripts/phi-vpu.sh [-c N] log           the worker's output
 scripts/phi-vpu.sh [-c N] config        the huge pages reserved and the running worker's arguments
 scripts/phi-vpu.sh [-c N] poly [args]   run the host driver; deploys and starts first if needed
+scripts/phi-vpu.sh [-c N] dmabench [R]  the card-owned DMA channel against the window copy, R repetitions (1000)
 ```
 
 `-c N` picks the card (else `$PHI_CARD`, else 0). Each card has its own
@@ -111,3 +112,14 @@ wait).
 (the reservation) and `worker ARGS` (the running worker's arguments after
 its name, or `none`). Read-only; Intel-Phi-Jev's xks reads it to know that
 a worker it started is still the one it started.
+
+## The DMA bench (2026-10-08)
+
+`dmabench [R]` builds the binaries (`card/vpu/build.sh`), puts
+`phi-vpu-dmabench` next to the worker on the card and runs it with R
+repetitions (`card/vpu/dmabench.md`: the card-owned DMA channel of
+`card/vpu/cdma.md` against the worker's copy through the uncached window,
+every byte verified). The channel has one owner on a card, so with a
+worker running the verb stops and says to run `stop` first rather than
+stopping it. The bench needs one free huge page; when the card has none
+the reservation is raised by one.

@@ -5,8 +5,8 @@ card/vpu/build.sh              # assemble, link, audit; host/asm/out/phi-vpu-wor
 card/vpu/build.sh --out DIR    # the binary into DIR, nothing else
 ```
 
-Assembles `worker.S`, `text.S`, `exec.S`, `matmul.S`, `rows.S` and
-`kernels.S` with GNU `as --64` (`-I card/vpu` for `defs.inc`,
+Assembles `worker.S`, `text.S`, `exec.S`, `matmul.S`, `rows.S`,
+`kernels.S` and `cdma.S` with GNU `as --64` (`-I card/vpu` for `defs.inc`,
 `proto.inc`, `mvex.inc`), the translated polynomial kernel
 `card/examples/avx512_poly.S` with its `//` comments stripped into a
 copy (GNU `as` does not take them), and links them static with `ld`
@@ -24,3 +24,7 @@ the card (`/opt/phi/vpu/phi-vpu-worker`, by `.new` and a move);
 `start` runs it. Until 2026-09-30 this file was `build-asm.sh` beside
 the C worker's on-card `build.sh`; the C worker's sources went with
 step 1e of the port (`docs/results/2026-09-30-worker-assembly.md`).
+
+Since 2026-10-08 the script also links `phi-vpu-dmabench` from
+`dmabench.S`, `cdma.S` and `text.S` (`dmabench.md`) and audits it the
+same way; `--out DIR` leaves both binaries there.
