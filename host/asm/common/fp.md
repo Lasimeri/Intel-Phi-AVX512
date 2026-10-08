@@ -46,6 +46,5 @@ Ends with `vzeroupper`.
 
 ## Constants
 
-`c_1e9`, `c_1e6`, `c_1e3`, `c_100`, `c_mib` (1048576.0), the power
-of ten table for the parser; all local to the file (backend.S carries
-its own copies, `k_*`, exported to ffn.S).
+`c_1e9` and the power of ten table for the parser; all local to the
+file (backend.S carries its own copies, `k_*`, exported to ffn.S).

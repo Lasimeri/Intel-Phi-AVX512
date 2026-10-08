@@ -2466,10 +2466,6 @@ phi_backend_free:
 	movl $0, BE_USED(%rdi)
 	ret
 
-phi_guid_of:
-	leaq phi_guid(%rip), %rax
-	ret
-
 # ---- the device ----
 
 phi_dev_get_name:

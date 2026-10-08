@@ -18,10 +18,6 @@ c_one:	.double 1.0
 c_abs64:	.quad 0x7fffffffffffffff, 0x7fffffffffffffff
 c_sign64:	.quad 0x8000000000000000, 0x8000000000000000
 c_1e9:	.double 1e9
-c_1e6:	.double 1e6
-c_1e3:	.double 1e3
-c_100:	.double 100.0
-c_mib:	.double 1048576.0
 c_2p63:	.double 9223372036854775808.0
 c_abs32:	.long 0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff
 pow10:	.quad 1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000
