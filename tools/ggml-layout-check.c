@@ -132,6 +132,7 @@ static const struct entry table[] = {
     { "GGML_TYPE_Q5_K", GGML_TYPE_Q5_K },
     { "GGML_TYPE_Q6_K", GGML_TYPE_Q6_K },
     { "GGML_TYPE_IQ4_XS", GGML_TYPE_IQ4_XS },
+    { "GGML_TYPE_BF16", GGML_TYPE_BF16 },
     { "GGML_TYPE_I32", GGML_TYPE_I32 },
     { "GGML_OP_NONE", GGML_OP_NONE },
     { "GGML_OP_RESHAPE", GGML_OP_RESHAPE },

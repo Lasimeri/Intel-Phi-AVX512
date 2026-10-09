@@ -16,6 +16,7 @@ about the kernels' design.
 | --- | --- |
 | `phi_dot_f16(a, b, k16, out)`, `phi_dot_f32` | the 16 partial sums of `a[0..16*k16) . b[0..16*k16)` into `out[16]` (64-byte aligned); `a` is 16 halfs per vector (the `{float16}` up-conversion on the load, which needs 32-byte alignment: ggml's tensors have it) or 16 floats at any alignment, `b` 16 floats at any alignment (the unpack pair); four accumulators cover the vector unit's result latency, four vectors per iteration and a one-vector tail |
 | `phi_dot4_f16(a, b, k16, out, nb)`, `phi_dot4_f32` | one weight row against four activation rows `nb` bytes apart, 64 sums into `out` |
+| `phi_dot_bf16(a, b, k16, out)`, `phi_dot4_bf16(a, b, k16, out, nb)` | the same for bfloat16 weights: a `{uint16}` load zero-extends 16 of them into int32 lanes and `vpslld` by 16 puts each in a float32's high half, exactly the value it stands for (32-byte alignment as float16); 2026-10-08, for Flash Next BF16 |
 | `phi_{q4k,q5k,q6k,q8_0,iq4xs}_{1,4,8}` and their `h` twins | one 256-weight superblock of a quantized row against 1, 4 or 8 activation rows, float32 or (`h`) float16 |
 | `phi_swiglu`, `phi_swiglu16`, `phi_swiglu_edge`, `phi_swiglu16_edge` | the feed-forward's SwiGLU on the vector unit |
 | `phi_copy64(dst, src, count)` | `count` 64-byte vectors, whole-vector loads and stores |

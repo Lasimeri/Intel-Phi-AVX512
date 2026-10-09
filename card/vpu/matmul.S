@@ -58,6 +58,7 @@ g_fmt:
 	.quad 210, phi_q6k_1, phi_q6k_4, phi_q6k_8, phi_q6k_1h, phi_q6k_4h, phi_q6k_8h, 0
 	.quad 272, phi_q8_0_1, phi_q8_0_4, phi_q8_0_8, phi_q8_0_1h, phi_q8_0_4h, phi_q8_0_8h, 0
 	.quad 136, phi_iq4xs_1, phi_iq4xs_4, phi_iq4xs_8, phi_iq4xs_1h, phi_iq4xs_4h, phi_iq4xs_8h, 0
+	.quad 0, 0, 0, 0, 0, 0, 0, 0		# bfloat16: a float type, the dot kernels
 	.globl g_fmt
 
 	.bss
@@ -503,6 +504,8 @@ shape_ok:
 	je 7f
 	cmpl $MM_F16, %eax
 	je 7f
+	cmpl $MM_BF16, %eax
+	je 7f
 	testl %r8d, %r8d
 	jz 8f
 	movq MM_K(%rbx), %rax
@@ -568,6 +571,8 @@ rows_slice:
 	je 1f
 	cmpl $MM_F16, %eax
 	je 1f
+	cmpl $MM_BF16, %eax
+	je 1f
 	jmp rows_slice_q
 1:	pushq %rbp
 	pushq %rbx
@@ -583,10 +588,14 @@ rows_slice:
 	movq %rdi, %rbx
 	movl %esi, %r12d
 	movl %edx, %r13d
+	# r14d the weights: 0 float32, 1 float16, 2 bfloat16
 	movl $0, %r14d
 	cmpl $MM_F16, MJ_TYPE(%rbx)
+	jne 1f
+	movl $1, %r14d
+1:	cmpl $MM_BF16, MJ_TYPE(%rbx)
 	jne 2f
-	movl $1, %r14d				# f16
+	movl $2, %r14d
 2:	movq MJ_M(%rbx), %rax
 	movl %r12d, %ecx
 	imulq %rcx, %rax
@@ -631,11 +640,15 @@ rows_slice:
 	movq RS_K16(%rbp), %rdx
 	leaq RS_OUT(%rbp), %rcx
 	movq MJ_NB_B(%rbx), %r8
-	testl %r14d, %r14d
-	jz 5f
-	call phi_dot4_f16
+	cmpl $1, %r14d
+	je 51f
+	cmpl $2, %r14d
+	je 52f
+	call phi_dot4_f32
 	jmp 6f
-5:	call phi_dot4_f32
+51:	call phi_dot4_f16
+	jmp 6f
+52:	call phi_dot4_bf16
 6:	movq $0, RS_Q(%rbp)
 7:	movq RS_Q(%rbp), %rcx
 	cmpq $4, %rcx
@@ -690,11 +703,15 @@ rows_slice:
 	movq RS_TMP(%rbp), %rdi
 	movq RS_K16(%rbp), %rdx
 	leaq RS_OUT(%rbp), %rcx
-	testl %r14d, %r14d
-	jz 21f
-	call phi_dot_f16
+	cmpl $1, %r14d
+	je 212f
+	cmpl $2, %r14d
+	je 213f
+	call phi_dot_f32
 	jmp 211f
-21:	call phi_dot_f32
+212:	call phi_dot_f16
+	jmp 211f
+213:	call phi_dot_bf16
 211:	popq %rsi
 	leaq RS_OUT(%rbp), %rax
 	fldz
@@ -754,8 +771,14 @@ tail_dot:
 	testl %r14d, %r14d
 	jz 2f
 	movzwl (%rax,%r13,2), %edi
+	cmpl $2, %r14d
+	je 4f
 	call half_to_float
 	movl %eax, RS_TMP+16(%rbp)
+	flds RS_TMP+16(%rbp)
+	jmp 3f
+4:	shll $16, %edi				# a bfloat16 is a float32's high half
+	movl %edi, RS_TMP+16(%rbp)
 	flds RS_TMP+16(%rbp)
 	jmp 3f
 2:	flds (%rax,%r13,4)

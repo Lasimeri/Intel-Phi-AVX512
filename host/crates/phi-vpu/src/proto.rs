@@ -357,6 +357,7 @@ pub const MM_Q5_K: u32 = 3;
 pub const MM_Q6_K: u32 = 4;
 pub const MM_Q8_0: u32 = 5;
 pub const MM_IQ4_XS: u32 = 6;
+pub const MM_BF16: u32 = 7;
 /// Diagnostic (`VPU_MM_SWIGLU`): `d = silu(g) * u` over `m` floats, g at
 /// `b_off` and u at `b_off + nb_b`, through the card's `phi_swiglu`.
 pub const MM_SWIGLU: u32 = 98;

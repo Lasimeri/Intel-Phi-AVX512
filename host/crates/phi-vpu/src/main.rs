@@ -76,7 +76,7 @@ enum Cmd {
         /// Card threads (1 to 114: 57 is one a core, 114 two, the backend's).
         #[arg(long, default_value_t = 57)]
         threads: u32,
-        /// One type only (f32, f16, q4_K, q5_K, q6_K, q8_0, iq4_xs).
+        /// One type only (f32, f16, bf16, q4_K, q5_K, q6_K, q8_0, iq4_xs).
         #[arg(long)]
         only: Option<String>,
         /// Diagnostic: every quant byte takes this value instead of random.

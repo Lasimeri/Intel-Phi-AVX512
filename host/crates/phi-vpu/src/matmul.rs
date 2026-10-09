@@ -92,6 +92,7 @@ pub fn type_name(t: u32) -> &'static str {
         MM_Q6_K => "q6_K",
         MM_Q8_0 => "q8_0",
         MM_IQ4_XS => "iq4_xs",
+        MM_BF16 => "bf16",
         _ => "?",
     }
 }
@@ -100,7 +101,7 @@ pub fn type_name(t: u32) -> &'static str {
 pub fn row_bytes(t: u32, k: u64) -> u64 {
     match t {
         MM_F32 => k * 4,
-        MM_F16 => k * 2,
+        MM_F16 | MM_BF16 => k * 2,
         MM_Q4_K => k / 256 * 144,
         MM_Q5_K => k / 256 * 176,
         MM_Q6_K => k / 256 * 210,
@@ -114,7 +115,7 @@ pub fn row_bytes(t: u32, k: u64) -> u64 {
 pub fn shape_ok(t: u32, k: u64, nb_a: u64, nb_b: u64) -> bool {
     match t {
         MM_F32 => nb_a >= k * 4,
-        MM_F16 => nb_a >= k * 2 && nb_a % 32 == 0,
+        MM_F16 | MM_BF16 => nb_a >= k * 2 && nb_a % 32 == 0,
         MM_Q4_K | MM_Q5_K => k % 256 == 0 && nb_a >= row_bytes(t, k) && nb_a % 16 == 0 && nb_b % 64 == 0,
         MM_Q6_K | MM_IQ4_XS => k % 256 == 0 && nb_a >= row_bytes(t, k) && nb_b % 64 == 0,
         MM_Q8_0 => k % 32 == 0 && nb_a >= row_bytes(t, k) && nb_b % 64 == 0,
@@ -266,6 +267,14 @@ fn random_row(rng: &mut Rng, t: u32, k: u64) -> (Vec<u8>, Vec<f32>) {
                 let h = f32_to_f16(rng.unit());
                 bytes.extend_from_slice(&h.to_le_bytes());
                 vals.push(f16_to_f32(h));
+            }
+        }
+        MM_BF16 => {
+            // the high half of a float32 (truncated): exactly the value it stands for
+            for _ in 0..k {
+                let h = (rng.unit().to_bits() >> 16) as u16;
+                bytes.extend_from_slice(&h.to_le_bytes());
+                vals.push(f32::from_bits((h as u32) << 16));
             }
         }
         MM_Q4_K | MM_Q5_K => {
@@ -1020,7 +1029,7 @@ pub fn check(
     CHUNK.store(chunk, Ordering::Relaxed);
     PAD.store(pad, Ordering::Relaxed);
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
-    let all = [MM_F32, MM_F16, MM_Q4_K, MM_Q5_K, MM_Q6_K, MM_Q8_0, MM_IQ4_XS];
+    let all = [MM_F32, MM_F16, MM_BF16, MM_Q4_K, MM_Q5_K, MM_Q6_K, MM_Q8_0, MM_IQ4_XS];
     let types: Vec<u32> = all.iter().copied().filter(|&t| only.is_none_or(|o| o == type_name(t))).collect();
     if types.is_empty() {
         bail!("no such type; one of f32 f16 q4_K q5_K q6_K q8_0 iq4_xs");
@@ -1031,7 +1040,7 @@ pub fn check(
     let mut id = 100;
     for &t in &types {
         // Only the quantized kernels have a float16-activation twin.
-        ACT.store(if t == MM_F32 || t == MM_F16 { 0 } else { act }, Ordering::Relaxed);
+        ACT.store(if t == MM_F32 || t == MM_F16 || t == MM_BF16 { 0 } else { act }, Ordering::Relaxed);
         for &n in &[1u64, 4, 8, 13] {
             let k = if t == MM_Q8_0 && n == 13 { 544 } else { 512 };
             check_one(w, threads, t, 61, k, n, id, &mut rng, 1)?;
@@ -1076,7 +1085,7 @@ pub fn check(
         // types only: of another type and other row counts than the first,
         // plain and as mixtures sharing the ids (a gate and up pair, and a
         // down-like one with a row per column).
-        if t != MM_F32 && t != MM_F16 {
+        if t != MM_F32 && t != MM_F16 && t != MM_BF16 {
             let quants = [MM_Q4_K, MM_Q5_K, MM_Q6_K, MM_Q8_0, MM_IQ4_XS];
             let other = quants[(quants.iter().position(|&q| q == t).unwrap_or(0) + 1) % quants.len()];
             check_more(w, threads, &[t, t, other], &[61, 64, 128], 512, 5, None, id, &mut rng)?;
@@ -1100,7 +1109,7 @@ pub fn check(
             "{:7} ok: 61 rows{}, k 512 (Q8_0 also 544), n 1 4 8 13, and mixtures of 8 experts{}, {threads} threads",
             type_name(t),
             if threads > 57 { " and 128" } else { "" },
-            if t != MM_F32 && t != MM_F16 {
+            if t != MM_F32 && t != MM_F16 && t != MM_BF16 {
                 ", and up to four matrices in one request"
             } else {
                 ""
@@ -1112,7 +1121,11 @@ pub fn check(
     // and Q6_K gate and up, IQ4_XS down in places). 512 rows of the
     // intermediate is 32 vectors, fewer than the pool, so the split that
     // leaves threads idle is covered too.
-    let quant: Vec<u32> = types.iter().copied().filter(|&t| t != MM_F32 && t != MM_F16).collect();
+    let quant: Vec<u32> = types
+        .iter()
+        .copied()
+        .filter(|&t| t != MM_F32 && t != MM_F16 && t != MM_BF16)
+        .collect();
     let combos: Vec<[u32; 3]> = if only.is_some() {
         quant.iter().map(|&t| [t; 3]).collect()
     } else {
@@ -1147,7 +1160,7 @@ pub fn check(
         shape.0, shape.1
     );
     for &t in &types {
-        ACT.store(if t == MM_F32 || t == MM_F16 { 0 } else { act }, Ordering::Relaxed);
+        ACT.store(if t == MM_F32 || t == MM_F16 || t == MM_BF16 { 0 } else { act }, Ordering::Relaxed);
         let (m, k) = shape;
         let bytes = m * row_bytes(t, k);
         for &n in &[1u64, 8, 64] {

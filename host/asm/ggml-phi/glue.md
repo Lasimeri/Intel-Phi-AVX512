@@ -28,8 +28,8 @@ hands out a backend from a pool of eight (`BE_SLOT`, `BE_USED`).
 ## What is accepted (`phi_dev_supports_op`)
 
 - `MUL_MAT` with a weight source that is a leaf named `*weight*`, of a
-  type the cards take (`card_type`: F32, F16, Q4_K, Q5_K, Q6_K, Q8_0,
-  IQ4_XS), whose shape `phi_ggml_supports` accepts, not flagged
+  type the cards take (`card_type`: F32, F16, BF16, Q4_K, Q5_K, Q6_K,
+  Q8_0, IQ4_XS), whose shape `phi_ggml_supports` accepts, not flagged
   `GGML_HINT_SRC0_IS_HADAMARD` (`T_OP_PARAMS+4`); the weight is noted
   for the shares (`phi_ggml_note_weight`, with its layer from the name
   `blk.N.`).

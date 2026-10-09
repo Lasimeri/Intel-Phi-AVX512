@@ -157,6 +157,108 @@ phi_dot4_f16:
     ret
     .size phi_dot4_f16, .-phi_dot4_f16
 
+# phi_dot_bf16: 16 partial sums of a[0..16*k16) . b[0..16*k16) into out[16]
+#   rdi = a (bfloat16, 32-byte aligned), rsi = b (float32, any alignment), rdx = k16, rcx = out (64-byte aligned)
+# A bfloat16 is the high half of a float32: the {uint16} load zero-extends
+# each to an int32 lane and the shift by 16 puts it in place, exact.
+    .globl phi_dot_bf16
+    .type phi_dot_bf16, @function
+phi_dot_bf16:
+	VPXORD zmm0, zmm0, zmm0	# vpxord zmm0, zmm0, zmm0
+	VPXORD zmm1, zmm1, zmm1	# vpxord zmm1, zmm1, zmm1
+	VPXORD zmm2, zmm2, zmm2	# vpxord zmm2, zmm2, zmm2
+	VPXORD zmm3, zmm3, zmm3	# vpxord zmm3, zmm3, zmm3
+1:
+    cmp $4, %rdx
+    jl 2f
+	VMOVDQA32 zmm4, rdi, 0, conv=CV_U16	# vmovdqa32 zmm4, [rdi+0] {uint16}
+	VMOVDQA32 zmm5, rdi, 32, conv=CV_U16	# vmovdqa32 zmm5, [rdi+32] {uint16}
+	VMOVDQA32 zmm6, rdi, 64, conv=CV_U16	# vmovdqa32 zmm6, [rdi+64] {uint16}
+	VMOVDQA32 zmm7, rdi, 96, conv=CV_U16	# vmovdqa32 zmm7, [rdi+96] {uint16}
+	VLOADUNPACKLD zmm8, rsi, 0	# vloadunpackld zmm8, [rsi+0]
+	VLOADUNPACKHD zmm8, rsi, 64	# vloadunpackhd zmm8, [rsi+64]
+	VLOADUNPACKLD zmm9, rsi, 64	# vloadunpackld zmm9, [rsi+64]
+	VLOADUNPACKHD zmm9, rsi, 128	# vloadunpackhd zmm9, [rsi+128]
+	VLOADUNPACKLD zmm10, rsi, 128	# vloadunpackld zmm10, [rsi+128]
+	VLOADUNPACKHD zmm10, rsi, 192	# vloadunpackhd zmm10, [rsi+192]
+	VLOADUNPACKLD zmm11, rsi, 192	# vloadunpackld zmm11, [rsi+192]
+	VLOADUNPACKHD zmm11, rsi, 256	# vloadunpackhd zmm11, [rsi+256]
+	VPSLLD zmm4, zmm4, 16	# vpslld zmm4, zmm4, 16
+	VPSLLD zmm5, zmm5, 16	# vpslld zmm5, zmm5, 16
+	VPSLLD zmm6, zmm6, 16	# vpslld zmm6, zmm6, 16
+	VPSLLD zmm7, zmm7, 16	# vpslld zmm7, zmm7, 16
+	VFMADD231PS zmm0, zmm4, zmm8	# vfmadd231ps zmm0, zmm4, zmm8
+	VFMADD231PS zmm1, zmm5, zmm9	# vfmadd231ps zmm1, zmm5, zmm9
+	VFMADD231PS zmm2, zmm6, zmm10	# vfmadd231ps zmm2, zmm6, zmm10
+	VFMADD231PS zmm3, zmm7, zmm11	# vfmadd231ps zmm3, zmm7, zmm11
+    add $128, %rdi
+    add $256, %rsi
+    sub $4, %rdx
+    jmp 1b
+2:
+    test %rdx, %rdx
+    jle 3f
+	VMOVDQA32 zmm4, rdi, 0, conv=CV_U16	# vmovdqa32 zmm4, [rdi+0] {uint16}
+	VLOADUNPACKLD zmm8, rsi, 0	# vloadunpackld zmm8, [rsi+0]
+	VLOADUNPACKHD zmm8, rsi, 64	# vloadunpackhd zmm8, [rsi+64]
+	VPSLLD zmm4, zmm4, 16	# vpslld zmm4, zmm4, 16
+	VFMADD231PS zmm0, zmm4, zmm8	# vfmadd231ps zmm0, zmm4, zmm8
+    add $32, %rdi
+    add $64, %rsi
+    sub $1, %rdx
+    jmp 2b
+3:
+	VADDPS zmm0, zmm0, zmm1	# vaddps zmm0, zmm0, zmm1
+	VADDPS zmm2, zmm2, zmm3	# vaddps zmm2, zmm2, zmm3
+	VADDPS zmm0, zmm0, zmm2	# vaddps zmm0, zmm0, zmm2
+	VMOVAPS_ST rcx, 0, zmm0	# vmovaps [rcx+0], zmm0
+    ret
+    .size phi_dot_bf16, .-phi_dot_bf16
+
+# phi_dot4_bf16: four dot products of a with b, b+nb, b+2nb, b+3nb; 16 partial sums each into out[4][16]
+#   rdi = a (bfloat16, 32-byte aligned), rsi = b (float32, any alignment), rdx = k16, rcx = out (64-byte aligned), r8 = nb (bytes)
+    .globl phi_dot4_bf16
+    .type phi_dot4_bf16, @function
+phi_dot4_bf16:
+    lea (%rsi,%r8,1), %r9
+    lea (%r9,%r8,1), %r10
+    lea (%r10,%r8,1), %r11
+	VPXORD zmm0, zmm0, zmm0	# vpxord zmm0, zmm0, zmm0
+	VPXORD zmm1, zmm1, zmm1	# vpxord zmm1, zmm1, zmm1
+	VPXORD zmm2, zmm2, zmm2	# vpxord zmm2, zmm2, zmm2
+	VPXORD zmm3, zmm3, zmm3	# vpxord zmm3, zmm3, zmm3
+1:
+    test %rdx, %rdx
+    jle 2f
+	VMOVDQA32 zmm4, rdi, 0, conv=CV_U16	# vmovdqa32 zmm4, [rdi+0] {uint16}
+	VLOADUNPACKLD zmm8, rsi, 0	# vloadunpackld zmm8, [rsi+0]
+	VLOADUNPACKHD zmm8, rsi, 64	# vloadunpackhd zmm8, [rsi+64]
+	VLOADUNPACKLD zmm9, r9, 0	# vloadunpackld zmm9, [r9+0]
+	VLOADUNPACKHD zmm9, r9, 64	# vloadunpackhd zmm9, [r9+64]
+	VLOADUNPACKLD zmm10, r10, 0	# vloadunpackld zmm10, [r10+0]
+	VLOADUNPACKHD zmm10, r10, 64	# vloadunpackhd zmm10, [r10+64]
+	VLOADUNPACKLD zmm11, r11, 0	# vloadunpackld zmm11, [r11+0]
+	VLOADUNPACKHD zmm11, r11, 64	# vloadunpackhd zmm11, [r11+64]
+	VPSLLD zmm4, zmm4, 16	# vpslld zmm4, zmm4, 16
+	VFMADD231PS zmm0, zmm4, zmm8	# vfmadd231ps zmm0, zmm4, zmm8
+	VFMADD231PS zmm1, zmm4, zmm9	# vfmadd231ps zmm1, zmm4, zmm9
+	VFMADD231PS zmm2, zmm4, zmm10	# vfmadd231ps zmm2, zmm4, zmm10
+	VFMADD231PS zmm3, zmm4, zmm11	# vfmadd231ps zmm3, zmm4, zmm11
+    add $32, %rdi
+    add $64, %rsi
+    add $64, %r9
+    add $64, %r10
+    add $64, %r11
+    sub $1, %rdx
+    jmp 1b
+2:
+	VMOVAPS_ST rcx, 0, zmm0	# vmovaps [rcx+0], zmm0
+	VMOVAPS_ST rcx, 64, zmm1	# vmovaps [rcx+64], zmm1
+	VMOVAPS_ST rcx, 128, zmm2	# vmovaps [rcx+128], zmm2
+	VMOVAPS_ST rcx, 192, zmm3	# vmovaps [rcx+192], zmm3
+    ret
+    .size phi_dot4_bf16, .-phi_dot4_bf16
+
 # phi_dot4_f32: four dot products of a with b, b+nb, b+2nb, b+3nb; 16 partial sums each into out[4][16]
 #   rdi = a (float32, any alignment), rsi = b (float32, any alignment), rdx = k16, rcx = out (64-byte aligned), r8 = nb (bytes)
     .globl phi_dot4_f32

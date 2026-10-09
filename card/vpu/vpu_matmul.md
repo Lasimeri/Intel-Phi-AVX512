@@ -32,7 +32,7 @@ activations at `VPU_OFF_MORE`: "A layer's gate and up in one request").
 - `VPU_K_FREE`: drop a tensor, or all of them.
 
 Weight types (`VPU_MM_*`, `a_type`): float32 and float16 rows use the
-dot kernels `phi_dot*_f16/f32` (one row against one or four activation
+dot kernels `phi_dot*_f16/bf16/f32` (one row against one or four activation
 rows, float16 up-converted by the load). The quantized formats of
 llama.cpp, Q4_K, Q5_K, Q6_K, Q8_0 and IQ4_XS, use the superblock kernels
 `phi_<fmt>_<1|4|8>` (`card/vpu/kernels.md`):

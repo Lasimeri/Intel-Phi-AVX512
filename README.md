@@ -115,8 +115,8 @@ used the way GPUs are: whole operators at a time. `host/asm/ggml-phi`
 builds `libggml_phi.so`, a ggml backend that an unmodified llama.cpp
 loads through `GGML_BACKEND_PATH`; its scheduler hands the backend
 every matrix multiply it accepts (`MUL_MAT` and `MUL_MAT_ID`, the
-mixture-of-experts one, with float16, float32 and llama.cpp's Q4_K,
-Q5_K, Q6_K, Q8_0 and IQ4_XS weights), and the backend shares each
+mixture-of-experts one, with float16, bfloat16, float32 and llama.cpp's
+Q4_K, Q5_K, Q6_K, Q8_0 and IQ4_XS weights), and the backend shares each
 one by rows: every card keeps a share of the weight matrix resident and
 multiplies it on its 114 threads (two on each of its 57 cores) with the kernels of
 `card/vpu/kernels.S` (the quantized formats decoded on the

@@ -152,7 +152,8 @@
 	.set MM_Q6_K, 4
 	.set MM_Q8_0, 5
 	.set MM_IQ4_XS, 6
-	.set MM_TYPES, 7
+	.set MM_BF16, 7
+	.set MM_TYPES, 8
 	.set MM_PROBE, 99
 	.set MM_SWIGLU, 98
 	.set MM_A_ID, 0

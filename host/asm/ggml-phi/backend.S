@@ -250,6 +250,7 @@ t_q5k:	.asciz "q5_K"
 t_q6k:	.asciz "q6_K"
 t_q80:	.asciz "q8_0"
 t_iq4xs:	.asciz "iq4_xs"
+t_bf16:	.asciz "bf16"
 t_unknown:	.asciz "?"
 st_ok:	.asciz "ok"
 st_alloc:	.asciz "the card could not reserve memory"
@@ -433,6 +434,8 @@ row_bytes:
 	je 1f
 	cmpl $MM_F16, %edi
 	je 2f
+	cmpl $MM_BF16, %edi
+	je 2f
 	cmpl $MM_Q8_0, %edi
 	je 3f
 	cmpl $MM_TYPES, %edi
@@ -477,6 +480,8 @@ shape_ok:
 	cmpl $MM_F32, %edi
 	je 1f
 	cmpl $MM_F16, %edi
+	je 2f
+	cmpl $MM_BF16, %edi
 	je 2f
 	cmpl $MM_Q8_0, %edi
 	je 5f
@@ -2190,6 +2195,8 @@ phi_ggml_take:
 	jne 3f
 	cmpl $MM_F16, %r13d
 	je 8f
+	cmpl $MM_BF16, %r13d
+	je 8f
 	cmpl $MM_F32, %r13d
 	je 8f
 	# what the weight's split recorded, if it has one
@@ -3781,6 +3788,8 @@ prepare:
 	je 3f
 	cmpl $MM_F16, q_type(%rip)
 	je 3f
+	cmpl $MM_BF16, q_type(%rip)
+	je 3f
 	cmpl $0, f16c_ok(%rip)
 	je 3f
 	movl $1, %eax
@@ -4040,6 +4049,8 @@ prepare:
 	cmpl $1, -72(%rbp)
 	jne 81f
 	cmpl $MM_F16, q_type(%rip)
+	je 80f
+	cmpl $MM_BF16, q_type(%rip)
 	je 80f
 	cmpl $MM_F32, q_type(%rip)
 	jne 81f
@@ -5657,5 +5668,5 @@ phi_ggml_free_all:
 
 	.section .data.rel.ro,"aw"
 	.balign 8
-type_names:	.quad t_f32, t_f16, t_q4k, t_q5k, t_q6k, t_q80, t_iq4xs
+type_names:	.quad t_f32, t_f16, t_q4k, t_q5k, t_q6k, t_q80, t_iq4xs, t_bf16
 status_names:	.quad st_ok, st_alloc, st_pull, st_push, st_request, st_kernel

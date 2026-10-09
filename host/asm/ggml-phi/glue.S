@@ -113,6 +113,8 @@ card_type:
 	je 15f
 	cmpl $GGML_TYPE_IQ4_XS, %edi
 	je 16f
+	cmpl $GGML_TYPE_BF16, %edi
+	je 17f
 	movl $-1, %eax
 	ret
 10:	movl $MM_F32, %eax
@@ -128,6 +130,8 @@ card_type:
 15:	movl $MM_Q8_0, %eax
 	ret
 16:	movl $MM_IQ4_XS, %eax
+	ret
+17:	movl $MM_BF16, %eax
 	ret
 
 # has_weight(rdi tensor): 1 in eax when "weight" is in its name.

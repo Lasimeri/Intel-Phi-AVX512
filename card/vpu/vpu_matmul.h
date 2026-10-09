@@ -26,7 +26,8 @@
 #define VPU_MM_Q6_K 4
 #define VPU_MM_Q8_0 5
 #define VPU_MM_IQ4_XS 6
-#define VPU_MM_TYPES 7
+#define VPU_MM_BF16 7
+#define VPU_MM_TYPES 8
 #define VPU_MM_PROBE 99   /* diagnostic: phi_probe writes 8 vectors to d (kernels.md) */
 #define VPU_MM_SWIGLU 98  /* diagnostic: d = silu(g) * u over m floats, g at b_off and u at b_off + nb_b, one thread (kernels.md) */
 
