@@ -2003,8 +2003,11 @@ fn fma_addsub(insn: &Instruction, ev: &Ev, tg: &Target) -> Result<Rewrite, Unsup
 /// dword (the block rotated by one lane and shifted by 8, or'd; by two
 /// lanes and 16, or'd), and the four first dwords are gathered by
 /// `vpermd` into lanes 0 to 3: to an xmm with the lanes above zeroed, or
-/// to memory through the pack pair. A write mask would be a byte mask,
-/// which the card cannot apply: refused.
+/// to memory through the scratch slot and scalar stores, which take any
+/// alignment (the pack pair's dword elements need 4-byte alignment: a
+/// 16-byte store at an odd address was a general protection fault on
+/// card 3, 2026-10-08). A write mask would be a byte mask, which the card
+/// cannot apply: refused.
 fn narrow_db(insn: &Instruction, ev: &Ev, tg: &Target) -> Result<Rewrite, Unsupported> {
     let mut em = Em::new(tg, insn);
     if ev.aaa != 0 {
@@ -2028,7 +2031,20 @@ fn narrow_db(insn: &Instruction, ev: &Ev, tg: &Target) -> Result<Rewrite, Unsupp
     let span: u16 = ((1u32 << ndw) - 1) as u16;
     let k = em.mask_imm(span);
     match MemOp::of(insn) {
-        Some(m) => em.store_unaligned(m, r, k, 0, false, 0),
+        Some(m) => {
+            // The bytes to the (aligned) scratch slot, then to memory in
+            // scalar stores of 8 or 4 bytes, at any alignment.
+            em.mvex(2, 1, 0, 0xD0, r, 0, Rm::Fs(S_XFER), k, 0, None);
+            em.rax();
+            let mut done = 0i64;
+            let total = i64::from(ndw) * 4;
+            while done < total {
+                let wide = total - done >= 8;
+                em.gpr_scratch(0, wide, S_XFER + done as i32, false);
+                em.store_rax(m.plus(done), wide);
+                done += if wide { 8 } else { 4 };
+            }
+        }
         None => {
             let d = ev.rm;
             em.vmov(d, Rm::Reg(r), k, 0);
@@ -2415,10 +2431,21 @@ fn kops(insn: &Instruction, bytes: &[u8], tg: &Target) -> Result<Rewrite, Unsupp
 }
 
 impl Em<'_> {
+    /// `mov [m], rax` (REX.W 89 /r) or `mov [m], eax` (89 /r), with the REX
+    /// bits a high base or index register needs.
+    fn store_rax(&mut self, m: MemOp, wide: bool) {
+        let rex = 0x40 | ((wide as u8) << 3) | (((m.index.unwrap_or(0) >> 3) & 1) << 1) | ((m.base.unwrap_or(0) >> 3) & 1);
+        if rex != 0x40 {
+            self.t.seq.push(rex);
+        }
+        self.t.seq.push(0x89);
+        self.mem_modrm(0, m);
+    }
+
     /// ModRM, SIB and displacement of a general-register memory operand
     /// for a legacy instruction, with `reg` in ModRM.reg (r8-r15 bases
-    /// and indexes are not expressed: refused earlier as a REX prefix
-    /// would be needed before the opcode).
+    /// and indexes need a REX prefix before the opcode, which the caller
+    /// emits: `store_rax` does; the `kmov` memory forms do not).
     fn mem_modrm(&mut self, reg: u8, m: MemOp) {
         let r3 = (reg & 7) << 3;
         if let Some(target) = m.rip {
@@ -2705,6 +2732,29 @@ mod tests {
         );
         assert!(
             !t.seq.windows(5).any(|w| w[0] == 0x62 && w[4] == 0x28 && w[3] & 0x70 == 0x10),
+            "{:02x?}",
+            t.seq
+        );
+    }
+
+    #[test]
+    fn a_byte_narrowing_to_memory_stores_scalars_at_any_alignment() {
+        // vpmovdb [rip+disp], zmm16
+        let t = thunk(&[0x62, 0xe2, 0x7e, 0x48, 0x31, 0x05, 0x47, 0x2a, 0x00, 0x00]);
+        // the dwords to the scratch slot: vpackstoreld [fs:S_XFER]{k7}, zmmT (64 62 .. d0 04 25 disp)
+        assert!(
+            t.seq
+                .windows(8)
+                .any(|w| w[0] == 0x64 && w[1] == 0x62 && w[5] == 0xd0 && w[6] == 0x04 && w[7] == 0x25),
+            "{:02x?}",
+            t.seq
+        );
+        // then two 8-byte scalar stores: mov [rip+..], rax (48 89 05)
+        let n = t.seq.windows(3).filter(|w| w == &[0x48, 0x89, 0x05]).count();
+        assert_eq!(n, 2, "{:02x?}", t.seq);
+        // and no pack store to the program's memory
+        assert!(
+            !t.seq.windows(6).any(|w| w[0] == 0x62 && w[4] == 0xd0 && w[5] & 0xc7 == 0x05),
             "{:02x?}",
             t.seq
         );

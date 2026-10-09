@@ -176,12 +176,31 @@ pub fn supported(m: Mnemonic) -> bool {
         || is_comis(m)
         || is_addsub(m)
         || is_gather_scatter(m)
+        || is_movdq(m)
+        || is_scalar_cvt(m)
+        || is_rndscale(m)
+        || is_half(m)
     {
         return true;
     }
     matches!(
         m,
         Vinsertps
+            | Vfmsub132pd
+            | Vfmsub213pd
+            | Vfmsub231pd
+            | Vfnmadd132ps
+            | Vfnmadd213ps
+            | Vfnmadd231ps
+            | Vfnmadd132pd
+            | Vfnmadd213pd
+            | Vfnmadd231pd
+            | Vfnmsub132ps
+            | Vfnmsub213ps
+            | Vfnmsub231ps
+            | Vfnmsub132pd
+            | Vfnmsub213pd
+            | Vfnmsub231pd
             | Vmovups
             | Vmovupd
             | Vmovaps
@@ -252,11 +271,12 @@ pub fn step(insn: &Instruction, st: &mut VState, cpu: &mut dyn Cpu) -> Result<()
     let lanes = match m {
         Vaddps | Vsubps | Vmulps | Vdivps | Vmaxps | Vminps | Vsqrtps | Vfmadd132ps | Vfmadd213ps | Vfmadd231ps | Vfmsub132ps
         | Vfmsub213ps | Vfmsub231ps | Vxorps | Vandps | Vorps | Vbroadcastss | Vfmaddsub132ps | Vfmaddsub213ps | Vfmaddsub231ps
-        | Vfmsubadd132ps | Vfmsubadd213ps | Vfmsubadd231ps => Some(Lanes::F32),
+        | Vfmsubadd132ps | Vfmsubadd213ps | Vfmsubadd231ps | Vfnmadd132ps | Vfnmadd213ps | Vfnmadd231ps | Vfnmsub132ps | Vfnmsub213ps
+        | Vfnmsub231ps => Some(Lanes::F32),
         Vaddpd | Vsubpd | Vmulpd | Vdivpd | Vmaxpd | Vminpd | Vsqrtpd | Vfmadd132pd | Vfmadd213pd | Vfmadd231pd | Vxorpd | Vandpd
-        | Vorpd | Vbroadcastsd | Vfmaddsub132pd | Vfmaddsub213pd | Vfmaddsub231pd | Vfmsubadd132pd | Vfmsubadd213pd | Vfmsubadd231pd => {
-            Some(Lanes::F64)
-        }
+        | Vorpd | Vbroadcastsd | Vfmaddsub132pd | Vfmaddsub213pd | Vfmaddsub231pd | Vfmsubadd132pd | Vfmsubadd213pd | Vfmsubadd231pd
+        | Vfmsub132pd | Vfmsub213pd | Vfmsub231pd | Vfnmadd132pd | Vfnmadd213pd | Vfnmadd231pd | Vfnmsub132pd | Vfnmsub213pd
+        | Vfnmsub231pd => Some(Lanes::F64),
         Vpaddd | Vpsubd | Vpmulld | Vpandd | Vpord | Vpxord | Vpandnd | Vpbroadcastd => Some(Lanes::I32),
         Vpaddq | Vpsubq | Vpmullq | Vpandq | Vporq | Vpxorq | Vpandnq | Vpbroadcastq => Some(Lanes::I64),
         _ => None,
@@ -274,7 +294,7 @@ pub fn step(insn: &Instruction, st: &mut VState, cpu: &mut dyn Cpu) -> Result<()
 
     // Broadcasts and square roots take one source; everything else here
     // takes two.
-    let one_source = matches!(m, Vsqrtps | Vsqrtpd | Vbroadcastss | Vbroadcastsd | Vpbroadcastd);
+    let one_source = matches!(m, Vsqrtps | Vsqrtpd | Vbroadcastss | Vbroadcastsd | Vpbroadcastd | Vpbroadcastq);
     let (a, b) = if one_source {
         let a = source_bytes(insn, 1, st, cpu, lanes)?;
         (a, a)
@@ -337,6 +357,13 @@ pub fn step(insn: &Instruction, st: &mut VState, cpu: &mut dyn Cpu) -> Result<()
                     Vfmaddsub132ps | Vfmsubadd132ps => cur.mul_add(y, addsub_sign(m, i, x)),
                     Vfmaddsub213ps | Vfmsubadd213ps => x.mul_add(cur, addsub_sign(m, i, y)),
                     Vfmaddsub231ps | Vfmsubadd231ps => x.mul_add(y, addsub_sign(m, i, cur)),
+                    // The negated forms: -(a*b) + c and -(a*b) - c, one rounding.
+                    Vfnmadd132ps => (-cur).mul_add(y, x),
+                    Vfnmadd213ps => (-x).mul_add(cur, y),
+                    Vfnmadd231ps => (-x).mul_add(y, cur),
+                    Vfnmsub132ps => (-cur).mul_add(y, -x),
+                    Vfnmsub213ps => (-x).mul_add(cur, -y),
+                    Vfnmsub231ps => (-x).mul_add(y, -cur),
                     Vxorps => f32::from_bits(x.to_bits() ^ y.to_bits()),
                     Vandps => f32::from_bits(x.to_bits() & y.to_bits()),
                     Vorps => f32::from_bits(x.to_bits() | y.to_bits()),
@@ -374,6 +401,15 @@ pub fn step(insn: &Instruction, st: &mut VState, cpu: &mut dyn Cpu) -> Result<()
                     Vfmaddsub132pd | Vfmsubadd132pd => cur.mul_add(y, addsub_sign(m, i, x)),
                     Vfmaddsub213pd | Vfmsubadd213pd => x.mul_add(cur, addsub_sign(m, i, y)),
                     Vfmaddsub231pd | Vfmsubadd231pd => x.mul_add(y, addsub_sign(m, i, cur)),
+                    Vfmsub132pd => cur.mul_add(y, -x),
+                    Vfmsub213pd => x.mul_add(cur, -y),
+                    Vfmsub231pd => x.mul_add(y, -cur),
+                    Vfnmadd132pd => (-cur).mul_add(y, x),
+                    Vfnmadd213pd => (-x).mul_add(cur, y),
+                    Vfnmadd231pd => (-x).mul_add(y, cur),
+                    Vfnmsub132pd => (-cur).mul_add(y, -x),
+                    Vfnmsub213pd => (-x).mul_add(cur, -y),
+                    Vfnmsub231pd => (-x).mul_add(y, -cur),
                     Vxorpd => f64::from_bits(x.to_bits() ^ y.to_bits()),
                     Vandpd => f64::from_bits(x.to_bits() & y.to_bits()),
                     Vorpd => f64::from_bits(x.to_bits() | y.to_bits()),
@@ -575,6 +611,421 @@ fn do_gather_scatter(insn: &Instruction, st: &mut VState, cpu: &dyn Cpu) -> Resu
     }
     st.k[k] = 0;
     Ok(())
+}
+
+fn is_movdq(m: Mnemonic) -> bool {
+    matches!(m, Mnemonic::Vmovd | Mnemonic::Vmovq)
+}
+
+/// `vmovd` and `vmovq` between a vector register and a general register
+/// or memory: into a vector, the low 4 or 8 bytes and the rest zero; out
+/// of one, those bytes alone. `vmovq xmm, xmm` keeps the low 8 and zeroes
+/// the rest.
+fn do_movdq(insn: &Instruction, st: &mut VState, cpu: &mut dyn Cpu) -> Result<(), Unsupported> {
+    let n = if insn.mnemonic() == Mnemonic::Vmovq { 8 } else { 4 };
+    let to_vec = insn.op0_kind() == OpKind::Register && zmm_index(insn.op0_register()).is_some();
+    if to_vec {
+        let d = zmm_index(insn.op0_register()).unwrap();
+        let mut v = [0u8; 8];
+        match insn.op1_kind() {
+            OpKind::Register => {
+                let r = insn.op1_register();
+                if let Some(s) = zmm_index(r) {
+                    v.copy_from_slice(&st.zmm[s][..8]);
+                } else {
+                    v = cpu.get(r).to_le_bytes();
+                }
+            }
+            OpKind::Memory => {
+                let addr = effective_address(insn, cpu) as *const u8;
+                // SAFETY: an address the program itself was about to use.
+                unsafe { std::ptr::copy_nonoverlapping(addr, v.as_mut_ptr(), n) };
+            }
+            k => return Err(Unsupported(format!("vmovd source kind {k:?}"))),
+        }
+        st.zmm[d] = [0u8; 64];
+        st.zmm[d][..n].copy_from_slice(&v[..n]);
+        return Ok(());
+    }
+    let s = zmm_index(insn.op1_register()).ok_or_else(|| Unsupported("vmovd source".into()))?;
+    let mut v = [0u8; 8];
+    v[..n].copy_from_slice(&st.zmm[s][..n]);
+    match insn.op0_kind() {
+        OpKind::Register => cpu.set(insn.op0_register(), u64::from_le_bytes(v)),
+        OpKind::Memory => {
+            let addr = effective_address(insn, cpu) as *mut u8;
+            // SAFETY: an address the program itself was about to write.
+            unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), addr, n) };
+        }
+        k => return Err(Unsupported(format!("vmovd destination kind {k:?}"))),
+    }
+    Ok(())
+}
+
+fn is_scalar_cvt(m: Mnemonic) -> bool {
+    use Mnemonic::*;
+    matches!(
+        m,
+        Vcvtsi2ss
+            | Vcvtsi2sd
+            | Vcvtusi2ss
+            | Vcvtusi2sd
+            | Vcvttss2si
+            | Vcvtss2si
+            | Vcvttsd2si
+            | Vcvtsd2si
+            | Vcvttss2usi
+            | Vcvtss2usi
+            | Vcvttsd2usi
+            | Vcvtsd2usi
+    )
+}
+
+/// The scalar conversions with a general register: integer to float
+/// (lane 0 of the destination, lanes 1 to 3 from the first source, the
+/// rest zero; one rounding, which `as` gives), and float to integer
+/// (truncating or to nearest even; out of range and NaN give the integer
+/// indefinite, the lowest signed value or the highest unsigned one, as
+/// the instructions define).
+fn do_scalar_cvt(insn: &Instruction, st: &mut VState, cpu: &mut dyn Cpu) -> Result<(), Unsupported> {
+    use Mnemonic::*;
+    let m = insn.mnemonic();
+    match m {
+        Vcvtsi2ss | Vcvtsi2sd | Vcvtusi2ss | Vcvtusi2sd => {
+            let d = zmm_index(insn.op0_register()).ok_or_else(|| Unsupported("conversion destination".into()))?;
+            let s1 = source_bytes(insn, 1, st, cpu, Lanes::I32)?;
+            let wide = match insn.op2_kind() {
+                OpKind::Register => insn.op2_register().size() == 8,
+                OpKind::Memory => insn.memory_size().size() == 8,
+                k => return Err(Unsupported(format!("conversion source kind {k:?}"))),
+            };
+            let raw = match insn.op2_kind() {
+                OpKind::Register => cpu.get(insn.op2_register()),
+                _ => {
+                    let addr = effective_address(insn, cpu) as *const u8;
+                    let mut b = [0u8; 8];
+                    // SAFETY: an address the program itself was about to use.
+                    unsafe { std::ptr::copy_nonoverlapping(addr, b.as_mut_ptr(), if wide { 8 } else { 4 }) };
+                    u64::from_le_bytes(b)
+                }
+            };
+            let unsigned = matches!(m, Vcvtusi2ss | Vcvtusi2sd);
+            let mut out = [0u8; 64];
+            out[..16].copy_from_slice(&s1[..16]);
+            match (m, wide, unsigned) {
+                (Vcvtsi2sd | Vcvtusi2sd, true, false) => out[..8].copy_from_slice(&((raw as i64) as f64).to_le_bytes()),
+                (Vcvtsi2sd | Vcvtusi2sd, true, true) => out[..8].copy_from_slice(&(raw as f64).to_le_bytes()),
+                (Vcvtsi2sd | Vcvtusi2sd, false, false) => out[..8].copy_from_slice(&f64::from(raw as u32 as i32).to_le_bytes()),
+                (Vcvtsi2sd | Vcvtusi2sd, false, true) => out[..8].copy_from_slice(&f64::from(raw as u32).to_le_bytes()),
+                (_, true, false) => out[..4].copy_from_slice(&((raw as i64) as f32).to_le_bytes()),
+                (_, true, true) => out[..4].copy_from_slice(&(raw as f32).to_le_bytes()),
+                (_, false, false) => out[..4].copy_from_slice(&((raw as u32 as i32) as f32).to_le_bytes()),
+                (_, false, true) => out[..4].copy_from_slice(&((raw as u32) as f32).to_le_bytes()),
+            }
+            st.zmm[d] = out;
+        }
+        _ => {
+            let r = insn.op0_register();
+            let wide = r.size() == 8;
+            let from_double = matches!(m, Vcvttsd2si | Vcvtsd2si | Vcvttsd2usi | Vcvtsd2usi);
+            let truncate = matches!(m, Vcvttss2si | Vcvttsd2si | Vcvttss2usi | Vcvttsd2usi);
+            let unsigned = matches!(m, Vcvttss2usi | Vcvtss2usi | Vcvttsd2usi | Vcvtsd2usi);
+            let lanes = if from_double { Lanes::F64 } else { Lanes::F32 };
+            let a = source_bytes(insn, 1, st, cpu, lanes)?;
+            let x = if from_double { lane_f64(&a, 0) } else { f64::from(lane_f32(&a, 0)) };
+            let x = if truncate { x.trunc() } else { x.round_ties_even() };
+            let v: u64 = match (wide, unsigned) {
+                (true, false) => {
+                    if x.is_nan() || x >= 9223372036854775808.0 || x < -9223372036854775808.0 {
+                        1u64 << 63
+                    } else {
+                        (x as i64) as u64
+                    }
+                }
+                (false, false) => {
+                    if x.is_nan() || x >= 2147483648.0 || x < -2147483648.0 {
+                        0x8000_0000
+                    } else {
+                        (x as i32) as u32 as u64
+                    }
+                }
+                (true, true) => {
+                    if x.is_nan() || x < 0.0 || x >= 18446744073709551616.0 {
+                        u64::MAX
+                    } else {
+                        x as u64
+                    }
+                }
+                (false, true) => {
+                    if x.is_nan() || x < 0.0 || x >= 4294967296.0 {
+                        0xffff_ffff
+                    } else {
+                        x as u64
+                    }
+                }
+            };
+            cpu.set(r, v);
+        }
+    }
+    Ok(())
+}
+
+fn is_rndscale(m: Mnemonic) -> bool {
+    use Mnemonic::*;
+    matches!(m, Vrndscaleps | Vrndscalepd | Vrndscaless | Vrndscalesd)
+}
+
+/// Round to a number of fraction bits (the immediate's high nibble) in
+/// the immediate's rounding mode (its low two bits; bit 2 selects the
+/// MXCSR mode, taken as nearest even here): x rounded as x * 2^M then
+/// scaled back. The scalar forms work lane 0 with lanes 1 to 3 from the
+/// first source.
+fn do_rndscale(insn: &Instruction, st: &mut VState, cpu: &dyn Cpu) -> Result<(), Unsupported> {
+    use Mnemonic::*;
+    let m = insn.mnemonic();
+    let imm = insn.immediate8();
+    let scale = f64::from(1u32 << (imm >> 4));
+    let round = |x: f64| -> f64 {
+        let y = x * scale;
+        let r = match (imm & 4 != 0, imm & 3) {
+            (true, _) | (false, 0) => y.round_ties_even(),
+            (false, 1) => y.floor(),
+            (false, 2) => y.ceil(),
+            _ => y.trunc(),
+        };
+        if y.is_infinite() || y.is_nan() {
+            x
+        } else {
+            r / scale
+        }
+    };
+    let wide = matches!(m, Vrndscalepd | Vrndscalesd);
+    let dst = zmm_index(insn.op0_register()).ok_or_else(|| Unsupported("round destination".into()))?;
+    let k = mask_index(insn.op_mask());
+    let lanes = if wide { Lanes::F64 } else { Lanes::F32 };
+    if matches!(m, Vrndscaless | Vrndscalesd) {
+        let s1 = source_bytes(insn, 1, st, cpu, lanes)?;
+        let s2 = source_bytes(insn, 2, st, cpu, lanes)?;
+        let mut out = [0u8; 64];
+        out[..16].copy_from_slice(&s1[..16]);
+        if wide {
+            out[..8].copy_from_slice(&round(lane_f64(&s2, 0)).to_le_bytes());
+        } else {
+            out[..4].copy_from_slice(&(round(f64::from(lane_f32(&s2, 0))) as f32).to_le_bytes());
+        }
+        st.zmm[dst] = out;
+        return Ok(());
+    }
+    let a = source_bytes(insn, 1, st, cpu, lanes)?;
+    let width = dest_width(insn);
+    let elem = if wide { 8 } else { 4 };
+    for i in 0..(width / elem) {
+        if !st.lane_enabled(k, i) {
+            if insn.zeroing_masking() {
+                st.zmm[dst][i * elem..i * elem + elem].fill(0);
+            }
+            continue;
+        }
+        if wide {
+            st.set_f64_lane(dst, i, round(lane_f64(&a, i)));
+        } else {
+            st.set_f32_lane(dst, i, round(f64::from(lane_f32(&a, i))) as f32);
+        }
+    }
+    for byte in width..64 {
+        st.zmm[dst][byte] = 0;
+    }
+    Ok(())
+}
+
+fn is_half(m: Mnemonic) -> bool {
+    matches!(m, Mnemonic::Vcvtph2ps | Mnemonic::Vcvtps2ph)
+}
+
+/// A float16's bits as a float32: exact (every half is a float).
+fn half_to_f32(h: u16) -> f32 {
+    let sign = u32::from(h >> 15) << 31;
+    let exp = u32::from((h >> 10) & 0x1f);
+    let mant = u32::from(h & 0x3ff);
+    let bits = if exp == 0 {
+        if mant == 0 {
+            sign
+        } else {
+            // a subnormal: normalise
+            let mut e = 127 - 15 + 1;
+            let mut mm = mant;
+            while mm & 0x400 == 0 {
+                mm <<= 1;
+                e -= 1;
+            }
+            sign | ((e as u32) << 23) | ((mm & 0x3ff) << 13)
+        }
+    } else if exp == 31 {
+        sign | 0x7f80_0000 | (mant << 13)
+    } else {
+        sign | ((exp + 127 - 15) << 23) | (mant << 13)
+    };
+    f32::from_bits(bits)
+}
+
+/// A float32 as a float16 in a rounding mode (0 nearest even, 1 down, 2
+/// up, 3 toward zero): overflow to infinity (or the largest finite value
+/// in a directed mode that does not reach it), subnormals rounded at
+/// their own precision, NaN quiet, the sign kept.
+fn f32_to_half(f: f32, mode: u8) -> u16 {
+    let bits = f.to_bits();
+    let sign = ((bits >> 31) as u16) << 15;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let mant = bits & 0x7f_ffff;
+    if exp == 0xff {
+        return if mant == 0 {
+            sign | 0x7c00
+        } else {
+            sign | 0x7e00 | ((mant >> 13) as u16 & 0x1ff)
+        };
+    }
+    // The value as an integer count of float16 units: significand with the
+    // hidden bit at bit 23, to be shifted right by `shift` bits.
+    let e = exp - 127; // unbiased
+    let (unit_shift, hexp) = if e >= -14 {
+        (13i32, (e + 15) as u16)
+    } else {
+        (13 + (-14 - e), 0u16)
+    };
+    let sig = if exp == 0 { mant } else { mant | 0x80_0000 };
+    let negative = bits >> 31 != 0;
+    // Shifted out by 25 bits or more (the significand has 24), the value is
+    // under half a unit: zero to nearest, one unit in the directed mode
+    // that rounds away from zero.
+    let (q, round_up) = if unit_shift >= 25 {
+        let any = sig != 0;
+        let up = match mode & 3 {
+            1 => negative && any,
+            2 => !negative && any,
+            _ => false,
+        };
+        (0u32, up)
+    } else {
+        let q = sig >> unit_shift;
+        let rem = sig & ((1u32 << unit_shift) - 1);
+        let half = 1u32 << (unit_shift - 1);
+        let up = match mode & 3 {
+            0 => rem > half || (rem == half && q & 1 == 1),
+            1 => negative && rem != 0,
+            2 => !negative && rem != 0,
+            _ => false,
+        };
+        (q, up)
+    };
+    let mut q = q + u32::from(round_up);
+    let mut hexp = hexp;
+    if hexp == 0 && q & 0x400 != 0 {
+        // a subnormal rounded up into the smallest normal
+        hexp = 1;
+        q &= 0x3ff;
+    } else if hexp > 0 && q & 0x800 != 0 {
+        hexp += 1;
+        q >>= 1;
+    }
+    if exp == 0 && mant == 0 {
+        return sign;
+    }
+    if hexp >= 31 {
+        // overflow: infinity, or the largest finite value where the mode rounds toward zero
+        let to_inf = match mode & 3 {
+            0 => true,
+            1 => negative,
+            2 => !negative,
+            _ => false,
+        };
+        return if to_inf { sign | 0x7c00 } else { sign | 0x7bff };
+    }
+    sign | (hexp << 10) | (q as u16 & 0x3ff)
+}
+
+/// `vcvtph2ps` (16 halves from a ymm or memory to 16 floats) and
+/// `vcvtps2ph` (16 floats to 16 halves in a ymm or memory, the rounding
+/// from the immediate; bit 2 means the MXCSR mode, taken as nearest).
+fn do_half(insn: &Instruction, st: &mut VState, cpu: &dyn Cpu) -> Result<(), Unsupported> {
+    let k = mask_index(insn.op_mask());
+    if insn.mnemonic() == Mnemonic::Vcvtph2ps {
+        let dst = zmm_index(insn.op0_register()).ok_or_else(|| Unsupported("convert destination".into()))?;
+        let width = dest_width(insn);
+        let n = width / 4;
+        let mut src = [0u8; 64];
+        match insn.op1_kind() {
+            OpKind::Register => {
+                let i = zmm_index(insn.op1_register()).ok_or_else(|| Unsupported("convert source".into()))?;
+                src = st.zmm[i];
+            }
+            OpKind::Memory => {
+                let addr = effective_address(insn, cpu) as *const u8;
+                // SAFETY: an address the program itself was about to use.
+                unsafe { std::ptr::copy_nonoverlapping(addr, src.as_mut_ptr(), n * 2) };
+            }
+            kk => return Err(Unsupported(format!("convert source kind {kk:?}"))),
+        }
+        for i in 0..n {
+            if !st.lane_enabled(k, i) {
+                if insn.zeroing_masking() {
+                    st.set_f32_lane(dst, i, 0.0);
+                }
+                continue;
+            }
+            let h = u16::from_le_bytes(src[i * 2..i * 2 + 2].try_into().unwrap());
+            st.set_f32_lane(dst, i, half_to_f32(h));
+        }
+        for byte in width..64 {
+            st.zmm[dst][byte] = 0;
+        }
+        return Ok(());
+    }
+    let s = zmm_index(insn.op1_register()).ok_or_else(|| Unsupported("convert source".into()))?;
+    let n = dest_width_of(insn.op1_register()) / 4;
+    let imm = insn.immediate8();
+    let mode = if imm & 4 != 0 { 0 } else { imm & 3 };
+    let mut out = [0u8; 64];
+    for i in 0..n {
+        let h = f32_to_half(st.f32_lane(s, i), mode);
+        out[i * 2..i * 2 + 2].copy_from_slice(&h.to_le_bytes());
+    }
+    match insn.op0_kind() {
+        OpKind::Register => {
+            let d = zmm_index(insn.op0_register()).ok_or_else(|| Unsupported("convert destination".into()))?;
+            for i in 0..n {
+                if st.lane_enabled(k, i) {
+                    st.zmm[d][i * 2..i * 2 + 2].copy_from_slice(&out[i * 2..i * 2 + 2]);
+                } else if insn.zeroing_masking() {
+                    st.zmm[d][i * 2..i * 2 + 2].fill(0);
+                }
+            }
+            for byte in n * 2..64 {
+                st.zmm[d][byte] = 0;
+            }
+        }
+        OpKind::Memory => {
+            let addr = effective_address(insn, cpu) as *mut u8;
+            for i in 0..n {
+                if st.lane_enabled(k, i) {
+                    // SAFETY: an address the program itself was about to write.
+                    unsafe { std::ptr::copy_nonoverlapping(out[i * 2..].as_ptr(), addr.add(i * 2), 2) };
+                }
+            }
+        }
+        kk => return Err(Unsupported(format!("convert destination kind {kk:?}"))),
+    }
+    Ok(())
+}
+
+/// The width in bytes a vector register name implies (`dest_width` for any operand).
+fn dest_width_of(r: Register) -> usize {
+    if r.is_zmm() {
+        64
+    } else if r.is_ymm() {
+        32
+    } else {
+        16
+    }
 }
 
 /// Loads, stores and register-to-register moves.
@@ -1239,7 +1690,10 @@ fn shift64(m: Mnemonic, x: u64, cnt: u64, bits: u64) -> u64 {
 
 fn is_permute(m: Mnemonic) -> bool {
     use Mnemonic::*;
-    matches!(m, Vpermd | Vpermps | Vpermq | Vpermpd | Vpermt2d | Vpermt2ps | Vpermi2d | Vpermi2ps)
+    matches!(
+        m,
+        Vpermd | Vpermps | Vpermq | Vpermpd | Vpermt2d | Vpermt2ps | Vpermi2d | Vpermi2ps | Vpermt2q | Vpermt2pd | Vpermi2q | Vpermi2pd
+    )
 }
 
 /// Cross-lane permutes. `vpermd` takes an index per lane and selects from
@@ -1249,7 +1703,7 @@ fn is_permute(m: Mnemonic) -> bool {
 fn do_permute(insn: &Instruction, st: &mut VState, cpu: &dyn Cpu) -> Result<(), Unsupported> {
     use Mnemonic::*;
     let m = insn.mnemonic();
-    let wide = matches!(m, Vpermq | Vpermpd);
+    let wide = matches!(m, Vpermq | Vpermpd | Vpermt2q | Vpermt2pd | Vpermi2q | Vpermi2pd);
     let elem = if wide { 8usize } else { 4 };
     let n = 64 / elem;
     let dst = zmm_index(insn.op0_register()).ok_or_else(|| Unsupported("permute destination".into()))?;
@@ -1276,11 +1730,11 @@ fn do_permute(insn: &Instruction, st: &mut VState, cpu: &dyn Cpu) -> Result<(), 
             }
             o
         }
-        Vpermt2d | Vpermt2ps | Vpermi2d | Vpermi2ps => {
+        Vpermt2d | Vpermt2ps | Vpermi2d | Vpermi2ps | Vpermt2q | Vpermt2pd | Vpermi2q | Vpermi2pd => {
             // Two-source: index bit above the lane count picks the second
             // table. For t2 the destination holds the first table and the
             // index is operand 1; for i2 the destination holds the index.
-            let (tbl_a, idx, tbl_b) = if matches!(m, Vpermt2d | Vpermt2ps) {
+            let (tbl_a, idx, tbl_b) = if matches!(m, Vpermt2d | Vpermt2ps | Vpermt2q | Vpermt2pd) {
                 (
                     st.zmm[dst],
                     source_bytes(insn, 1, st, cpu, lanes)?,
@@ -1410,7 +1864,10 @@ fn is_lane_move(m: Mnemonic) -> bool {
     use Mnemonic::*;
     matches!(
         m,
-        Vunpckhps
+        Valignd
+            | Valignq
+            | Vpermilps
+            | Vunpckhps
             | Vunpcklps
             | Vunpckhpd
             | Vunpcklpd
@@ -1441,12 +1898,12 @@ fn do_lane_move(insn: &Instruction, st: &mut VState, cpu: &dyn Cpu) -> Result<()
     let width = dest_width(insn);
     let wide = matches!(
         m,
-        Vunpckhpd | Vunpcklpd | Vpunpckhqdq | Vpunpcklqdq | Vshufpd | Vshuff64x2 | Vshufi64x2
+        Vunpckhpd | Vunpcklpd | Vpunpckhqdq | Vpunpcklqdq | Vshufpd | Vshuff64x2 | Vshufi64x2 | Valignq
     );
     let lanes = if wide { Lanes::I64 } else { Lanes::I32 };
 
     let a = source_bytes(insn, 1, st, cpu, lanes)?;
-    let b = if matches!(m, Vpshufd) {
+    let b = if matches!(m, Vpshufd) || (m == Vpermilps && insn.op_kind(insn.op_count() - 1) == OpKind::Immediate8) {
         a
     } else {
         source_bytes(insn, 2, st, cpu, lanes)?
@@ -1504,6 +1961,38 @@ fn do_lane_move(insn: &Instruction, st: &mut VState, cpu: &dyn Cpu) -> Result<()
                 for j in 0..4 {
                     let sel = ((imm >> (j * 2)) & 3) as usize;
                     copy_elem(&mut o, g * 4 + j, &a, g * 4 + sel, 4);
+                }
+            }
+        }
+        // vpermilps: within each group, by two bits of the immediate per
+        // lane, or by the low two bits of the second source's lane.
+        Vpermilps => {
+            let by_imm = insn.op_kind(insn.op_count() - 1) == OpKind::Immediate8;
+            for g in 0..groups {
+                for j in 0..4 {
+                    let sel = if by_imm {
+                        ((imm >> (j * 2)) & 3) as usize
+                    } else {
+                        (lane_i32(&b, g * 4 + j) & 3) as usize
+                    };
+                    copy_elem(&mut o, g * 4 + j, &a, g * 4 + sel, 4);
+                }
+            }
+        }
+        // valignd / valignq: the two sources concatenated (the second low),
+        // shifted right by the immediate's count of elements, the width's
+        // worth kept (the count wraps at twice the lane count).
+        Valignd | Valignq => {
+            let elem = if wide { 8 } else { 4 };
+            let n = width / elem;
+            let shift = usize::from(imm) & (2 * n - 1);
+            let mut cat = [0u8; 128];
+            cat[..width].copy_from_slice(&b[..width]);
+            cat[width..2 * width].copy_from_slice(&a[..width]);
+            for j in 0..n {
+                let from = j + shift;
+                if from < 2 * n {
+                    o[j * elem..j * elem + elem].copy_from_slice(&cat[from * elem..from * elem + elem]);
                 }
             }
         }
@@ -1675,6 +2164,24 @@ fn is_scalar(m: Mnemonic) -> bool {
             | Vfmadd132sd
             | Vfmadd213sd
             | Vfmadd231sd
+            | Vfmsub132ss
+            | Vfmsub213ss
+            | Vfmsub231ss
+            | Vfmsub132sd
+            | Vfmsub213sd
+            | Vfmsub231sd
+            | Vfnmadd132ss
+            | Vfnmadd213ss
+            | Vfnmadd231ss
+            | Vfnmadd132sd
+            | Vfnmadd213sd
+            | Vfnmadd231sd
+            | Vfnmsub132ss
+            | Vfnmsub213ss
+            | Vfnmsub231ss
+            | Vfnmsub132sd
+            | Vfnmsub213sd
+            | Vfnmsub231sd
             | Vcvtss2sd
             | Vcvtsd2ss
     )
@@ -1689,7 +2196,27 @@ fn do_scalar(insn: &Instruction, st: &mut VState, cpu: &dyn Cpu) -> Result<(), U
     let m = insn.mnemonic();
     let wide = matches!(
         m,
-        Vaddsd | Vsubsd | Vmulsd | Vdivsd | Vmaxsd | Vminsd | Vsqrtsd | Vmovsd | Vfmadd132sd | Vfmadd213sd | Vfmadd231sd | Vcvtss2sd
+        Vaddsd
+            | Vsubsd
+            | Vmulsd
+            | Vdivsd
+            | Vmaxsd
+            | Vminsd
+            | Vsqrtsd
+            | Vmovsd
+            | Vfmadd132sd
+            | Vfmadd213sd
+            | Vfmadd231sd
+            | Vfmsub132sd
+            | Vfmsub213sd
+            | Vfmsub231sd
+            | Vfnmadd132sd
+            | Vfnmadd213sd
+            | Vfnmadd231sd
+            | Vfnmsub132sd
+            | Vfnmsub213sd
+            | Vfnmsub231sd
+            | Vcvtss2sd
     );
     let lanes = if wide { Lanes::F64 } else { Lanes::F32 };
 
@@ -1759,6 +2286,15 @@ fn do_scalar(insn: &Instruction, st: &mut VState, cpu: &dyn Cpu) -> Result<(), U
             Vfmadd132sd => c.mul_add(y, x),
             Vfmadd213sd => x.mul_add(c, y),
             Vfmadd231sd => x.mul_add(y, c),
+            Vfmsub132sd => c.mul_add(y, -x),
+            Vfmsub213sd => x.mul_add(c, -y),
+            Vfmsub231sd => x.mul_add(y, -c),
+            Vfnmadd132sd => (-c).mul_add(y, x),
+            Vfnmadd213sd => (-x).mul_add(c, y),
+            Vfnmadd231sd => (-x).mul_add(y, c),
+            Vfnmsub132sd => (-c).mul_add(y, -x),
+            Vfnmsub213sd => (-x).mul_add(c, -y),
+            Vfnmsub231sd => (-x).mul_add(y, -c),
             _ => return Err(Unsupported(format!("{m:?} scalar"))),
         };
         out[..8].copy_from_slice(&v.to_le_bytes());
@@ -1791,6 +2327,15 @@ fn do_scalar(insn: &Instruction, st: &mut VState, cpu: &dyn Cpu) -> Result<(), U
             Vfmadd132ss => c.mul_add(y, x),
             Vfmadd213ss => x.mul_add(c, y),
             Vfmadd231ss => x.mul_add(y, c),
+            Vfmsub132ss => c.mul_add(y, -x),
+            Vfmsub213ss => x.mul_add(c, -y),
+            Vfmsub231ss => x.mul_add(y, -c),
+            Vfnmadd132ss => (-c).mul_add(y, x),
+            Vfnmadd213ss => (-x).mul_add(c, y),
+            Vfnmadd231ss => (-x).mul_add(y, c),
+            Vfnmsub132ss => (-c).mul_add(y, -x),
+            Vfnmsub213ss => (-x).mul_add(c, -y),
+            Vfnmsub231ss => (-x).mul_add(y, -c),
             _ => return Err(Unsupported(format!("{m:?} scalar"))),
         };
         out[..4].copy_from_slice(&v.to_le_bytes());
@@ -1967,6 +2512,18 @@ fn step_uncommon(insn: &Instruction, st: &mut VState, cpu: &mut dyn Cpu) -> Resu
     }
     if is_gather_scatter(m) {
         return do_gather_scatter(insn, st, cpu);
+    }
+    if is_movdq(m) {
+        return do_movdq(insn, st, cpu);
+    }
+    if is_scalar_cvt(m) {
+        return do_scalar_cvt(insn, st, cpu);
+    }
+    if is_rndscale(m) {
+        return do_rndscale(insn, st, cpu);
+    }
+    if is_half(m) {
+        return do_half(insn, st, cpu);
     }
 
     // Moves are their own shape: one of the two operands is memory, and

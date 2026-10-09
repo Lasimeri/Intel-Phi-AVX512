@@ -281,7 +281,10 @@ the flags.
   block's four packed into its first dword (the block rotated by one lane
   and shifted by 8, or'd; by two lanes and 16, or'd), the four first
   dwords gathered by `vpermd` into lanes 0 to 3; to an xmm with the lanes
-  above zeroed, or to memory through the pack pair. The card's own
+  above zeroed, or to memory through the scratch slot and two scalar
+  stores, byte-granular (the pack pair moves dword elements and the card
+  wants them dword-aligned: the forms test's 16-byte store at an odd
+  address was a general protection fault on card 3). The card's own
   down-converting store was not used: whether its `sint8` conversion
   truncates or saturates was not established, and `vpmovdb` truncates. A
   write mask would be a byte mask, which the card cannot apply: refused.

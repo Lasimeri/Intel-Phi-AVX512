@@ -127,3 +127,27 @@ way: `vpcmpq`, `vpcmpuq`, `vpcmpeqq` and `vpcmpgtq` were in `is_compare`
 but had no arm in `do_compare`, so a program reaching one stopped with
 "compare" instead of a result; they compare i64 lanes now, `vpcmpuq`
 through `uint_predicate` on u64.
+
+Then the same build scanned against the emulator's table (the scanner
+asks `phi512::is_supported` of every AVX-512 instruction in what
+`llama-simple` loads: `bench/phi512-2026-10-08b/xscan` on the rack) found
+21 mnemonics it lacked, 3070 sites, `vmovq` alone 2460, and the
+`--emulate` run of llama.phi had stopped at the first (`vcvtusi2sd`,
+a form c42f078 gave the translator alone). All 21 are in now, each in
+the family its shape belongs to: `vmovd` and `vmovq` with a general
+register or memory (`do_movdq`); the scalar conversions with a general
+register, integer to float by `as` (one rounding) and float to integer
+truncating or to nearest even with the integer indefinite out of range
+(`do_scalar_cvt`); `vcvtph2ps` and `vcvtps2ph` with a float16 conversion
+written here (`half_to_f32` exact; `f32_to_half` rounding in the
+immediate's mode, subnormals at their own precision, overflow to
+infinity or the largest finite value as the mode says; `do_half`);
+`valignd`, `valignq` and `vpermilps` within `do_lane_move`; `vpermt2q`
+and the other qword two-table permutes in `do_permute`; the fused
+multiply-add's `fmsub`, `fnmadd` and `fnmsub` forms, packed and scalar,
+beside `fmadd` in `step` and `do_scalar`; `vrndscaleps/pd/ss/sd` to the
+immediate's fraction bits in its rounding mode (`do_rndscale`; bit 2,
+the MXCSR mode, is taken as nearest even, as the compares and
+conversions here take MXCSR). The narrow test (`tools/avx512-narrow-test.c`)
+stays a card test: under `--emulate` it stops at its fourth check,
+`vmovdqu8`, a BW form outside this emulator's scope.
