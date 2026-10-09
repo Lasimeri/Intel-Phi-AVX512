@@ -105,8 +105,25 @@ with a rule that is easy to get wrong:
 | shuffles, unpacks | `do_lane_move` | within each 128-bit group |
 | extract, insert | `do_extract_insert` | a 128- or 256-bit block by immediate |
 | scalar forms | `do_scalar` | the upper lanes come from the first source |
-| extend, narrow | `do_extend` | `vpmov*` widening and narrowing |
+| extend, narrow | `do_extend` | `vpmov*` widening and narrowing; a narrowing form stores to memory the enabled elements only (2026-10-08) |
 
 And in `step`: `vmaxps`/`vminps` return the second source when either is
 NaN, and when both are zero, which is not IEEE maxNum. `supported` is the
 list of mnemonics all of this covers; `step` is the one entry point.
+| scalar compares to flags | `do_comis` | `vcomiss` and kin write ZF, PF and CF (all three for unordered) and clear SF, AF and OF; comi and ucomi fold together, as the signalling is not modelled (2026-10-08) |
+| `vinsertps` | `do_insertps` | one dword of the second source (lane imm[7:6], lane 0 of memory) into lane imm[5:4] of the first, the lanes imm[3:0] zeroed, the xmm's upper lanes zeroed (2026-10-08) |
+| gather, scatter | `do_gather_scatter` | dword indices, every enabled lane from the lowest up, the mask cleared at the end; a gather's disabled lanes keep the destination (2026-10-08) |
+
+## The forms llama.cpp's AVX-512F build met (2026-10-08)
+
+With the card translator (`avx512-xlate/src/rewrite.md`, the same date)
+the emulator took the same nine forms, so `tools/avx512-f-forms-test.c`
+passes both ways: `vcomiss` and kin (`do_comis`), `vinsertps`, the
+dword-index gathers and scatters, the fused multiply-add forms that add
+on half the lanes (`vfmaddsub`, `vfmsubadd`: `addsub_sign` in `step`),
+`vpmaxuq` and `vpminuq` beside the signed pair, `vptestmq`, `vptestnmq`
+and `vptestnmd` in `do_compare`, and `vpmovdb` to memory. Found on the
+way: `vpcmpq`, `vpcmpuq`, `vpcmpeqq` and `vpcmpgtq` were in `is_compare`
+but had no arm in `do_compare`, so a program reaching one stopped with
+"compare" instead of a result; they compare i64 lanes now, `vpcmpuq`
+through `uint_predicate` on u64.

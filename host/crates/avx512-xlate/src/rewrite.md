@@ -171,7 +171,7 @@ What the card cannot do directly, and how each is expressed:
 Still refused (a reason is returned, and the region builder treats a
 refusal as a region boundary, except at the faulting instruction
 itself, where the program cannot continue): byte and word lane
-arithmetic (`vpmaddwd`, `vpshufb`, `vpaddw`, ...), gathers and scatters,
+arithmetic (`vpmaddwd`, `vpshufb`, `vpaddw`, ...), a gather or scatter with qword indices, without a mask or narrow, a masked `vpmovdb`,
 AVX512CD, `vshufpd` with a different selection per block, a masked
 scalar minimum, maximum, divide, square root or `vrndscaless`/`sd` (under
 any mask), `vcvtps2ph` with a rounding other than to nearest, a byte or
@@ -225,3 +225,78 @@ kept. The region builder calls this instead of `rewrite` only when the
 branch after `kortest` reads the kept flag (phi512's `bytecmp_flag_kept`,
 `host/crates/phi512/src/offload.md`); anything else is refused. Still
 assumed: nothing reads the mask register itself after the branch.
+
+## The forms llama.cpp's AVX-512F build met (2026-10-08)
+
+A scan of llama.phi's `build-avx512f` (`-mavx512f` alone, no VL, BW, DQ
+or CD) with this translator found nine forms refused, 547 of 92028
+instructions; each is now expressed, checked on the card and under the
+emulator by `tools/avx512-f-forms-test.c`, and the build scans with 0
+refused in what `llama-simple` loads (57861 instructions). The emitter
+gained `flags_out`: a flags byte the sequence leaves in the scratch area,
+written with `sahf` after every restore (OF cleared by a `test` first,
+AH restored from the saved rax after), for an instruction whose result is
+the flags.
+
+- **`vcomiss`, `vucomiss`, `vcomisd`, `vucomisd`** (`comis`): three
+  `vcmpps` on lane 0 into the scratch mask, with the lt, eq and unordered
+  predicates (a memory operand as a one-element broadcast), the flags
+  byte assembled in ecx (CF for less, ZF for equal, ZF, PF and CF for
+  unordered, nothing for greater) and written through `flags_out`; SF, AF
+  and OF come out clear, as the instruction defines. The comi and ucomi
+  forms differ only in which NaN signals, which the card does not trap.
+- **`vpcmpq`, `vpcmpuq`, `vpcmpeqq`, `vpcmpgtq`** (`cmp_q`): the card
+  compares dwords, so `qword_lt_eq` builds each qword's lt and eq from
+  three dword compares (`vpcmpeqd`; `vpcmpud` lt for the low halves, which
+  are always unsigned; `vpcmpd` or `vpcmpud` lt for the high halves, as
+  the instruction says): a < b when hi(a) < hi(b), or hi(a) = hi(b) and
+  lo(a) <u lo(b). The six predicates come from the two (le is lt or eq;
+  neq, nlt and nle the complements; FALSE and TRUE are constants), the
+  result's even bits are packed to one per qword (`pack_even`, three
+  shift-or-and steps in eax), cut to the vector length and to the write
+  mask, which zeroes as a compare's does.
+- **`vpmaxsq`, `vpminsq`, `vpmaxuq`, `vpminuq`** (`minmax_q`): the second
+  source, then the first where `qword_lt_eq` says it wins, each qword's
+  bit spread over its two dword lanes (`spread_even`) for the masked move.
+- **`vptestmq`, `vptestnmq`, `vptestnmd`** (`testm`): the card's
+  `vptestmd` (added to the whitelist as well, for the dword form), the
+  two bits of a qword or'd and packed, the nm forms complemented, cut to
+  the length and the write mask.
+- **`vinsertps`** (`insertps`): a copy of the first source, the chosen
+  dword of the second (`vpshufd` to broadcast lane imm[7:6] within its
+  block, or `vbroadcastss` of the memory dword) moved in under the mask
+  of lane imm[5:4], the lanes imm[3:0] and everything above the xmm
+  zeroed.
+- **`vshuff32x4`, `vshufi32x4`, `vshuff64x2`, `vshufi64x2`**
+  (`shuf_blocks`): `vpermf32x4` by the immediate's low nibble from the
+  first source, then by its high nibble from the second under the high
+  half's mask; a 256-bit form takes one block from each by one bit each.
+- **`vfmaddsub` and `vfmsubadd`, 132, 213 and 231, ps and pd**
+  (`fma_addsub`): the card's fused multiply-add over one copy of the
+  destination and its fused multiply-subtract over another (the opcodes
+  two and four above the addsub line, the same operand roles), merged
+  under the lane parity: addsub subtracts on the even lanes, subadd on
+  the odd; one rounding per lane, as AVX-512.
+- **`vpmovdb`** (`narrow_db`): the dwords masked to a byte, each 128-bit
+  block's four packed into its first dword (the block rotated by one lane
+  and shifted by 8, or'd; by two lanes and 16, or'd), the four first
+  dwords gathered by `vpermd` into lanes 0 to 3; to an xmm with the lanes
+  above zeroed, or to memory through the pack pair. The card's own
+  down-converting store was not used: whether its `sint8` conversion
+  truncates or saturates was not established, and `vpmovdb` truncates. A
+  write mask would be a byte mask, which the card cannot apply: refused.
+- **`vpscatterdd`, and `vpgatherdd`, `vgatherdps`, `vpgatherdq`,
+  `vgatherdpd`, `vscatterdps`, `vpscatterdq`, `vscatterdpd`**
+  (`gather_scatter`): the card has each with the same bytes after the
+  prefix rewrite (its VSIB operand, the disp8 scale, which is the element
+  size on both, and the mask read as the program's), but completes a
+  subset of the mask's elements per issue and clears their bits
+  (327364-001, VPSCATTERDD: "re-executed via a loop until ... the
+  write-mask bits all are zero"), so the sequence is the instruction
+  followed by `jknzd k, rel8` (VEX.NDS.128.W0 75 ib, the mask in vvvv)
+  back to it, which reads no flag and no general register, so nothing is
+  saved around the instruction's own base register. AVX-512 clears the
+  mask at the end as well, and both order writes to one index from the
+  lowest lane up. The planner cannot resolve an address through a vector
+  index, so a region with one runs in demand mode (`plan.rs` gives a
+  vector index `Unknown`).

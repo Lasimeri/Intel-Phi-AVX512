@@ -173,12 +173,16 @@ pub fn supported(m: Mnemonic) -> bool {
         || is_extract_insert(m)
         || is_scalar(m)
         || is_extend(m)
+        || is_comis(m)
+        || is_addsub(m)
+        || is_gather_scatter(m)
     {
         return true;
     }
     matches!(
         m,
-        Vmovups
+        Vinsertps
+            | Vmovups
             | Vmovupd
             | Vmovaps
             | Vmovapd
@@ -247,9 +251,12 @@ pub fn step(insn: &Instruction, st: &mut VState, cpu: &mut dyn Cpu) -> Result<()
     // case cost real time on every execution of every patched site.
     let lanes = match m {
         Vaddps | Vsubps | Vmulps | Vdivps | Vmaxps | Vminps | Vsqrtps | Vfmadd132ps | Vfmadd213ps | Vfmadd231ps | Vfmsub132ps
-        | Vfmsub213ps | Vfmsub231ps | Vxorps | Vandps | Vorps | Vbroadcastss => Some(Lanes::F32),
+        | Vfmsub213ps | Vfmsub231ps | Vxorps | Vandps | Vorps | Vbroadcastss | Vfmaddsub132ps | Vfmaddsub213ps | Vfmaddsub231ps
+        | Vfmsubadd132ps | Vfmsubadd213ps | Vfmsubadd231ps => Some(Lanes::F32),
         Vaddpd | Vsubpd | Vmulpd | Vdivpd | Vmaxpd | Vminpd | Vsqrtpd | Vfmadd132pd | Vfmadd213pd | Vfmadd231pd | Vxorpd | Vandpd
-        | Vorpd | Vbroadcastsd => Some(Lanes::F64),
+        | Vorpd | Vbroadcastsd | Vfmaddsub132pd | Vfmaddsub213pd | Vfmaddsub231pd | Vfmsubadd132pd | Vfmsubadd213pd | Vfmsubadd231pd => {
+            Some(Lanes::F64)
+        }
         Vpaddd | Vpsubd | Vpmulld | Vpandd | Vpord | Vpxord | Vpandnd | Vpbroadcastd => Some(Lanes::I32),
         Vpaddq | Vpsubq | Vpmullq | Vpandq | Vporq | Vpxorq | Vpandnq | Vpbroadcastq => Some(Lanes::I64),
         _ => None,
@@ -326,6 +333,10 @@ pub fn step(insn: &Instruction, st: &mut VState, cpu: &mut dyn Cpu) -> Result<()
                     Vfmsub132ps => cur.mul_add(y, -x),
                     Vfmsub213ps => x.mul_add(cur, -y),
                     Vfmsub231ps => x.mul_add(y, -cur),
+                    // addsub: the odd lanes add, the even subtract; subadd the other way.
+                    Vfmaddsub132ps | Vfmsubadd132ps => cur.mul_add(y, addsub_sign(m, i, x)),
+                    Vfmaddsub213ps | Vfmsubadd213ps => x.mul_add(cur, addsub_sign(m, i, y)),
+                    Vfmaddsub231ps | Vfmsubadd231ps => x.mul_add(y, addsub_sign(m, i, cur)),
                     Vxorps => f32::from_bits(x.to_bits() ^ y.to_bits()),
                     Vandps => f32::from_bits(x.to_bits() & y.to_bits()),
                     Vorps => f32::from_bits(x.to_bits() | y.to_bits()),
@@ -360,6 +371,9 @@ pub fn step(insn: &Instruction, st: &mut VState, cpu: &mut dyn Cpu) -> Result<()
                     Vfmadd132pd => cur.mul_add(y, x),
                     Vfmadd213pd => x.mul_add(cur, y),
                     Vfmadd231pd => x.mul_add(y, cur),
+                    Vfmaddsub132pd | Vfmsubadd132pd => cur.mul_add(y, addsub_sign(m, i, x)),
+                    Vfmaddsub213pd | Vfmsubadd213pd => x.mul_add(cur, addsub_sign(m, i, y)),
+                    Vfmaddsub231pd | Vfmsubadd231pd => x.mul_add(y, addsub_sign(m, i, cur)),
                     Vxorpd => f64::from_bits(x.to_bits() ^ y.to_bits()),
                     Vandpd => f64::from_bits(x.to_bits() & y.to_bits()),
                     Vorpd => f64::from_bits(x.to_bits() | y.to_bits()),
@@ -404,6 +418,162 @@ pub fn step(insn: &Instruction, st: &mut VState, cpu: &mut dyn Cpu) -> Result<()
     for byte in width..64 {
         st.zmm[dst][byte] = 0;
     }
+    Ok(())
+}
+
+/// The fused multiply-add forms that add on half the lanes and subtract
+/// on the other half: vfmaddsub adds on the odd lanes, vfmsubadd on the
+/// even. The addend `v` of lane `i`, with its sign.
+fn addsub_sign<T: std::ops::Neg<Output = T>>(m: Mnemonic, i: usize, v: T) -> T {
+    use Mnemonic::*;
+    let adds_odd = matches!(
+        m,
+        Vfmaddsub132ps | Vfmaddsub213ps | Vfmaddsub231ps | Vfmaddsub132pd | Vfmaddsub213pd | Vfmaddsub231pd
+    );
+    if (i % 2 == 1) == adds_odd {
+        v
+    } else {
+        -v
+    }
+}
+
+fn is_addsub(m: Mnemonic) -> bool {
+    use Mnemonic::*;
+    matches!(
+        m,
+        Vfmaddsub132ps
+            | Vfmaddsub213ps
+            | Vfmaddsub231ps
+            | Vfmaddsub132pd
+            | Vfmaddsub213pd
+            | Vfmaddsub231pd
+            | Vfmsubadd132ps
+            | Vfmsubadd213ps
+            | Vfmsubadd231ps
+            | Vfmsubadd132pd
+            | Vfmsubadd213pd
+            | Vfmsubadd231pd
+    )
+}
+
+fn is_comis(m: Mnemonic) -> bool {
+    use Mnemonic::*;
+    matches!(m, Vcomiss | Vucomiss | Vcomisd | Vucomisd)
+}
+
+/// `vcomiss` and its kin compare lane 0 and write the flags: ZF, PF and
+/// CF all set for unordered, ZF for equal, CF for less, none for greater;
+/// OF, SF and AF cleared. The comi and ucomi forms differ only in which
+/// NaN signals, which this emulator does not model, so they fold together.
+fn do_comis(insn: &Instruction, st: &mut VState, cpu: &mut dyn Cpu) -> Result<(), Unsupported> {
+    use Mnemonic::*;
+    let wide = matches!(insn.mnemonic(), Vcomisd | Vucomisd);
+    let lanes = if wide { Lanes::F64 } else { Lanes::F32 };
+    let a = source_bytes(insn, 0, st, cpu, lanes)?;
+    let b = source_bytes(insn, 1, st, cpu, lanes)?;
+    let (x, y) = if wide {
+        (lane_f64(&a, 0), lane_f64(&b, 0))
+    } else {
+        (f64::from(lane_f32(&a, 0)), f64::from(lane_f32(&b, 0)))
+    };
+    const CF: u64 = 1;
+    const PF: u64 = 1 << 2;
+    const AF: u64 = 1 << 4;
+    const ZF: u64 = 1 << 6;
+    const SF: u64 = 1 << 7;
+    const OF: u64 = 1 << 11;
+    let mut f = cpu.flags() & !(CF | PF | AF | ZF | SF | OF);
+    if x.is_nan() || y.is_nan() {
+        f |= ZF | PF | CF;
+    } else if x == y {
+        f |= ZF;
+    } else if x < y {
+        f |= CF;
+    }
+    cpu.set_flags(f);
+    Ok(())
+}
+
+/// `vinsertps`: the first source with one dword replaced, at lane
+/// imm[5:4], by lane imm[7:6] of the second source (lane 0 of a memory
+/// operand); the lanes named by imm[3:0] zeroed, and everything above the
+/// xmm.
+fn do_insertps(insn: &Instruction, st: &mut VState, cpu: &dyn Cpu) -> Result<(), Unsupported> {
+    let dst = zmm_index(insn.op0_register()).ok_or_else(|| Unsupported("insertps destination".into()))?;
+    let a = source_bytes(insn, 1, st, cpu, Lanes::F32)?;
+    let b = source_bytes(insn, 2, st, cpu, Lanes::F32)?;
+    let imm = insn.immediate8();
+    let from = if insn.op2_kind() == OpKind::Memory {
+        0
+    } else {
+        usize::from((imm >> 6) & 3)
+    };
+    let at = usize::from((imm >> 4) & 3);
+    let mut out = [0u8; 64];
+    out[..16].copy_from_slice(&a[..16]);
+    out[at * 4..at * 4 + 4].copy_from_slice(&b[from * 4..from * 4 + 4]);
+    for j in 0..4 {
+        if imm & (1 << j) != 0 {
+            out[j * 4..j * 4 + 4].fill(0);
+        }
+    }
+    st.zmm[dst] = out;
+    Ok(())
+}
+
+fn is_gather_scatter(m: Mnemonic) -> bool {
+    use Mnemonic::*;
+    matches!(
+        m,
+        Vpgatherdd | Vgatherdps | Vpgatherdq | Vgatherdpd | Vpscatterdd | Vscatterdps | Vpscatterdq | Vscatterdpd
+    )
+}
+
+/// Gathers and scatters with dword indices: every enabled lane's element
+/// at base + index * scale + displacement (the q forms take the low eight
+/// indices), lane by lane from the lowest, and the mask cleared at the
+/// end, as the instructions define (a gather's disabled lanes keep the
+/// destination's value).
+fn do_gather_scatter(insn: &Instruction, st: &mut VState, cpu: &dyn Cpu) -> Result<(), Unsupported> {
+    use Mnemonic::*;
+    let m = insn.mnemonic();
+    let scatter = matches!(m, Vpscatterdd | Vscatterdps | Vpscatterdq | Vscatterdpd);
+    let elem = if matches!(m, Vpgatherdq | Vgatherdpd | Vpscatterdq | Vscatterdpd) {
+        8
+    } else {
+        4
+    };
+    let k = mask_index(insn.op_mask());
+    if k == 0 {
+        return Err(Unsupported("a gather or scatter without a mask".into()));
+    }
+    let idx = zmm_index(insn.memory_index()).ok_or_else(|| Unsupported("the index is not a vector register".into()))?;
+    let vreg = zmm_index(if scatter { insn.op1_register() } else { insn.op0_register() })
+        .ok_or_else(|| Unsupported("gather or scatter vector".into()))?;
+    let base = if insn.memory_base() == Register::None {
+        0
+    } else {
+        cpu.get(insn.memory_base())
+    };
+    let scale = u64::from(insn.memory_index_scale());
+    let disp = insn.memory_displacement64();
+    let indices = st.zmm[idx];
+    for i in 0..(64 / elem) {
+        if !st.lane_enabled(k, i) {
+            continue;
+        }
+        let ix = i64::from(lane_i32(&indices, i)) as u64;
+        let addr = base.wrapping_add(ix.wrapping_mul(scale)).wrapping_add(disp) as *mut u8;
+        // SAFETY: an address the program itself was about to use.
+        unsafe {
+            if scatter {
+                std::ptr::copy_nonoverlapping(st.zmm[vreg][i * elem..].as_ptr(), addr, elem);
+            } else {
+                std::ptr::copy_nonoverlapping(addr, st.zmm[vreg][i * elem..].as_mut_ptr(), elem);
+            }
+        }
+    }
+    st.k[k] = 0;
     Ok(())
 }
 
@@ -677,7 +847,20 @@ fn is_compare(m: Mnemonic) -> bool {
     use Mnemonic::*;
     matches!(
         m,
-        Vcmpps | Vcmppd | Vpcmpd | Vpcmpud | Vpcmpq | Vpcmpuq | Vpcmpeqd | Vpcmpgtd | Vpcmpeqq | Vpcmpgtq | Vptestmd
+        Vcmpps
+            | Vcmppd
+            | Vpcmpd
+            | Vpcmpud
+            | Vpcmpq
+            | Vpcmpuq
+            | Vpcmpeqd
+            | Vpcmpgtd
+            | Vpcmpeqq
+            | Vpcmpgtq
+            | Vptestmd
+            | Vptestnmd
+            | Vptestmq
+            | Vptestnmq
     )
 }
 
@@ -686,7 +869,7 @@ fn is_compare(m: Mnemonic) -> bool {
 fn do_compare(insn: &Instruction, st: &mut VState, cpu: &mut dyn Cpu) -> Result<(), Unsupported> {
     use Mnemonic::*;
     let m = insn.mnemonic();
-    let f64_lanes = matches!(m, Vcmppd | Vpcmpq | Vpcmpuq | Vpcmpeqq | Vpcmpgtq);
+    let f64_lanes = matches!(m, Vcmppd | Vpcmpq | Vpcmpuq | Vpcmpeqq | Vpcmpgtq | Vptestmq | Vptestnmq);
     let lanes = if f64_lanes { Lanes::F64 } else { Lanes::F32 };
 
     let dst = insn.op0_register();
@@ -716,8 +899,17 @@ fn do_compare(insn: &Instruction, st: &mut VState, cpu: &mut dyn Cpu) -> Result<
             Vpcmpeqd => lane_i32(&a, i) == lane_i32(&b, i),
             Vpcmpgtd => lane_i32(&a, i) > lane_i32(&b, i),
             Vptestmd => lane_i32(&a, i) & lane_i32(&b, i) != 0,
+            Vptestnmd => lane_i32(&a, i) & lane_i32(&b, i) == 0,
             Vpcmpd => int_predicate(imm, i64::from(lane_i32(&a, i)), i64::from(lane_i32(&b, i))),
             Vpcmpud => int_predicate(imm, i64::from(lane_i32(&a, i) as u32), i64::from(lane_i32(&b, i) as u32)),
+            // The qword forms: the lanes as i64, or as u64 for the unsigned
+            // compare, whose predicates are the same six on the wider order.
+            Vpcmpeqq => lane_i64(&a, i) == lane_i64(&b, i),
+            Vpcmpgtq => lane_i64(&a, i) > lane_i64(&b, i),
+            Vpcmpq => int_predicate(imm, lane_i64(&a, i), lane_i64(&b, i)),
+            Vpcmpuq => uint_predicate(imm, lane_i64(&a, i) as u64, lane_i64(&b, i) as u64),
+            Vptestmq => lane_i64(&a, i) & lane_i64(&b, i) != 0,
+            Vptestnmq => lane_i64(&a, i) & lane_i64(&b, i) == 0,
             _ => return Err(Unsupported(format!("{m:?} compare"))),
         };
         if bit {
@@ -726,6 +918,24 @@ fn do_compare(insn: &Instruction, st: &mut VState, cpu: &mut dyn Cpu) -> Result<
     }
     st.k[dst] = out;
     Ok(())
+}
+
+fn lane_i64(b: &[u8; 64], i: usize) -> i64 {
+    i64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap())
+}
+
+/// The eight predicates on unsigned 64-bit lanes (`vpcmpuq`).
+fn uint_predicate(imm: u8, a: u64, b: u64) -> bool {
+    match imm & 7 {
+        0 => a == b,
+        1 => a < b,
+        2 => a <= b,
+        3 => false,
+        4 => a != b,
+        5 => a >= b,
+        6 => a > b,
+        _ => true,
+    }
 }
 
 /// The eight integer compare predicates of `vpcmpd` and friends.
@@ -1113,7 +1323,7 @@ fn is_misc_int(m: Mnemonic) -> bool {
     use Mnemonic::*;
     matches!(
         m,
-        Vpmuldq | Vpmuludq | Vpmaxsd | Vpminsd | Vpmaxud | Vpminud | Vpabsd | Vpmaxsq | Vpminsq
+        Vpmuldq | Vpmuludq | Vpmaxsd | Vpminsd | Vpmaxud | Vpminud | Vpabsd | Vpmaxsq | Vpminsq | Vpmaxuq | Vpminuq
     )
 }
 
@@ -1155,7 +1365,7 @@ fn do_misc_int(insn: &Instruction, st: &mut VState, cpu: &dyn Cpu) -> Result<(),
         return Ok(());
     }
 
-    let wide = matches!(m, Vpmaxsq | Vpminsq);
+    let wide = matches!(m, Vpmaxsq | Vpminsq | Vpmaxuq | Vpminuq);
     let lanes = if wide { Lanes::I64 } else { Lanes::I32 };
     let a = source_bytes(insn, 1, st, cpu, lanes)?;
     let b = if m == Vpabsd { a } else { source_bytes(insn, 2, st, cpu, lanes)? };
@@ -1170,7 +1380,12 @@ fn do_misc_int(insn: &Instruction, st: &mut VState, cpu: &dyn Cpu) -> Result<(),
         if wide {
             let x = i64::from_le_bytes(a[i * 8..i * 8 + 8].try_into().unwrap());
             let y = i64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
-            let v = if m == Vpmaxsq { x.max(y) } else { x.min(y) };
+            let v = match m {
+                Vpmaxsq => x.max(y),
+                Vpminsq => x.min(y),
+                Vpmaxuq => (x as u64).max(y as u64) as i64,
+                _ => (x as u64).min(y as u64) as i64,
+            };
             st.zmm[dst][i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
         } else {
             let (x, y) = (lane_i32(&a, i), lane_i32(&b, i));
@@ -1621,9 +1836,19 @@ fn is_extend(m: Mnemonic) -> bool {
 fn do_extend(insn: &Instruction, st: &mut VState, cpu: &dyn Cpu) -> Result<(), Unsupported> {
     let m = insn.mnemonic();
     let (sw, dw, signed) = extend_shape(m).ok_or_else(|| Unsupported(format!("{m:?} extend")))?;
-    let dst = zmm_index(insn.op0_register()).ok_or_else(|| Unsupported("extend destination".into()))?;
     let k = mask_index(insn.op_mask());
     let zeroing = insn.zeroing_masking();
+    // A narrowing form may store to memory (`vpmovdb [m128], zmm`): the
+    // enabled elements only, each at its own offset, nothing else written.
+    let to_memory = insn.op0_kind() == OpKind::Memory;
+    if to_memory && dw > sw {
+        return Err(Unsupported("a widening form with a memory destination".into()));
+    }
+    let dst = if to_memory {
+        0
+    } else {
+        zmm_index(insn.op0_register()).ok_or_else(|| Unsupported("extend destination".into()))?
+    };
 
     // The source may be a narrower register or memory holding only the
     // bytes the operation reads.
@@ -1661,6 +1886,16 @@ fn do_extend(insn: &Instruction, st: &mut VState, cpu: &dyn Cpu) -> Result<(), U
         out[i * dw..i * dw + dw].copy_from_slice(&le[..dw]);
     }
 
+    if to_memory {
+        let addr = effective_address(insn, cpu) as *mut u8;
+        for i in 0..n {
+            if st.lane_enabled(k, i) {
+                // SAFETY: an address the program itself was about to write.
+                unsafe { std::ptr::copy_nonoverlapping(out[i * dw..].as_ptr(), addr.add(i * dw), dw) };
+            }
+        }
+        return Ok(());
+    }
     let written = if widening { 64 } else { n * dw };
     for i in 0..n {
         if st.lane_enabled(k, i) {
@@ -1723,6 +1958,15 @@ fn step_uncommon(insn: &Instruction, st: &mut VState, cpu: &mut dyn Cpu) -> Resu
     }
     if matches!(m, Vpternlogd | Vpternlogq) {
         return do_ternlog(insn, st, cpu);
+    }
+    if is_comis(m) {
+        return do_comis(insn, st, cpu);
+    }
+    if m == Vinsertps {
+        return do_insertps(insn, st, cpu);
+    }
+    if is_gather_scatter(m) {
+        return do_gather_scatter(insn, st, cpu);
     }
 
     // Moves are their own shape: one of the two operands is memory, and

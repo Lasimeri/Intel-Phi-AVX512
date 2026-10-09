@@ -267,6 +267,10 @@ struct Em<'a> {
     flags_used: bool,
     /// General registers loaded from the scratch area after the restores.
     tail: Vec<(u8, bool, i32)>,
+    /// A flags byte (AH's layout) the sequence produces, at this scratch
+    /// offset: written with `sahf` after every restore, OF cleared
+    /// (`comis`).
+    flags_out: Option<i32>,
 }
 
 impl<'a> Em<'a> {
@@ -298,6 +302,7 @@ impl<'a> Em<'a> {
             rcx_used: false,
             flags_used: false,
             tail: Vec::new(),
+            flags_out: None,
         }
     }
 
@@ -643,6 +648,19 @@ impl<'a> Em<'a> {
         for (r, wide, off) in tail {
             self.gpr_scratch(r, wide, off, false);
         }
+        if let Some(off) = self.flags_out {
+            // The flags the instruction defines, last of all: a test clears
+            // OF (sahf does not reach it), the byte goes through AH, which
+            // is restored from the saved rax after; a mov changes no flag.
+            let at = self.fs(off).to_le_bytes();
+            let ah = self.fs(S_RAX + 1).to_le_bytes();
+            self.t.seq.extend_from_slice(&[0x85, 0xc0]); // test eax, eax
+            self.t.seq.extend_from_slice(&[0x64, 0x8a, 0x24, 0x25]); // mov ah, [fs:off]
+            self.t.seq.extend_from_slice(&at);
+            self.t.seq.push(0x9e); // sahf
+            self.t.seq.extend_from_slice(&[0x64, 0x8a, 0x24, 0x25]); // mov ah, [fs:S_RAX + 1]
+            self.t.seq.extend_from_slice(&ah);
+        }
         self.t
     }
 }
@@ -809,6 +827,33 @@ fn special(insn: &Instruction, bytes: &[u8], ev: &Ev, tg: &Target) -> Result<Opt
         M::Vpmovzxbd | M::Vpmovsxbd | M::Vpmovzxwd | M::Vpmovsxwd => widen(insn, ev, tg)?,
         M::Vpmovzxdq | M::Vpmovsxdq => widen_dq(insn, ev, tg)?,
         M::Vpaddq | M::Vpsubq => add_sub_q(insn, ev, tg)?,
+        M::Vcomiss | M::Vucomiss | M::Vcomisd | M::Vucomisd => comis(insn, ev, tg)?,
+        M::Vpcmpq | M::Vpcmpuq | M::Vpcmpeqq | M::Vpcmpgtq => cmp_q(insn, ev, tg)?,
+        M::Vpmaxsq | M::Vpminsq | M::Vpmaxuq | M::Vpminuq => minmax_q(insn, ev, tg)?,
+        M::Vptestmq | M::Vptestnmq | M::Vptestnmd => testm(insn, ev, tg)?,
+        M::Vinsertps => insertps(insn, ev, tg)?,
+        M::Vshuff32x4 | M::Vshufi32x4 | M::Vshuff64x2 | M::Vshufi64x2 => shuf_blocks(insn, ev, tg)?,
+        M::Vfmaddsub132ps
+        | M::Vfmaddsub213ps
+        | M::Vfmaddsub231ps
+        | M::Vfmaddsub132pd
+        | M::Vfmaddsub213pd
+        | M::Vfmaddsub231pd
+        | M::Vfmsubadd132ps
+        | M::Vfmsubadd213ps
+        | M::Vfmsubadd231ps
+        | M::Vfmsubadd132pd
+        | M::Vfmsubadd213pd
+        | M::Vfmsubadd231pd => fma_addsub(insn, ev, tg)?,
+        M::Vpmovdb => narrow_db(insn, ev, tg)?,
+        M::Vpgatherdd
+        | M::Vgatherdps
+        | M::Vpgatherdq
+        | M::Vgatherdpd
+        | M::Vpscatterdd
+        | M::Vscatterdps
+        | M::Vpscatterdq
+        | M::Vscatterdpd => gather_scatter(insn, bytes, ev, tg)?,
         M::Vpsrlq | M::Vpsllq | M::Vpsraq if insn.op_kind(insn.op_count() - 1) == OpKind::Immediate8 => shift_q(insn, ev, tg)?,
         M::Vpabsd => abs_d(insn, ev, tg)?,
         M::Vpmuludq => muludq(insn, ev, tg)?,
@@ -1654,6 +1699,369 @@ fn add_sub_q(insn: &Instruction, ev: &Ev, tg: &Target) -> Result<Rewrite, Unsupp
     Ok(Rewrite::Thunk(em.finish()))
 }
 
+/// vcomiss / vucomiss / vcomisd / vucomisd: lane 0 compared and the flags
+/// written as the instruction defines them: ZF, PF and CF all set when
+/// unordered, ZF for equal, CF for less, none for greater; OF, SF and AF
+/// cleared. The card compares into a mask (`vcmpps` with the lt, eq and
+/// unordered predicates; a memory operand as a one-element broadcast),
+/// the flags byte is assembled in ecx and kept in the scratch area, and
+/// the emitter writes it with `sahf` after every restore (`flags_out`).
+/// The comi and ucomi forms differ in which NaN signals, which the card
+/// does not trap, so their results are the same bits.
+fn comis(insn: &Instruction, ev: &Ev, tg: &Target) -> Result<Rewrite, Unsupported> {
+    let mut em = Em::new(tg, insn);
+    let w = ev.w;
+    let s1 = ev.reg;
+    let (rm, sss) = match MemOp::of(insn) {
+        Some(m) => (Rm::Mem(m), 1u8),
+        None => (Rm::Reg(ev.rm), 0),
+    };
+    em.rax();
+    em.rcx();
+    let ks = em.k();
+    // CF: less than
+    em.vcmp(ks, s1, rm, 1, 0, w, sss);
+    em.kmov_r_k(0, ks);
+    em.t.seq.extend_from_slice(&[0x83, 0xe0, 0x01, 0x89, 0xc1]); // and eax, 1; mov ecx, eax
+                                                                 // ZF: equal
+    em.vcmp(ks, s1, rm, 0, 0, w, sss);
+    em.kmov_r_k(0, ks);
+    em.t.seq.extend_from_slice(&[0x83, 0xe0, 0x01, 0xc1, 0xe0, 0x06, 0x09, 0xc1]); // and eax, 1; shl eax, 6; or ecx, eax
+                                                                                   // ZF, PF and CF: unordered
+    em.vcmp(ks, s1, rm, 3, 0, w, sss);
+    em.kmov_r_k(0, ks);
+    em.t.seq
+        .extend_from_slice(&[0x83, 0xe0, 0x01, 0xf7, 0xd8, 0x83, 0xe0, 0x45, 0x09, 0xc1]); // and eax, 1; neg eax; and eax, 0x45; or ecx, eax
+    em.gpr_scratch(1, false, S_XFER, true);
+    em.flags_out = Some(S_XFER);
+    Ok(Rewrite::Thunk(em.finish()))
+}
+
+/// Each qword lane's `lt` and `eq` from the card's dword compares, for the
+/// qword forms: into eax the `lt` of qword j at bit 2j (the odd bits are
+/// not meaningful), at `[fs:S_XFER]` its `eq` the same way. The high
+/// dwords compare as the instruction says (signed or unsigned), the low
+/// dwords always unsigned: a < b when hi(a) < hi(b), or hi(a) = hi(b) and
+/// lo(a) <u lo(b). Takes the scratch mask, rax, rcx and the flags.
+fn qword_lt_eq(em: &mut Em, a: u8, b: u8, signed: bool) {
+    let ks = em.k();
+    em.flags();
+    em.rcx();
+    em.mvex(1, 1, 0, 0x76, ks, a, Rm::Reg(b), 0, 0, None); // vpcmpeqd ks, a, b
+    em.kmov_r_k(0, ks);
+    em.t.seq.extend_from_slice(&[0x89, 0xc1, 0xd1, 0xe9, 0x21, 0xc1]); // mov ecx, eax; shr ecx, 1; and ecx, eax
+    em.gpr_scratch(1, false, S_XFER, true); // eq of both halves, on the even bits
+    em.t.seq.extend_from_slice(&[0xd1, 0xe8]); // shr eax, 1: the high halves' eq on the even bits
+    em.mvex(3, 1, 0, 0x1E, ks, a, Rm::Reg(b), 0, 0, Some(1)); // vpcmpud ks, a, b, lt
+    em.kmov_r_k(1, ks);
+    em.t.seq.extend_from_slice(&[0x21, 0xc8]); // and eax, ecx: high eq and low lt
+    em.gpr_scratch(0, false, S_XFER + 8, true);
+    if signed {
+        em.mvex(3, 1, 0, 0x1F, ks, a, Rm::Reg(b), 0, 0, Some(1)); // vpcmpd ks, a, b, lt
+        em.kmov_r_k(0, ks);
+    } else {
+        em.t.seq.extend_from_slice(&[0x89, 0xc8]); // mov eax, ecx
+    }
+    em.t.seq.extend_from_slice(&[0xd1, 0xe8]); // shr eax, 1: the high halves' lt
+    em.fs_op(&[0x0b], 0, S_XFER + 8); // or eax, [fs:S_XFER + 8]
+}
+
+/// eax: its even bits (bit 2j) packed down to bit j, the rest zero. Uses ecx.
+fn pack_even(em: &mut Em) {
+    em.t.seq.extend_from_slice(&[0x25, 0x55, 0x55, 0x00, 0x00]); // and eax, 0x5555
+                                                                 // x = (x | x >> 1) & 0x3333; (x | x >> 2) & 0x0f0f; (x | x >> 4) & 0x00ff
+    em.t.seq
+        .extend_from_slice(&[0x89, 0xc1, 0xd1, 0xe9, 0x09, 0xc8, 0x25, 0x33, 0x33, 0x00, 0x00]);
+    em.t.seq
+        .extend_from_slice(&[0x89, 0xc1, 0xc1, 0xe9, 0x02, 0x09, 0xc8, 0x25, 0x0f, 0x0f, 0x00, 0x00]);
+    em.t.seq
+        .extend_from_slice(&[0x89, 0xc1, 0xc1, 0xe9, 0x04, 0x09, 0xc8, 0x25, 0xff, 0x00, 0x00, 0x00]);
+}
+
+/// eax: each even bit copied to the odd bit above it (a qword lane's bit
+/// on both its dword lanes), the rest zero. Uses ecx.
+fn spread_even(em: &mut Em) {
+    em.t.seq.extend_from_slice(&[0x25, 0x55, 0x55, 0x00, 0x00]); // and eax, 0x5555
+    em.t.seq.extend_from_slice(&[0x89, 0xc1, 0xd1, 0xe1, 0x09, 0xc8]); // mov ecx, eax; shl ecx, 1; or eax, ecx
+}
+
+/// `and eax, imm32`.
+fn and_eax(em: &mut Em, imm: u32) {
+    em.t.seq.push(0x25);
+    em.t.seq.extend_from_slice(&imm.to_le_bytes());
+}
+
+/// vpcmpq, vpcmpuq, vpcmpeqq, vpcmpgtq: qword compares into a mask, on a
+/// card whose compares are dword. `qword_lt_eq` gives each qword's lt and
+/// eq; the predicates come from those two (le: lt or eq; neq, nlt, nle
+/// their complements; FALSE and TRUE constants), the bits are packed to
+/// one per qword, cut to the vector length and to the write mask, which
+/// zeroes a compare's result as AVX-512 defines.
+fn cmp_q(insn: &Instruction, ev: &Ev, tg: &Target) -> Result<Rewrite, Unsupported> {
+    use Mnemonic as M;
+    let mut em = Em::new(tg, insn);
+    let kd = ev.reg & 7;
+    let m = insn.mnemonic();
+    let signed = matches!(m, M::Vpcmpq | M::Vpcmpeqq | M::Vpcmpgtq);
+    let pred = match m {
+        M::Vpcmpeqq => 0,
+        M::Vpcmpgtq => 6,
+        _ => insn.immediate8() & 7,
+    };
+    let lanes = vl_lanes(ev.ll, 1);
+    if pred == 3 {
+        em.mov_eax(0);
+        em.kmov_k_r(kd, 0);
+        return Ok(Rewrite::Thunk(em.finish()));
+    }
+    let s1 = ev.vvvv;
+    let s2 = src2(&mut em, insn, ev, lanes)?;
+    if pred == 7 {
+        em.flags();
+        em.rcx();
+        em.mov_eax(u32::from(lanes));
+    } else {
+        qword_lt_eq(&mut em, s1, s2, signed);
+        match pred {
+            0 => em.gpr_scratch(0, false, S_XFER, false), // mov eax, [eq]
+            1 => {}
+            2 => em.fs_op(&[0x0b], 0, S_XFER), // or eax, [eq]
+            4 => {
+                em.gpr_scratch(0, false, S_XFER, false);
+                em.t.seq.extend_from_slice(&[0xf7, 0xd0]); // not eax
+            }
+            5 => em.t.seq.extend_from_slice(&[0xf7, 0xd0]),
+            _ => {
+                em.fs_op(&[0x0b], 0, S_XFER);
+                em.t.seq.extend_from_slice(&[0xf7, 0xd0]);
+            }
+        }
+        pack_even(&mut em);
+        and_eax(&mut em, u32::from(lanes));
+    }
+    if ev.aaa != 0 {
+        em.kmov_r_k(1, ev.aaa);
+        em.t.seq.extend_from_slice(&[0x21, 0xc8]); // and eax, ecx
+    }
+    em.kmov_k_r(kd, 0);
+    Ok(Rewrite::Thunk(em.finish()))
+}
+
+/// vpmaxsq, vpminsq, vpmaxuq, vpminuq: the second source, then the first
+/// where it wins (`qword_lt_eq` with its operands in the order that makes
+/// lt the first source winning), each qword's bit spread over its two
+/// dword lanes for the masked move.
+fn minmax_q(insn: &Instruction, ev: &Ev, tg: &Target) -> Result<Rewrite, Unsupported> {
+    use Mnemonic as M;
+    let mut em = Em::new(tg, insn);
+    let m = insn.mnemonic();
+    let (d, s1) = (ev.reg, ev.vvvv);
+    let is_max = matches!(m, M::Vpmaxsq | M::Vpmaxuq);
+    let signed = matches!(m, M::Vpmaxsq | M::Vpminsq);
+    let s2 = src2(&mut em, insn, ev, vl_lanes(ev.ll, 1))?;
+    let r = em.temp().map_err(|e| refuse(insn, e))?;
+    if is_max {
+        qword_lt_eq(&mut em, s2, s1, signed);
+    } else {
+        qword_lt_eq(&mut em, s1, s2, signed);
+    }
+    spread_even(&mut em);
+    let ks = em.k();
+    em.kmov_k_r(ks, 0);
+    em.vmov(r, Rm::Reg(s2), 0, 1);
+    em.vmov(r, Rm::Reg(s1), ks, 0);
+    commit(&mut em, d, r, &Ev { w: 1, ..*ev });
+    Ok(Rewrite::Thunk(em.finish()))
+}
+
+/// vptestmq, vptestnmq and vptestnmd: the card's vptestmd on the dword
+/// lanes; a qword is nonzero when either of its dwords is (the two bits
+/// or'd, then packed to one per qword), the nm forms are the complement,
+/// cut to the vector length and the write mask.
+fn testm(insn: &Instruction, ev: &Ev, tg: &Target) -> Result<Rewrite, Unsupported> {
+    use Mnemonic as M;
+    let mut em = Em::new(tg, insn);
+    let kd = ev.reg & 7;
+    let m = insn.mnemonic();
+    let negate = matches!(m, M::Vptestnmq | M::Vptestnmd);
+    let qword = matches!(m, M::Vptestmq | M::Vptestnmq);
+    let s1 = ev.vvvv;
+    let lanes = vl_lanes(ev.ll, ev.w);
+    let s2 = src2(&mut em, insn, ev, lanes)?;
+    let ks = em.k();
+    em.flags();
+    em.rcx();
+    em.mvex(2, 1, 0, 0x27, ks, s1, Rm::Reg(s2), 0, 0, None); // vptestmd ks, s1, s2
+    em.kmov_r_k(0, ks);
+    if qword {
+        em.t.seq.extend_from_slice(&[0x89, 0xc1, 0xd1, 0xe9, 0x09, 0xc8]); // mov ecx, eax; shr ecx, 1; or eax, ecx
+        if negate {
+            em.t.seq.extend_from_slice(&[0xf7, 0xd0]); // not eax
+        }
+        pack_even(&mut em);
+    } else if negate {
+        em.t.seq.extend_from_slice(&[0xf7, 0xd0]);
+    }
+    and_eax(&mut em, u32::from(lanes));
+    if ev.aaa != 0 {
+        em.kmov_r_k(1, ev.aaa);
+        em.t.seq.extend_from_slice(&[0x21, 0xc8]); // and eax, ecx
+    }
+    em.kmov_k_r(kd, 0);
+    Ok(Rewrite::Thunk(em.finish()))
+}
+
+/// vinsertps: the first source with one dword replaced, at lane imm[5:4],
+/// by lane imm[7:6] of the second source (its dword broadcast within the
+/// block with `vpshufd`) or by the one dword of a memory operand
+/// (`vbroadcastss` under the lane's mask); the lanes imm[3:0] zeroed, and
+/// the lanes above the xmm.
+fn insertps(insn: &Instruction, ev: &Ev, tg: &Target) -> Result<Rewrite, Unsupported> {
+    let mut em = Em::new(tg, insn);
+    let (d, s1) = (ev.reg, ev.vvvv);
+    let imm = insn.immediate8();
+    let r = em.temp().map_err(|e| refuse(insn, e))?;
+    em.vmov(r, Rm::Reg(s1), 0, 0);
+    let k = em.mask_imm(1 << ((imm >> 4) & 3));
+    match MemOp::of(insn) {
+        Some(m) => em.broadcast(r, Rm::Mem(m), k, 0),
+        None => {
+            let t = em.temp().map_err(|e| refuse(insn, e))?;
+            em.vpshufd(t, Rm::Reg(ev.rm), ((imm >> 6) & 3) * 0x55, 0);
+            em.vmov(r, Rm::Reg(t), k, 0);
+        }
+    }
+    em.zero_lanes(r, u16::from(imm & 0xf) | 0xfff0);
+    commit(&mut em, d, r, &Ev { ll: 0, w: 0, ..*ev });
+    Ok(Rewrite::Thunk(em.finish()))
+}
+
+/// vshuff32x4, vshufi32x4, vshuff64x2, vshufi64x2: the destination's low
+/// two 128-bit blocks from the first source and its high two from the
+/// second, each chosen by two bits of the immediate: two `vpermf32x4`,
+/// the second under the high half's mask. The 256-bit form takes one
+/// block from each source, chosen by one bit each.
+fn shuf_blocks(insn: &Instruction, ev: &Ev, tg: &Target) -> Result<Rewrite, Unsupported> {
+    let mut em = Em::new(tg, insn);
+    let (d, s1) = (ev.reg, ev.vvvv);
+    let imm = insn.immediate8();
+    let s2 = src2(&mut em, insn, ev, vl_lanes(ev.ll, 0))?;
+    let r = em.temp().map_err(|e| refuse(insn, e))?;
+    match ev.ll {
+        2 => {
+            em.vpermf32x4(r, Rm::Reg(s1), imm & 0x0f, 0);
+            let k = em.mask_imm(0xff00);
+            em.vpermf32x4(r, Rm::Reg(s2), imm & 0xf0, k);
+        }
+        1 => {
+            em.vpermf32x4(r, Rm::Reg(s1), imm & 1, 0);
+            let k = em.mask_imm(0x00f0);
+            em.vpermf32x4(r, Rm::Reg(s2), ((imm >> 1) & 1) << 2, k);
+        }
+        _ => return Err(refuse(insn, "a 128-bit block shuffle: no such form")),
+    }
+    commit(&mut em, d, r, ev);
+    Ok(Rewrite::Thunk(em.finish()))
+}
+
+/// vfmaddsub132/213/231ps/pd and vfmsubadd: the card's fused
+/// multiply-add over one copy of the destination and its fused
+/// multiply-subtract over another (the same operand roles, two opcodes
+/// up and four up from the addsub line), merged under the lane parity
+/// (addsub subtracts on the even lanes, subadd on the odd).
+fn fma_addsub(insn: &Instruction, ev: &Ev, tg: &Target) -> Result<Rewrite, Unsupported> {
+    let mut em = Em::new(tg, insn);
+    let (d, s1, w) = (ev.reg, ev.vvvv, ev.w);
+    let s2 = src2(&mut em, insn, ev, vl_lanes(ev.ll, w))?;
+    let base = ev.op & 0xfe; // 96, A6, B6
+    let subadd = ev.op & 1 == 1;
+    let r = em.temp().map_err(|e| refuse(insn, e))?;
+    let t = em.temp().map_err(|e| refuse(insn, e))?;
+    em.vmov(r, Rm::Reg(d), 0, w);
+    em.vmov(t, Rm::Reg(d), 0, w);
+    em.fma(base + 2, r, s1, Rm::Reg(s2), w); // vfmadd (98, A8, B8)
+    em.fma(base + 4, t, s1, Rm::Reg(s2), w); // vfmsub (9A, AA, BA)
+    let sub_lanes: u16 = match (subadd, w) {
+        (false, 0) => 0x5555,
+        (true, 0) => 0xaaaa,
+        (false, _) => 0x3333,
+        (true, _) => 0xcccc,
+    };
+    let k = em.mask_imm(sub_lanes);
+    em.vmov(r, Rm::Reg(t), k, 0);
+    commit(&mut em, d, r, ev);
+    Ok(Rewrite::Thunk(em.finish()))
+}
+
+/// vpmovdb: every dword's low byte, packed in lane order. The dwords are
+/// masked to a byte, each 128-bit block's four are packed into its first
+/// dword (the block rotated by one lane and shifted by 8, or'd; by two
+/// lanes and 16, or'd), and the four first dwords are gathered by
+/// `vpermd` into lanes 0 to 3: to an xmm with the lanes above zeroed, or
+/// to memory through the pack pair. A write mask would be a byte mask,
+/// which the card cannot apply: refused.
+fn narrow_db(insn: &Instruction, ev: &Ev, tg: &Target) -> Result<Rewrite, Unsupported> {
+    let mut em = Em::new(tg, insn);
+    if ev.aaa != 0 {
+        return Err(refuse(insn, "a masked byte narrowing: the card masks dword lanes only"));
+    }
+    let s = ev.reg;
+    let r = em.temp().map_err(|e| refuse(insn, e))?;
+    let t = em.temp().map_err(|e| refuse(insn, e))?;
+    let ff = em.const_dw(0xff);
+    em.i0f(0xDB, r, s, Rm::Const(ff), 0, 0);
+    em.vpshufd(t, Rm::Reg(r), 0x39, 0); // lane i from lane i + 1
+    em.shift_imm(6, t, Rm::Reg(t), 8, 0);
+    em.i0f(0xEB, r, r, Rm::Reg(t), 0, 0);
+    em.vpshufd(t, Rm::Reg(r), 0x4e, 0); // lane i from lane i + 2
+    em.shift_imm(6, t, Rm::Reg(t), 16, 0);
+    em.i0f(0xEB, r, r, Rm::Reg(t), 0, 0);
+    let idx = em.const_dws([0, 4, 8, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    em.vmov(t, Rm::Const(idx), 0, 0);
+    em.vpermd(r, t, Rm::Reg(r), 0);
+    let ndw = vl_lanes(ev.ll, 0).count_ones() / 4; // dwords of bytes: 4, 2 or 1
+    let span: u16 = ((1u32 << ndw) - 1) as u16;
+    let k = em.mask_imm(span);
+    match MemOp::of(insn) {
+        Some(m) => em.store_unaligned(m, r, k, 0, false, 0),
+        None => {
+            let d = ev.rm;
+            em.vmov(d, Rm::Reg(r), k, 0);
+            em.zero_lanes(d, !span);
+        }
+    }
+    Ok(Rewrite::Thunk(em.finish()))
+}
+
+/// vpgatherdd, vgatherdps, vpgatherdq, vgatherdpd, vpscatterdd,
+/// vscatterdps, vpscatterdq, vscatterdpd: the card has each with the same
+/// bytes after the prefix rewrite (the VSIB operand, the disp8 scale and
+/// the mask read as the program's), but completes a subset of the mask's
+/// elements per issue, clearing their bits (327364-001, VPSCATTERDD:
+/// "re-executed via a loop until ... the write-mask bits all are zero"),
+/// so the sequence repeats it while the mask is not zero with `jknzd`
+/// (VEX.NDS.128.W0 75 ib, the mask in vvvv), which reads no flag and no
+/// general register. AVX-512 clears the mask at the end as well, and both
+/// order writes to one index from the lowest lane up.
+fn gather_scatter(insn: &Instruction, bytes: &[u8], ev: &Ev, tg: &Target) -> Result<Rewrite, Unsupported> {
+    if ev.aaa == 0 {
+        return Err(refuse(insn, "a gather or scatter without a mask"));
+    }
+    if ev.ll != 2 {
+        return Err(refuse(insn, "a narrow gather or scatter: not expressed yet"));
+    }
+    let mut em = Em::new(tg, insn);
+    let mut v = bytes[..insn.len()].to_vec();
+    v[2] = bytes[2] & !0x04;
+    v[3] = bytes[3] & 0x0f;
+    let at = em.t.seq.len();
+    em.t.seq.extend_from_slice(&v);
+    let rel = at as i64 - (em.t.seq.len() as i64 + 4);
+    em.t.seq
+        .extend_from_slice(&[0xc5, 0x80 | ((!ev.aaa & 0xf) << 3), 0x75, rel as i8 as u8]);
+    Ok(Rewrite::Thunk(em.finish()))
+}
+
 /// vpsrlq / vpsllq / vpsraq by immediate on dword lanes: the two halves
 /// of each qword shifted and combined.
 fn shift_q(insn: &Instruction, ev: &Ev, tg: &Target) -> Result<Rewrite, Unsupported> {
@@ -2214,6 +2622,65 @@ mod tests {
     }
 
     #[test]
+    fn a_qword_compare_packs_one_bit_per_qword_into_the_mask() {
+        // vpcmpq $1, %zmm2, %zmm1, %k1 (lt)
+        let t = thunk(&[0x62, 0xf3, 0xf5, 0x48, 0x1f, 0xca, 0x01]);
+        // the signed compare of the high halves: vpcmpd k7, zmm1, zmm2, 1
+        assert!(
+            t.seq.windows(7).any(|w| w == [0x62, 0xf3, 0x71, 0x08, 0x1f, 0xfa, 0x01]),
+            "{:02x?}",
+            t.seq
+        );
+        // the last packing step, and eax, 0xff; then the length cut; then kmov k1, eax
+        let pack = t.seq.windows(5).position(|w| w == [0x25, 0xff, 0x00, 0x00, 0x00]).expect("pack");
+        let k = t.seq.windows(4).position(|w| w == [0xc5, 0xf8, 0x92, 0xc8]).expect("kmov k1, eax");
+        assert!(k > pack);
+    }
+
+    #[test]
+    fn a_scalar_compare_writes_the_flags_after_every_restore() {
+        // vcomiss %xmm2, %xmm1 (EVEX)
+        let t = thunk(&[0x62, 0xf1, 0x7c, 0x08, 0x2f, 0xca]);
+        let n = t.seq.len();
+        // ... test eax, eax; mov ah, [fs:S_XFER]; sahf; mov ah, [fs:S_RAX + 1]
+        assert_eq!(&t.seq[n - 8..n - 4], &[0x64, 0x8a, 0x24, 0x25]);
+        assert_eq!(&t.seq[n - 4..], &(TG.scratch + S_RAX + 1).to_le_bytes());
+        assert_eq!(t.seq[n - 9], 0x9e, "sahf");
+        assert_eq!(&t.seq[n - 19..n - 17], &[0x85, 0xc0], "test eax, eax clears OF first");
+        // three compares: lt (1), eq (0), unordered (3) into k7
+        for pred in [1u8, 0, 3] {
+            assert!(
+                t.seq.windows(7).any(|w| w == [0x62, 0xf1, 0x70, 0x08, 0xc2, 0xfa, pred]),
+                "pred {pred}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_scatter_repeats_until_its_mask_clears() {
+        // vpscatterdd %zmm1, (%rdi,%zmm2,4){%k1}
+        let b = [0x62, 0xf2, 0x7d, 0x49, 0xa0, 0x0c, 0x97];
+        let t = thunk(&b);
+        assert_eq!(
+            &t.seq[..7],
+            &[0x62, 0xf2, 0x79, 0x09, 0xa0, 0x0c, 0x97],
+            "the MVEX form, VSIB and mask kept"
+        );
+        assert_eq!(&t.seq[7..], &[0xc5, 0xf0, 0x75, 0xf5], "jknzd k1, back to the scatter");
+    }
+
+    #[test]
+    fn an_addsub_fma_is_both_fmas_merged_by_lane_parity() {
+        // vfmaddsub132ps %zmm2, %zmm1, %zmm0
+        let t = thunk(&[0x62, 0xf2, 0x75, 0x48, 0x96, 0xc2]);
+        let add = t.seq.windows(5).position(|w| w[0] == 0x62 && w[4] == 0x98).expect("vfmadd132ps");
+        let sub = t.seq.windows(5).position(|w| w[0] == 0x62 && w[4] == 0x9a).expect("vfmsub132ps");
+        assert!(sub > add);
+        // the even lanes take the subtraction: mov eax, 0x5555
+        assert!(t.seq.windows(5).any(|w| w == [0xb8, 0x55, 0x55, 0x00, 0x00]));
+    }
+
+    #[test]
     fn thunk_layout_patches_constants_and_rip_relative_operands() {
         let mut th = Thunk::default();
         // vmovaps zmm0, [rip+const0]: 62 f1 7c 48 28 05 disp32
@@ -2363,6 +2830,8 @@ fn canon(map: u8, pp: u8, w: u8, op: u8, reg: u8) -> Option<Canon> {
         (2, 1, 0, 0x16) => to(2, 1, 0, 0x36),
         // vpblendmd / vpblendmq (MVEX.NDS.512.66.0F38.W0 64; W1), vblendmps / vblendmpd (65)
         (2, 1, _, 0x64) | (2, 1, _, 0x65) => same,
+        // vptestmd into a mask (MVEX.NDS.512.66.0F38.W0 27)
+        (2, 1, 0, 0x27) => same,
         // vgetexpps (MVEX.512.66.0F38.W0 42), vgetmantps (MVEX.512.66.0F3A.W0 26 ib): the same opcodes and immediate as AVX-512
         (2, 1, 0, 0x42) | (3, 1, 0, 0x26) => same,
         // valignd (MVEX.NDS.512.66.0F3A.W0 03 ib)
@@ -2469,7 +2938,9 @@ fn generic(insn: &Instruction, ev: &Ev, c: Canon, tg: &Target) -> Result<Rewrite
     let narrow = ev.ll != 2;
     let kn = ev.aaa;
     let is_store = ev.map == 1 && (ev.op == 0x29 || ev.op == 0x7F);
-    let is_cmp = (ev.map == 1 && (ev.op == 0xC2 || ev.op == 0x76 || ev.op == 0x66)) || (ev.map == 3 && (ev.op == 0x1F || ev.op == 0x1E));
+    let is_cmp = (ev.map == 1 && (ev.op == 0xC2 || ev.op == 0x76 || ev.op == 0x66))
+        || (ev.map == 3 && (ev.op == 0x1F || ev.op == 0x1E))
+        || (ev.map == 2 && ev.op == 0x27);
     let mem = MemOp::of(insn);
     let vl = vl_lanes(ev.ll, ev.w);
     let full = ev.ll == 2;
