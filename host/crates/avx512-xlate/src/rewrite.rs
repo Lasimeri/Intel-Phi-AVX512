@@ -703,7 +703,12 @@ fn src2(em: &mut Em, insn: &Instruction, ev: &Ev, _elems: u16) -> Result<u8, Uns
         Some(m) => {
             let t = em.temp().map_err(|e| refuse(insn, e))?;
             if ev.b {
-                em.mvex(1, ev.w, ev.w, 0x28, t, 0, Rm::Mem(m), 0, 1, None);
+                // An embedded broadcast: vbroadcastss / vbroadcastsd from
+                // memory. The aligned move's memory operand is of the
+                // up-conversion family (Uf32, Uf64: datatype conversions,
+                // no broadcast), so `vmovapd {1to8}` is no encoding: the card
+                // refused it (2026-10-08, the forms test's vpcmpq m64{1to8}).
+                em.broadcast(t, Rm::Mem(m), 0, ev.w);
             } else {
                 let dm = vl_lanes(ev.ll, 0);
                 let k = if dm == 0xffff { 0 } else { em.mask_imm(dm) };
@@ -2040,9 +2045,9 @@ fn narrow_db(insn: &Instruction, ev: &Ev, tg: &Target) -> Result<Rewrite, Unsupp
 /// elements per issue, clearing their bits (327364-001, VPSCATTERDD:
 /// "re-executed via a loop until ... the write-mask bits all are zero"),
 /// so the sequence repeats it while the mask is not zero with `jknzd`
-/// (VEX.NDS.128.W0 75 ib, the mask in vvvv), which reads no flag and no
-/// general register. AVX-512 clears the mask at the end as well, and both
-/// order writes to one index from the lowest lane up.
+/// (VEX.NDS.128.0F.W0 85 id, the mask in vvvv), which reads no flag and
+/// no general register. AVX-512 clears the mask at the end as well, and
+/// both order writes to one index from the lowest lane up.
 fn gather_scatter(insn: &Instruction, bytes: &[u8], ev: &Ev, tg: &Target) -> Result<Rewrite, Unsupported> {
     if ev.aaa == 0 {
         return Err(refuse(insn, "a gather or scatter without a mask"));
@@ -2056,9 +2061,11 @@ fn gather_scatter(insn: &Instruction, bytes: &[u8], ev: &Ev, tg: &Target) -> Res
     v[3] = bytes[3] & 0x0f;
     let at = em.t.seq.len();
     em.t.seq.extend_from_slice(&v);
-    let rel = at as i64 - (em.t.seq.len() as i64 + 4);
-    em.t.seq
-        .extend_from_slice(&[0xc5, 0x80 | ((!ev.aaa & 0xf) << 3), 0x75, rel as i8 as u8]);
+    // The rel32 form: the rel8 one the manual lists (VEX.NDS.128.W0 75 ib)
+    // raised #UD on card 3 (2026-10-08), the rel32 one ran as documented.
+    let rel = (at as i64 - (em.t.seq.len() as i64 + 7)) as i32;
+    em.t.seq.extend_from_slice(&[0xc5, 0x80 | ((!ev.aaa & 0xf) << 3), 0x85]);
+    em.t.seq.extend_from_slice(&rel.to_le_bytes());
     Ok(Rewrite::Thunk(em.finish()))
 }
 
@@ -2666,7 +2673,11 @@ mod tests {
             &[0x62, 0xf2, 0x79, 0x09, 0xa0, 0x0c, 0x97],
             "the MVEX form, VSIB and mask kept"
         );
-        assert_eq!(&t.seq[7..], &[0xc5, 0xf0, 0x75, 0xf5], "jknzd k1, back to the scatter");
+        assert_eq!(
+            &t.seq[7..],
+            &[0xc5, 0xf0, 0x85, 0xf2, 0xff, 0xff, 0xff],
+            "jknzd k1, rel32 back to the scatter"
+        );
     }
 
     #[test]
@@ -2678,6 +2689,25 @@ mod tests {
         assert!(sub > add);
         // the even lanes take the subtraction: mov eax, 0x5555
         assert!(t.seq.windows(5).any(|w| w == [0xb8, 0x55, 0x55, 0x00, 0x00]));
+    }
+
+    #[test]
+    fn a_staged_broadcast_operand_is_a_broadcast_load_not_a_move() {
+        // vpcmpq $1, [rax]{1to8}, zmm1, k1
+        let t = thunk(&[0x62, 0xf3, 0xf5, 0x58, 0x1f, 0x08, 0x01]);
+        // vbroadcastsd zmmT, [rax] (MVEX.512.66.0F38.W1 19), no vmovapd with a swizzle
+        assert!(
+            t.seq
+                .windows(5)
+                .any(|w| w[0] == 0x62 && w[1] & 3 == 2 && w[2] & 0x80 == 0x80 && w[4] == 0x19),
+            "{:02x?}",
+            t.seq
+        );
+        assert!(
+            !t.seq.windows(5).any(|w| w[0] == 0x62 && w[4] == 0x28 && w[3] & 0x70 == 0x10),
+            "{:02x?}",
+            t.seq
+        );
     }
 
     #[test]
