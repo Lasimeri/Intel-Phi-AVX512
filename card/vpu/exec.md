@@ -123,3 +123,36 @@ logs comparable without stripping addresses does not work with either
 worker: the program's stack then sits at `0x7fffffffd000`, which the
 worker's own mappings occupy on the card (exit kind 3, a collision, the
 same on both).
+
+## The card's own DMA channel carries the program's memory (2026-10-08)
+
+Until now a phase's bytes came through the block device (`vpu_pull`,
+`vpu_push`: a request to the host's `phictl` and its host-owned DMA
+channel each way, one record per 512 KiB, with the request's fixed cost
+on every piece), on top of the mailbox round trip that asks the host to
+copy the program's memory into the window. Now, with the worker's
+channel open (`cdma.md`, channel 7, `-d 0` leaves it closed):
+
+- **In**: `exec_pull` takes `vpu_pull`'s arguments and pulls the window
+  into card memory with the engine, in pieces of one descriptor's length
+  (`EP_PIECE`, 16383 lines) into the channel's landing area, each
+  submitted, waited for (`cdma_wait`) and copied on with `phi_copy64`.
+  The copy is vectors, so `exec_pull` serves only between runs: the
+  bundle (descriptor, thunk, code pages) at a phase's start, a
+  ranges-mode fetch (`fetch_pages`, both arms: into the staging huge page
+  or straight into a huge chunk), and the code chunk's refresh of a demand
+  phase. A demand fault inside a run (`on_segv`) keeps `vpu_pull`: it runs
+  on the faulting thread, whose vector registers are the program's. A
+  piece the channel refuses or fails (the channel closes itself then,
+  `cdma.md`) sends what is left through the block device, and so does a
+  channel that was never up.
+- **Out**: `stage_flush` writes a slot of at most `WB_MAP_MAX` (32 KiB) of
+  pages through the window's mapping as posted vector stores (the table's
+  used entries, rounded to lines, then the pages: no request, nothing
+  waited for; `FENCE` before the mail so the stores are ahead of it on
+  the link, which the host polls), and a larger slot through the block
+  device as before. The descriptor already went back that way.
+
+Nothing in the protocol changes: the same window offsets, the same
+mailbox, the same slots; the host (`offload.rs`) is as it was. What it
+buys is in `docs/results/2026-10-08-phi512-dma.md`.

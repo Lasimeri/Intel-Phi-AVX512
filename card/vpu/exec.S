@@ -22,6 +22,8 @@
 	.set SHADOWS, 8			# snapshots of chunks written in demand mode
 	.set PAGES_PER_CHUNK, EXEC_CHUNK / 4096
 	.set STAGE_POOL_MIN, 262144	# a staged copy this large goes to the pool
+	.set EP_PIECE, 16383 * 64	# the card's DMA channel: one descriptor's length (cdma.S, CD_LEN_MAX)
+	.set WB_MAP_MAX, 32768		# a write-back slot this small goes through the mapping as posted stores
 	.set TRAMP_SLOT, 16 * EXEC_MAX_THREADS
 	.set CTX_KIND_TRAMP, 100	# a thread that left through the trampoline
 	.set DISP_ALTSTACK, 262144	# the dispatcher's alternate signal stack
@@ -189,6 +191,63 @@ mail:
 1:	cmpq MAIL_ACK(%r8), %rax
 	jne 1b
 	movl MAIL_STATUS(%r8), %eax
+	ret
+
+# exec_pull: rsi bytes of the window at rdx into rdi (the arguments of
+# vpu_pull) through the card's own DMA channel (cdma.S, opened by
+# worker.S): pieces of at most a descriptor's length into the landing
+# area, each submitted, waited for and copied on in vectors (so only
+# between runs: the bundle, a ranges-mode fetch, the code chunk's
+# refresh; a demand fault inside a run keeps the block device, its
+# thread's vector registers being the program's). With the channel down,
+# or once a piece is refused or fails (the channel closes itself then),
+# the rest goes through the block device as before. eax 0 or -1.
+exec_pull:
+	cmpq $0, cdma_ready(%rip)
+	je vpu_pull
+	pushq %rbx
+	pushq %r12
+	pushq %r13
+	pushq %r14
+	movq %rdi, %rbx				# dst
+	leaq 63(%rsi), %r12
+	andq $-64, %r12				# bytes, whole lines
+	movq %rdx, %r13				# off
+1:	testq %r12, %r12
+	jz 8f
+	movq %r12, %r14
+	cmpq $EP_PIECE, %r14
+	jbe 2f
+	movq $EP_PIECE, %r14
+2:	movq %r13, %rdi
+	xorl %esi, %esi				# the landing area's start
+	movq %r14, %rdx
+	call cdma_submit
+	testq %rax, %rax
+	jz 9f
+	movq %rax, %rdi
+	call cdma_wait
+	testl %eax, %eax
+	jz 9f
+	movq %rbx, %rdi
+	movq cdma_land(%rip), %rsi
+	movq %r14, %rdx
+	shrq $6, %rdx
+	call phi_copy64
+	addq %r14, %rbx
+	addq %r14, %r13
+	subq %r14, %r12
+	jmp 1b
+8:	xorl %eax, %eax
+	jmp 10f
+9:	movq %rbx, %rdi				# what is left, the old way
+	movq %r12, %rsi
+	movq %r13, %rdx
+	call vpu_pull
+10:	popq %r14
+	popq %r13
+	popq %r12
+	popq %rbx
 	ret
 
 # ---- the huge page pool ----
@@ -631,7 +690,7 @@ fetch_pages:
 	testq %rdi, %rdi
 	jz 5f
 	movq %r14, %rsi
-	call vpu_pull
+	call exec_pull
 	testl %eax, %eax
 	jnz .Lfp_fault3
 	movq %r12, %rdi
@@ -641,7 +700,7 @@ fetch_pages:
 	jmp 6f
 5:	movq %r12, %rdi
 	movq %r14, %rsi
-	call vpu_pull
+	call exec_pull
 	testl %eax, %eax
 	jnz .Lfp_fault3
 6:	movq 8(%rsp), %rax
@@ -870,7 +929,11 @@ shadow_get:
 # stage_flush: edi staged pages written to the write-back slot and the
 # host told; the slot alternates. The host acknowledges on receipt and
 # applies after; the next acknowledgement means this one was applied, so
-# the other slot is free to fill meanwhile. eax 0 or -1.
+# the other slot is free to fill meanwhile. A slot of WB_MAP_MAX bytes or
+# fewer goes through the window's mapping as posted vector stores (the
+# table's used entries, then the pages: no request, nothing waited for;
+# a fence before the mail orders the stores ahead of it), a larger one
+# through the block device as before. eax 0 or -1.
 stage_flush:
 	testl %edi, %edi
 	jz 9f
@@ -879,7 +942,37 @@ stage_flush:
 	movl %edi, %ebx
 	movl g_wb_slot(%rip), %r12d
 	andl $1, %r12d
+	movl %ebx, %esi
+	shlq $12, %rsi				# the pages' bytes
+	cmpq $WB_MAP_MAX, %rsi
+	ja 5f
+	movq %r12, %rdi
+	shlq $21, %rdi
+	addq $OFF_EXEC_WB, %rdi
+	addq $WB_TABLE, %rsi
+	call vpu_window
+	testq %rax, %rax
+	jz 5f
+	movq %rax, %rdi				# the slot in the mapping
 	leaq g_stages(%rip), %rax
+	movq (%rax,%r12,8), %rsi		# the staged slot
+	movl %ebx, %edx
+	shlq $4, %rdx
+	addq $63, %rdx
+	shrq $6, %rdx				# the table's used entries, in lines
+	pushq %rdi
+	pushq %rsi
+	call phi_copy64
+	popq %rsi
+	popq %rdi
+	addq $WB_TABLE, %rdi
+	addq $WB_TABLE, %rsi
+	movl %ebx, %edx
+	shlq $6, %rdx				# the pages, in lines
+	call phi_copy64
+	FENCE
+	jmp 6f
+5:	leaq g_stages(%rip), %rax
 	movq (%rax,%r12,8), %rdi
 	movl %ebx, %esi
 	shlq $12, %rsi
@@ -890,7 +983,7 @@ stage_flush:
 	call vpu_push
 	testl %eax, %eax
 	jnz 8f
-	movl $MAIL_WRITEBACK, %edi
+6:	movl $MAIL_WRITEBACK, %edi
 	xorl %esi, %esi
 	movl %ebx, %edx
 	movl %r12d, %ecx
@@ -1758,7 +1851,7 @@ vpu_exec_run:
 	addq $EXEC_DESC_PAGES * 4096, %rsi
 	movq g_bundle(%rip), %rdi
 	movl $OFF_EXEC_CODE, %edx
-	call vpu_pull
+	call exec_pull
 	testl %eax, %eax
 	jnz .Ler_pull
 	movq %r14, %rdi
@@ -1905,7 +1998,7 @@ vpu_exec_run:
 	movl L_TMP(%rbp), %edx
 	shlq $21, %rdx
 	addq $OFF_EXEC_FETCH, %rdx
-	call vpu_pull
+	call exec_pull
 	testl %eax, %eax
 	jz 62f
 61:	movq EX_CODE_ADDR(%r14), %rax
