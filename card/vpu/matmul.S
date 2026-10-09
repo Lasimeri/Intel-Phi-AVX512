@@ -117,6 +117,7 @@ r_experts:	.skip 8
 r_total:	.skip 8
 r_slice:	.skip 8
 r_acts:	.skip 8			# where the ids and activations landed: the engine's area (cdma.S) or g_b
+r_fmore:	.skip 8			# a request of several matrices whose base is a float type: every piece the same type, run by rows_slice_multi_f
 
 	.text
 
@@ -834,6 +835,40 @@ rows_slice_id:
 	jmp 1b
 9:	addq $MJ_BYTES, %rsp
 	popq %r14
+	popq %r13
+	popq %r12
+	popq %rbx
+	ret
+
+# rows_slice_multi_f(multi_job rdi, slice esi, nslices edx): the pool's
+# entry for a request of several float matrices (a BF16 gate and up pair,
+# say): each piece in turn as the single-matrix float paths take it
+# (rows_slice_id for a mixture, rows_slice else), this thread its slice of
+# every piece's rows. The quantized request cuts the rows of all pieces as
+# one (rows_slice_multi, rows.S); here the float kernels take a matrix at
+# a time, so the pieces are simply run one after another.
+rows_slice_multi_f:
+	pushq %rbx
+	pushq %r12
+	pushq %r13
+	pushq %r14
+	movq %rdi, %rbx
+	movl %esi, %r12d
+	movl %edx, %r13d
+	xorl %r14d, %r14d			# x
+1:	cmpl MU_COUNT(%rbx), %r14d
+	jge 9f
+	movq MU_JOBS(%rbx,%r14,8), %rdi
+	movl %r12d, %esi
+	movl %r13d, %edx
+	cmpq $0, r_mixture(%rip)
+	je 2f
+	call rows_slice_id
+	jmp 3f
+2:	call rows_slice
+3:	incl %r14d
+	jmp 1b
+9:	popq %r14
 	popq %r13
 	popq %r12
 	popq %rbx
@@ -1666,6 +1701,7 @@ vpu_matmul_run:
 	jne 6f
 	movl $1, %eax
 6:	movq %rax, r_more(%rip)
+	movq $0, r_fmore(%rip)
 	xorl %eax, %eax
 	cmpq $K_MATMUL_ID, r_kernel(%rip)
 	je 7f
@@ -1759,11 +1795,15 @@ vpu_matmul_run:
 	ja .Lbad
 	cmpq $0, MM_A_ID(%rbx)
 	je .Lbad
+	# a quantized base takes quantized pieces of any type (the groups
+	# path, rows.S); a float base (shape_ok passed it) takes pieces of
+	# its own type, each run by the float kernels (rows_slice_multi_f)
 	movl MM_A_TYPE(%rbx), %edi
 	call quantized
 	testl %eax, %eax
-	jz .Lbad
-	xorl %r13d, %r13d			# x
+	jnz 125f
+	movq $1, r_fmore(%rip)
+125:	xorl %r13d, %r13d			# x
 13:	cmpl mo + MORE_COUNT(%rip), %r13d
 	jge 15f
 	movq %r13, %rax
@@ -1792,10 +1832,15 @@ vpu_matmul_run:
 	testq $VPU_BLOCK - 1, MM2_D_OFF(%r14)
 	jnz .Lbad
 	movl MM2_A_TYPE(%r14), %edi
-	call quantized
+	cmpq $0, r_fmore(%rip)
+	je 131f
+	cmpl MM_A_TYPE(%rbx), %edi		# a float base: the same type
+	jne .Lbad
+	jmp 132f
+131:	call quantized
 	testl %eax, %eax
 	jz .Lbad
-	leaq ff(%rip), %rdi
+132:	leaq ff(%rip), %rdi
 	call shape_ok
 	testl %eax, %eax
 	jz .Lbad
@@ -2060,9 +2105,13 @@ vpu_matmul_run:
 29:	incl %r14d
 	jmp 28b
 30:	# a few columns: every thread groups them itself; else one table
+	# (a float base has no groups: rows_slice_multi_f takes each piece
+	# as the single-matrix float paths do)
 	movl mo + MORE_COUNT(%rip), %r14d
 	incl %r14d				# pieces
 	xorl %r15d, %r15d			# own
+	cmpq $0, r_fmore(%rip)
+	jne 33f
 	cmpq $OWN_GROUPS_MAX, MM_N(%rbx)
 	ja 31f
 	movl $1, %r15d
@@ -2100,6 +2149,8 @@ vpu_matmul_run:
 	movq %rax, (%rdx,%r13,8)
 	movq MJ_M(%rdi), %rax
 	addq %rax, r_total(%rip)
+	cmpq $0, r_fmore(%rip)
+	jne 36f
 	testl %r15d, %r15d
 	jz 35f
 	movl $1, MJ_OWN_GROUPS(%rdi)
@@ -2165,7 +2216,10 @@ vpu_matmul_run:
 	call now_ns
 	movq %rax, r_c0(%rip)
 	leaq rows_slice_multi(%rip), %rdi
-	leaq mjob(%rip), %rsi
+	cmpq $0, r_fmore(%rip)
+	je 3911f
+	leaq rows_slice_multi_f(%rip), %rdi
+3911:	leaq mjob(%rip), %rsi
 	movl r_threads(%rip), %edx
 	call vpu_pool_map
 	movq r_plive(%rip), %rcx

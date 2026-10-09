@@ -116,6 +116,17 @@ int main(void)
 	check("VPU_OFF_REQ", VPU_OFF_REQ, 64);
 	check("VPU_OFF_NONCE", VPU_OFF_NONCE, 128);
 	check("VPU_OFF_REPLY", VPU_OFF_REPLY, 256);
+	check("VPU_OFF_STATS", VPU_OFF_STATS, 320);
+	check("sizeof(vpu_stats)", sizeof(struct vpu_stats), 64);
+	check("stats.requests", offsetof(struct vpu_stats, requests), 0);
+	check("stats.errors", offsetof(struct vpu_stats, errors), 8);
+	check("stats.busy_ns", offsetof(struct vpu_stats, busy_ns), 16);
+	check("stats.compute_ns", offsetof(struct vpu_stats, compute_ns), 24);
+	check("stats.pull_ns", offsetof(struct vpu_stats, pull_ns), 32);
+	check("stats.push_ns", offsetof(struct vpu_stats, push_ns), 40);
+	check("stats.last_kernel", offsetof(struct vpu_stats, last_kernel), 48);
+	check("stats.last_threads", offsetof(struct vpu_stats, last_threads), 52);
+	check("stats.last_seq", offsetof(struct vpu_stats, last_seq), 56);
 	check("VPU_OFF_DATA", VPU_OFF_DATA, 1u << 20);
 	check("VPU_BLOCK", VPU_BLOCK, 4096);
 	check("VPU_CHUNK", VPU_CHUNK, 128);

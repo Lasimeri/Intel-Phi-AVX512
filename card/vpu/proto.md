@@ -1,7 +1,8 @@
 # proto.inc
 
 The host/card contract as assembler constants: the offsets of the
-control words, the request and reply fields, the request kinds and
+control words, the request, reply and stats fields (`RQ_*`, `RP_*`,
+`ST_*`), the request kinds and
 status values (`vpu_proto.h`), the seamless path's mailbox, descriptor,
 register file and slots (`vpu_exec.h`), and the matrix service's
 descriptors (`vpu_matmul.h`). The C headers stay the readable contract

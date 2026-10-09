@@ -19,6 +19,9 @@ pub const OFF_REQ: usize = 64;
 pub const OFF_NONCE: usize = 128;
 /// Window offset of the reply descriptor.
 pub const OFF_REPLY: usize = 256;
+/// Window offset of the worker's running counters (`Stats`), one line it
+/// rewrites after every reply; the stack's phitop reads it for its rates.
+pub const OFF_STATS: usize = 320;
 /// Where bulk data starts. Everything below is control words.
 pub const OFF_DATA: u64 = 1 << 20;
 
@@ -75,6 +78,27 @@ pub struct Reply {
     pub threads: i32,
 }
 
+/// `struct vpu_stats`: the worker's counters since it started, summed
+/// over every reply it wrote; two samples give the rates.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stats {
+    /// Replies written.
+    pub requests: u64,
+    /// Of them with a status other than `OK`.
+    pub errors: u64,
+    /// The sum of their `total_ns`.
+    pub busy_ns: u64,
+    pub compute_ns: u64,
+    pub pull_ns: u64,
+    pub push_ns: u64,
+    /// The last request's kind and the slices it ran on.
+    pub last_kernel: u32,
+    pub last_threads: u32,
+    /// The last reply's sequence number.
+    pub last_seq: u64,
+}
+
 pub const OK: i32 = 0;
 pub const E_ALLOC: i32 = -1;
 pub const E_PULL: i32 = -2;
@@ -95,9 +119,10 @@ pub fn status_name(status: i32) -> &'static str {
     }
 }
 
-// The C header asserts the same two sizes.
+// The C header asserts the same three sizes.
 const _: [(); 56] = [(); std::mem::size_of::<Request>()];
 const _: [(); 48] = [(); std::mem::size_of::<Reply>()];
+const _: [(); 64] = [(); std::mem::size_of::<Stats>()];
 
 #[cfg(test)]
 mod tests {
@@ -130,6 +155,19 @@ mod tests {
     }
 
     #[test]
+    fn stats_layout_matches_the_c_header() {
+        assert_eq!(offset_of!(Stats, requests), 0);
+        assert_eq!(offset_of!(Stats, errors), 8);
+        assert_eq!(offset_of!(Stats, busy_ns), 16);
+        assert_eq!(offset_of!(Stats, compute_ns), 24);
+        assert_eq!(offset_of!(Stats, pull_ns), 32);
+        assert_eq!(offset_of!(Stats, push_ns), 40);
+        assert_eq!(offset_of!(Stats, last_kernel), 48);
+        assert_eq!(offset_of!(Stats, last_threads), 52);
+        assert_eq!(offset_of!(Stats, last_seq), 56);
+    }
+
+    #[test]
     #[allow(clippy::assertions_on_constants)]
     fn control_words_do_not_share_a_cache_line() {
         assert!(OFF_REQ - OFF_READY >= 64);
@@ -137,7 +175,9 @@ mod tests {
         assert!(OFF_REPLY - OFF_REQ >= 64);
         assert!(OFF_NONCE - OFF_REQ >= 64);
         assert!(OFF_REPLY - OFF_NONCE >= 64);
-        assert!(OFF_DATA as usize >= OFF_REPLY + std::mem::size_of::<Reply>());
+        assert!(OFF_STATS - OFF_REPLY >= 64);
+        assert_eq!(OFF_STATS % 64, 0);
+        assert!(OFF_DATA as usize >= OFF_STATS + std::mem::size_of::<Stats>());
         assert_eq!(OFF_DATA % BLOCK, 0);
     }
 

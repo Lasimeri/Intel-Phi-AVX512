@@ -11,6 +11,7 @@
 	.set OFF_REQ, 64
 	.set OFF_NONCE, 128		# the card alone writes it: the nonce of its DMA channel's open (cdma.md)
 	.set OFF_REPLY, 256
+	.set OFF_STATS, 320		# struct vpu_stats: the worker's running counters, rewritten after every reply (phitop reads them)
 	.set OFF_DATA, 1048576
 	.set MAGIC_LO, 0x52454144
 	.set MAGIC_HI, 0x5650555F
@@ -53,6 +54,17 @@
 	.set RP_STATUS, 40
 	.set RP_THREADS, 44
 	.set RP_BYTES, 48
+# struct vpu_stats (64 bytes, one line at OFF_STATS).
+	.set ST_REQUESTS, 0
+	.set ST_ERRORS, 8
+	.set ST_BUSY_NS, 16
+	.set ST_COMPUTE_NS, 24
+	.set ST_PULL_NS, 32
+	.set ST_PUSH_NS, 40
+	.set ST_LAST_KERNEL, 48
+	.set ST_LAST_THREADS, 52
+	.set ST_LAST_SEQ, 56
+	.set ST_BYTES, 64
 
 # The seamless path (vpu_exec.h): the mailbox, the descriptor, the slots.
 	.set OFF_MAIL, 4096

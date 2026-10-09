@@ -44,7 +44,15 @@ what is where in the assembly and what its gates were.
 - **The float weight types** (`rows_slice`, `rows_slice_id`): a row
   against four activation rows (`phi_dot4_*`) or one (`phi_dot_*`), the
   sixteen sums and the row's last `k % 16` elements in the x87 unit
-  exactly as the C (`rows.md`, "The sums").
+  exactly as the C (`rows.md`, "The sums"). A request of several
+  matrices (`VPU_K_MATMUL_MORE`) with a float base takes pieces of the
+  base's own type only (`r_fmore`; a quantized base takes quantized
+  pieces of any type, as before) and runs them by `rows_slice_multi_f`:
+  each piece in turn as the single-matrix float paths take it, every
+  thread its slice of each piece's rows, no groups. Added 2026-10-09:
+  until then the request wanted a quantized base, and a bfloat16 gate
+  and up pair from the backend was rejected (`matmul-check` now covers
+  it for every type).
 - **The SwiGLU** (`swiglu_range`): a range of h in whole vectors with
   its ends under lane masks (`phi_swiglu*`, `kernels.md`), so every lane
   is stored by exactly one thread; also the conformance diagnostic

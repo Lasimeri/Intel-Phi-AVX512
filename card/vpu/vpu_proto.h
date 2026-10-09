@@ -33,6 +33,7 @@
 #define VPU_OFF_REQ    64     /* struct vpu_request */
 #define VPU_OFF_NONCE 128     /* a line the card alone writes: the nonce of its DMA channel's open (card/vpu/cdma.md); the host never touches it */
 #define VPU_OFF_REPLY 256     /* struct vpu_reply */
+#define VPU_OFF_STATS 320     /* struct vpu_stats: the worker's running counters, one line it rewrites after every reply (phitop reads it) */
 #define VPU_OFF_DATA  (1u << 20)   /* bulk data starts here, page aligned */
 
 #define VPU_MAGIC 0x5650555F52454144ULL   /* "VPU_READ" */
@@ -85,7 +86,27 @@ struct vpu_reply {
     int32_t  threads;    /* slices actually run */
 };
 
+/* The worker's running counters since it started, summed over every
+ * reply it wrote (the reply's own fields, so the same clock) and stored
+ * whole at VPU_OFF_STATS after the reply's sequence number. A reader on
+ * the host (the stack's phitop) takes two samples and shows the rates:
+ * requests a second, busy = busy_ns over the wall clock, and each stage's
+ * time per request. Zeroed at start; last_seq says which reply they
+ * include. */
+struct vpu_stats {
+    uint64_t requests;     /* replies written */
+    uint64_t errors;       /* of them with a status other than VPU_OK */
+    uint64_t busy_ns;      /* the sum of their total_ns */
+    uint64_t compute_ns;   /* the sum of their compute_ns */
+    uint64_t pull_ns;
+    uint64_t push_ns;
+    uint32_t last_kernel;  /* the last request's VPU_K_* */
+    uint32_t last_threads; /* and the slices it ran on */
+    uint64_t last_seq;     /* the last reply's sequence number */
+};
+
 _Static_assert(sizeof(struct vpu_request) == 56, "request layout is shared with Rust");
 _Static_assert(sizeof(struct vpu_reply) == 48, "reply layout is shared with Rust");
+_Static_assert(sizeof(struct vpu_stats) == 64, "stats layout is shared with Rust and phitop");
 
 #endif

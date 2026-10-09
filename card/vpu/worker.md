@@ -84,6 +84,13 @@ dispatches or requests (below).
   over whole 128-element chunks with the last slice on this thread, the
   output pushed), anything else `VPU_E_KERNEL`. The reply's fields are
   written, then its sequence number last: that is what the host polls.
+  After it, the running counters (`stats`, `struct vpu_stats`): the
+  replies written, those with an error, the sums of their total,
+  compute, pull and push times, the last request's kind, threads and
+  sequence number, stored whole at `OFF_STATS` in one 64-byte vector
+  store (zeroed there at start, before readiness). The stack's phitop
+  reads the line from the window on the host and shows the rates
+  between two of its samples; nothing on the card reads it.
 - **The clock.** `now_ns` is the time-stamp counter scaled by a rate
   measured at start against the kernel's clock over 20 ms (1099.8
   ticks per microsecond on this card, the same on every core): a

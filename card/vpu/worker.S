@@ -97,6 +97,9 @@ cur_live:	.skip 8
 cur_pull:	.skip 8
 cur_push:	.skip 8
 cur_compute:	.skip 8
+cur_total:	.skip 8
+	.balign 64
+stats:	.skip ST_BYTES			# the running counters, stored whole at OFF_STATS after every reply
 	.balign 8
 affinity:	.skip 128
 timespec:	.skip 16
@@ -380,6 +383,12 @@ _start:
 	movl $0, OFF_REPLY + RP_STATUS(%rbx)
 	movq $0, last_seq(%rip)
 	movq $SCRATCH_DISP, OFF_SCRATCH(%rbx)
+	# the counters at zero (a reader must not see an earlier worker's)
+	leaq OFF_STATS(%rbx), %rdi
+	leaq stats(%rip), %rsi
+	movl $1, %edx
+	call phi_copy64
+	movq ctrl(%rip), %rbx
 	movabsq $(MAGIC_HI << 32) | MAGIC_LO, %rax
 	movq %rax, OFF_READY(%rbx)
 	call now_ns
@@ -597,12 +606,38 @@ main_loop:
 	movq %rax, OFF_REPLY + RP_PUSH_NS(%rbx)
 	call now_ns
 	subq cur_t0(%rip), %rax
+	movq %rax, cur_total(%rip)
 	movq %rax, OFF_REPLY + RP_TOTAL_NS(%rbx)
 	movl cur_status(%rip), %eax
 	movl %eax, OFF_REPLY + RP_STATUS(%rbx)
 	movl cur_live(%rip), %eax
 	movl %eax, OFF_REPLY + RP_THREADS(%rbx)
 	movq %r12, OFF_REPLY + RP_SEQ(%rbx)
+	# the running counters (OFF_STATS): summed here, stored as one line
+	# after the reply, so a reader that sees last_seq sees the sums
+	# through that reply
+	leaq stats(%rip), %rcx
+	incq ST_REQUESTS(%rcx)
+	cmpq $0, cur_status(%rip)
+	je 7f
+	incq ST_ERRORS(%rcx)
+7:	movq cur_total(%rip), %rax
+	addq %rax, ST_BUSY_NS(%rcx)
+	movq cur_compute(%rip), %rax
+	addq %rax, ST_COMPUTE_NS(%rcx)
+	movq cur_pull(%rip), %rax
+	addq %rax, ST_PULL_NS(%rcx)
+	movq cur_push(%rip), %rax
+	addq %rax, ST_PUSH_NS(%rcx)
+	movl rq+RQ_KERNEL(%rip), %eax
+	movl %eax, ST_LAST_KERNEL(%rcx)
+	movl cur_live(%rip), %eax
+	movl %eax, ST_LAST_THREADS(%rcx)
+	movq %r12, ST_LAST_SEQ(%rcx)
+	leaq OFF_STATS(%rbx), %rdi
+	movq %rcx, %rsi
+	movl $1, %edx
+	call phi_copy64
 	cmpl $0, trace(%rip)
 	je 6f
 	cmpl $K_EXEC, rq+RQ_KERNEL(%rip)

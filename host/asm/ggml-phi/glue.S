@@ -1985,16 +1985,30 @@ id_pair:
 	movq T_NE+16(%rsi), %rax
 	cmpq %rax, T_NE+16(%rdi)
 	jne 9f
+	# one request takes two quantized types, or two of the same float
+	# type (matmul.S: the float kernels run each piece on its own)
 	movl T_TYPE(%rsi), %edi
 	call card_type
-	cmpl $2, %eax
-	jl 9f
+	testl %eax, %eax
+	js 9f
+	pushq %rax				# the first's type
 	movq T_SRC(%r14), %rdi
 	movl T_TYPE(%rdi), %edi
 	call card_type
-	cmpl $2, %eax
+	popq %rcx
+	testl %eax, %eax
+	js 9f
+	cmpl %eax, %ecx
+	je 21f
+	cmpl $MM_Q4_K, %ecx
 	jl 9f
-	movq T_SRC(%r12), %rdi
+	cmpl $MM_IQ4_XS, %ecx
+	jg 9f
+	cmpl $MM_Q4_K, %eax
+	jl 9f
+	cmpl $MM_IQ4_XS, %eax
+	jg 9f
+21:	movq T_SRC(%r12), %rdi
 	call has_weight
 	testl %eax, %eax
 	jz 9f

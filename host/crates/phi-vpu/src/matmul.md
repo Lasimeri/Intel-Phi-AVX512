@@ -130,10 +130,12 @@ token's multiply, and whose lines the pool reads").
 A shape with one activation row is also timed as a gate and up pair,
 two tensors of that shape by the same activations and ids: as two
 requests (the times summed), then as one (`K_MATMUL_MORE`). `check_more`
-(in the ordinary run) checks that request's results: for every quantized
-type, a plain one of three matrices of two types and three row counts, a
-pair of mixtures sharing one activation row, and four mixtures with a
-row per column.
+(in the ordinary run) checks that request's results: for every type, a
+plain one of three matrices and three row counts, a pair of mixtures
+sharing one activation row, and four mixtures with a row per column; a
+quantized type's request mixes in the next quantized type, a float
+type's pieces are all of that type (what the card takes for a float
+base; since 2026-10-09, before which float types had no such request).
 
 ## The feed-forward request and its SwiGLU
 

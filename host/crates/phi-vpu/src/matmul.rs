@@ -1081,39 +1081,37 @@ pub fn check(
             check_id(w, threads, t, 128, 512, 8, 3, 5, 1, id, &mut rng, false)?;
             id += 1;
         }
-        // Further matrices in the same request (K_MATMUL_MORE), quantized
-        // types only: of another type and other row counts than the first,
-        // plain and as mixtures sharing the ids (a gate and up pair, and a
-        // down-like one with a row per column).
-        if t != MM_F32 && t != MM_F16 && t != MM_BF16 {
-            let quants = [MM_Q4_K, MM_Q5_K, MM_Q6_K, MM_Q8_0, MM_IQ4_XS];
-            let other = quants[(quants.iter().position(|&q| q == t).unwrap_or(0) + 1) % quants.len()];
-            check_more(w, threads, &[t, t, other], &[61, 64, 128], 512, 5, None, id, &mut rng)?;
-            id += 3;
-            check_more(w, threads, &[t, other], &[61, 64], 512, 0, Some((8, 3, 5, 1)), id, &mut rng)?;
-            id += 2;
-            check_more(
-                w,
-                threads,
-                &[t, t, other, t],
-                &[64, 128, 61, 3],
-                512,
-                0,
-                Some((8, 8, 2, 8)),
-                id,
-                &mut rng,
-            )?;
-            id += 4;
-        }
+        // Further matrices in the same request (K_MATMUL_MORE): of other
+        // row counts than the first and, for a quantized type, of another
+        // quantized type (a float type pairs with itself: the card runs
+        // each piece with its float kernels), plain and as mixtures
+        // sharing the ids (a gate and up pair, and a down-like one with a
+        // row per column).
+        let quants = [MM_Q4_K, MM_Q5_K, MM_Q6_K, MM_Q8_0, MM_IQ4_XS];
+        let other = match quants.iter().position(|&q| q == t) {
+            Some(i) => quants[(i + 1) % quants.len()],
+            None => t,
+        };
+        check_more(w, threads, &[t, t, other], &[61, 64, 128], 512, 5, None, id, &mut rng)?;
+        id += 3;
+        check_more(w, threads, &[t, other], &[61, 64], 512, 0, Some((8, 3, 5, 1)), id, &mut rng)?;
+        id += 2;
+        check_more(
+            w,
+            threads,
+            &[t, t, other, t],
+            &[64, 128, 61, 3],
+            512,
+            0,
+            Some((8, 8, 2, 8)),
+            id,
+            &mut rng,
+        )?;
+        id += 4;
         println!(
-            "{:7} ok: 61 rows{}, k 512 (Q8_0 also 544), n 1 4 8 13, and mixtures of 8 experts{}, {threads} threads",
+            "{:7} ok: 61 rows{}, k 512 (Q8_0 also 544), n 1 4 8 13, mixtures of 8 experts, and up to four matrices in one request, {threads} threads",
             type_name(t),
             if threads > 57 { " and 128" } else { "" },
-            if t != MM_F32 && t != MM_F16 && t != MM_BF16 {
-                ", and up to four matrices in one request"
-            } else {
-                ""
-            }
         );
     }
     // The fused feed-forward (K_FFN): every quantized type in each of the

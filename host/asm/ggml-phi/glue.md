@@ -70,7 +70,11 @@ Then in order:
   `phi_ggml_end_id`.
 - `run_id_pair`: a layer's gate and up over the same ids as one
   request (`phi_ggml_begin_id_pair`; -2 means the two go one by one);
-  `host_rows_id_pair`; `phi_ggml_end_id_pair`.
+  `host_rows_id_pair`; `phi_ggml_end_id_pair`. `id_pair` pairs two
+  quantized weights of any types, or two of the same float type (the
+  card runs a float request's pieces one by one with its float
+  kernels); until 2026-10-09 the test was "a card type of 2 or more",
+  which let a bfloat16 pair through to a request the card rejected.
 - `run_ffn`: `phi_ggml_ffn_begin(&args)`; -2 declines and the four
   nodes run as they are; else the host's runs of the intermediate
   through `host_ffn` (gate and up rows, the SwiGLU and down's columns,
